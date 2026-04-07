@@ -56,15 +56,18 @@ impl System {
         let (kernel_entry, boot_params_addr) = kernel::load(&memory, kernel_path, initrd_path)?;
         cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
 
-        let serial = serial::create(vm.clone());
+        let serial = serial::create(&vm);
         let s3fs = S3Fs::new(S3Config::default());
         let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ);
+        vm.register_irqfd(virtiofs.mmio.irqfd_fd(), VIRTIO_FS_IRQ)?;
 
         let virtionet = if let Some(ifname) = net_ifname {
             log!("Creating virtio-net with interface {}", ifname);
             let backend = MacvtapBackend::new(ifname)?;
             let mac = [0x06, 0x00, 0xAC, 0x10, 0xFF, 0x01];
-            Some(VirtioNet::new(backend, mac, VIRTIO_NET_IRQ))
+            let net = VirtioNet::new(backend, mac, VIRTIO_NET_IRQ);
+            vm.register_irqfd(net.mmio.irqfd_fd(), VIRTIO_NET_IRQ)?;
+            Some(net)
         } else {
             None
         };
@@ -72,9 +75,6 @@ impl System {
         // Set up epoll for event sources
         let poll = EventPoll::new();
         poll.add(virtiofs.completion_fd(), EVENT_FUSE_COMPLETION);
-        if let Some(ref net) = virtionet {
-            poll.add(net.rx_fd(), EVENT_NET_RX);
-        }
 
         Ok(Self { vm, memory, vcpu, serial, virtiofs, virtionet, poll })
     }
@@ -141,9 +141,7 @@ impl System {
                                 // than spinning and guarantees we don't miss it.
                                 self.virtiofs.wait_for_completion();
                                 if self.virtiofs.process_completions(&self.memory) {
-                                    self.virtiofs.mmio.interrupt_status |= 0x01;
-                                    self.vm.set_irq_line(VIRTIO_FS_IRQ, true).ok();
-                                    self.vm.set_irq_line(VIRTIO_FS_IRQ, false).ok();
+                                    self.virtiofs.mmio.inject_irq();
                                 }
                             }
                         }
@@ -154,12 +152,12 @@ impl System {
                                 if offset == 0x044 && val == 1 {
                                     let qs = net.mmio.queue_sel();
                                     net.activate_queue(qs as usize);
+                                    // Start RX worker once both queues are ready
+                                    net.start_rx_worker(self.memory.clone());
                                 }
                                 if notify {
                                     net.process_tx(&self.memory);
-                                    net.mmio.interrupt_status |= 0x01;
-                                    self.vm.set_irq_line(VIRTIO_NET_IRQ, true).ok();
-                                    self.vm.set_irq_line(VIRTIO_NET_IRQ, false).ok();
+                                    net.mmio.inject_irq();
                                 }
                             }
                         }
@@ -186,20 +184,11 @@ impl System {
                 match token {
                     EVENT_FUSE_COMPLETION => {
                         if self.virtiofs.process_completions(&self.memory) {
-                            self.virtiofs.mmio.interrupt_status |= 0x01;
-                            self.vm.set_irq_line(VIRTIO_FS_IRQ, true).ok();
-                            self.vm.set_irq_line(VIRTIO_FS_IRQ, false).ok();
+                            self.virtiofs.mmio.inject_irq();
                         }
                     }
-                    EVENT_NET_RX => {
-                        if let Some(ref mut net) = self.virtionet {
-                            if net.process_rx(&self.memory) {
-                                net.mmio.interrupt_status |= 0x01;
-                                self.vm.set_irq_line(VIRTIO_NET_IRQ, true).ok();
-                                self.vm.set_irq_line(VIRTIO_NET_IRQ, false).ok();
-                            }
-                        }
-                    }
+                    // NET_RX is handled entirely by the worker thread via irqfd —
+                    // no epoll drain needed. KVM delivers the interrupt directly.
                     _ => {}
                 }
             }

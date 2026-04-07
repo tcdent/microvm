@@ -1,39 +1,32 @@
 use std::io;
+use std::sync::Arc;
 
 use kvm_ioctls::VmFd;
 use vm_superio::serial::NoEvents;
 use vm_superio::{Serial as VmSerial, Trigger};
+use vmm_sys_util::eventfd::EventFd;
 
 pub const SERIAL_IRQ: u32 = 4;
 
-/// IRQ trigger that injects an interrupt via KVM's irqchip
+/// IRQ trigger via irqfd — single write() injects the interrupt in kernel space
 #[derive(Clone)]
 pub struct IrqTrigger {
-    vm: std::sync::Arc<VmFd>,
-    irq: u32,
-}
-
-impl IrqTrigger {
-    pub fn new(vm: std::sync::Arc<VmFd>, irq: u32) -> Self {
-        Self { vm, irq }
-    }
+    eventfd: Arc<EventFd>,
 }
 
 impl Trigger for IrqTrigger {
     type E = io::Error;
 
     fn trigger(&self) -> Result<(), Self::E> {
-        self.vm.set_irq_line(self.irq, true)
-            .map_err(|e| io::Error::other(format!("set_irq_line assert: {e}")))?;
-        self.vm.set_irq_line(self.irq, false)
-            .map_err(|e| io::Error::other(format!("set_irq_line deassert: {e}")))?;
-        Ok(())
+        self.eventfd.write(1).map_err(|e| io::Error::other(format!("irqfd write: {e}")))
     }
 }
 
 pub type Serial = VmSerial<IrqTrigger, NoEvents, io::Stdout>;
 
-pub fn create(vm: std::sync::Arc<VmFd>) -> Serial {
-    let trigger = IrqTrigger::new(vm, SERIAL_IRQ);
+pub fn create(vm: &VmFd) -> Serial {
+    let eventfd = EventFd::new(libc::EFD_NONBLOCK).expect("eventfd");
+    vm.register_irqfd(&eventfd, SERIAL_IRQ).expect("register serial irqfd");
+    let trigger = IrqTrigger { eventfd: Arc::new(eventfd) };
     Serial::new(trigger, io::stdout())
 }

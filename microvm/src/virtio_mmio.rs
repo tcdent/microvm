@@ -1,7 +1,10 @@
 // Virtio MMIO transport — shared infrastructure for all virtio devices.
 // Implements the virtio-mmio register interface (spec v2) and virtqueue management.
 
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use vmm_sys_util::eventfd::EventFd;
 
 // MMIO register offsets (virtio spec 4.2.2)
 pub const MMIO_MAGIC: u32 = 0x7472_6976; // "virt"
@@ -22,19 +25,21 @@ pub struct VirtioMmioDevice {
     pub vendor_id: u32,
     pub device_features: u64,
     pub irq: u32,
+    pub irqfd: EventFd,
 
     // Negotiation state
     pub status: u32,
     device_features_sel: u32,
     driver_features: u64,
     driver_features_sel: u32,
-    pub interrupt_status: u32,
+    pub interrupt_status: AtomicU32,
 
     // Queue configuration (indexed by queue_sel)
     queue_sel: u32,
     pub queues: Vec<QueueConfig>,
 }
 
+#[derive(Clone)]
 pub struct QueueConfig {
     pub max_size: u16,
     pub size: u16,
@@ -60,16 +65,18 @@ impl QueueConfig {
 impl VirtioMmioDevice {
     pub fn new(device_id: u32, vendor_id: u32, device_features: u64, irq: u32, num_queues: usize, queue_size: u16) -> Self {
         let queues = (0..num_queues).map(|_| QueueConfig::new(queue_size)).collect();
+        let irqfd = EventFd::new(libc::EFD_NONBLOCK).expect("failed to create irqfd");
         Self {
             device_id,
             vendor_id,
             device_features: device_features | VIRTIO_F_VERSION_1,
             irq,
+            irqfd,
             status: 0,
             device_features_sel: 0,
             driver_features: 0,
             driver_features_sel: 0,
-            interrupt_status: 0,
+            interrupt_status: AtomicU32::new(0),
             queue_sel: 0,
             queues,
         }
@@ -97,7 +104,7 @@ impl VirtioMmioDevice {
             }
             0x034 => self.selected_queue().map_or(0, |q| q.max_size as u32),
             0x044 => self.selected_queue().map_or(0, |q| q.ready as u32),
-            0x060 => self.interrupt_status,
+            0x060 => self.interrupt_status.load(Ordering::Relaxed),
             0x070 => self.status,
             // Config space starts at 0x100
             off @ 0x100.. => config_read(off - 0x100),
@@ -131,7 +138,7 @@ impl VirtioMmioDevice {
             }
             0x064 => {
                 // InterruptACK
-                self.interrupt_status &= !val;
+                self.interrupt_status.fetch_and(!val, Ordering::Relaxed);
             }
             0x070 => self.status = val,
             // Queue address registers (low/high halves)
@@ -174,6 +181,18 @@ impl VirtioMmioDevice {
 
     pub fn queue_sel(&self) -> u32 {
         self.queue_sel
+    }
+
+    /// Inject an interrupt — sets status and writes to the irqfd.
+    /// KVM delivers the interrupt entirely in kernel space.
+    pub fn inject_irq(&mut self) {
+        self.interrupt_status.fetch_or(0x01, Ordering::Relaxed);
+        self.irqfd.write(1).ok();
+    }
+
+    /// Raw fd for the irqfd — register with KVM via register_irqfd().
+    pub fn irqfd_fd(&self) -> &EventFd {
+        &self.irqfd
     }
 
     pub fn is_driver_ready(&self) -> bool {

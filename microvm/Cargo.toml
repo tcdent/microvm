@@ -14,7 +14,5 @@ libc = "0.2"
 fuse-backend-rs = { version = "0.14", features = ["virtiofs"] }
 virtio-queue = "0.17"
 xdp-net = { path = "../../rust-vmm/xdp-net" }
-
-# S3 client: rusty-s3 for signing, ureq for HTTP
-rusty-s3 = "0.9"
-ureq = "3"
+s3-rootfs = { path = "../s3-rootfs" }
+vmm-sys-util = "0.15.0"

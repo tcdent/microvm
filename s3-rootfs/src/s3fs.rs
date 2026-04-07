@@ -30,6 +30,7 @@ use fuse_backend_rs::abi::fuse_abi::{stat64, FsOptions, OpenOptions};
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem};
 
 use crate::s3::{S3Client, S3Config};
+use crate::log;
 
 const ROOT_INODE: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
@@ -476,10 +477,6 @@ impl FileSystem for S3Fs {
         _flags: u32,
         _fuse_flags: u32,
     ) -> io::Result<usize> {
-        let mut buf = vec![0u8; size as usize];
-        let n = r.read(&mut buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
         let mut handles = self.handles.lock().unwrap();
         let entry = handles.get_mut(handle)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
@@ -487,11 +484,14 @@ impl FileSystem for S3Fs {
         let data = entry.data.get_or_insert_with(Vec::new);
 
         // Extend buffer if write goes past current end
-        let end = offset as usize + n;
+        let end = offset as usize + size as usize;
         if end > data.len() {
             data.resize(end, 0);
         }
-        data[offset as usize..end].copy_from_slice(&buf[..n]);
+
+        // Read directly from guest memory into the handle buffer — no temp allocation
+        let n = r.read(&mut data[offset as usize..end])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         entry.dirty = true;
 
         // Update size in inode table
