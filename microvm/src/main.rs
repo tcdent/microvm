@@ -9,19 +9,25 @@ mod s3fs;
 mod serial;
 mod virtio_fs;
 mod virtio_mmio;
+mod virtio_net;
 mod vm;
 
 use std::sync::Arc;
 
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use vm_memory::GuestMemoryMmap;
+use xdp_net::{MacvtapBackend, NetBackend};
 
 use serial::Serial;
 use virtio_fs::VirtioFs;
+use virtio_net::VirtioNet;
 use s3fs::S3Fs;
 
+// MMIO device addresses — each device gets a 4K region
 const VIRTIO_FS_BASE: u64 = 0xD000_0000;
 const VIRTIO_FS_IRQ: u32 = 5;
+const VIRTIO_NET_BASE: u64 = 0xD000_1000;
+const VIRTIO_NET_IRQ: u32 = 6;
 
 struct System {
     vm: Arc<VmFd>,
@@ -29,10 +35,11 @@ struct System {
     vcpu: VcpuFd,
     serial: Serial,
     virtiofs: VirtioFs<S3Fs>,
+    virtionet: Option<VirtioNet<MacvtapBackend>>,
 }
 
 impl System {
-    fn new(kernel_path: &str, initrd_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(kernel_path: &str, initrd_path: &str, net_ifname: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
         let (kvm, vm) = vm::create_vm()?;
         let vm = Arc::new(vm);
         let memory = memory::setup_guest_memory(&vm)?;
@@ -51,14 +58,20 @@ impl System {
         );
         let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ);
 
-        Ok(Self { vm, memory, vcpu, serial, virtiofs })
+        let virtionet = if let Some(ifname) = net_ifname {
+            log!("Creating virtio-net with interface {}", ifname);
+            let backend = MacvtapBackend::new(ifname)?;
+            let mac = [0x06, 0x00, 0xAC, 0x10, 0xFF, 0x01];
+            Some(VirtioNet::new(backend, mac, VIRTIO_NET_IRQ))
+        } else {
+            None
+        };
+
+        Ok(Self { vm, memory, vcpu, serial, virtiofs, virtionet })
     }
 
     fn run(&mut self) {
         log!("=== microvm started ===");
-        // Test: read the magic value to verify MMIO works
-        let magic = self.virtiofs.mmio.read(0x000, |_| 0);
-        log!("virtio-fs magic test: 0x{:x}", magic);
         loop {
             match self.vcpu.run().expect("KVM_RUN failed") {
                 VcpuExit::IoOut(port, data) => {
@@ -82,54 +95,72 @@ impl System {
                     }
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    match addr {
+                    let val = match addr {
                         VIRTIO_FS_BASE..=0xD000_0FFF => {
                             let offset = addr - VIRTIO_FS_BASE;
-                            let val = self.virtiofs.mmio.read(offset, |off| {
-                                self.virtiofs.config_read(off)
-                            });
-                            if offset >= 0x100 {
-                                log!("MMIO R config[0x{:x}] = 0x{:08x}", offset - 0x100, val);
-                            } else {
-                                log!("MMIO R reg[0x{:03x}] = 0x{:08x}", offset, val);
-                            }
-                            let bytes = val.to_le_bytes();
-                            let len = data.len().min(4);
-                            data[..len].copy_from_slice(&bytes[..len]);
+                            self.virtiofs.mmio.read(offset, |off| self.virtiofs.config_read(off))
                         }
-                        _ => data.fill(0),
-                    }
+                        VIRTIO_NET_BASE..=0xD000_1FFF => {
+                            if let Some(ref net) = self.virtionet {
+                                let offset = addr - VIRTIO_NET_BASE;
+                                net.mmio.read(offset, |off| net.config_read(off))
+                            } else { 0 }
+                        }
+                        _ => { data.fill(0); continue; }
+                    };
+                    let bytes = val.to_le_bytes();
+                    let len = data.len().min(4);
+                    data[..len].copy_from_slice(&bytes[..len]);
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    let val = u32::from_le_bytes(
+                        data[..4.min(data.len())].try_into().unwrap_or([0; 4])
+                    );
                     match addr {
                         VIRTIO_FS_BASE..=0xD000_0FFF => {
                             let offset = addr - VIRTIO_FS_BASE;
-                            let val = u32::from_le_bytes(
-                                data[..4.min(data.len())]
-                                    .try_into()
-                                    .unwrap_or([0; 4])
-                            );
-                            log!("MMIO W reg[0x{:03x}] = 0x{:08x}", offset, val);
                             let notify = self.virtiofs.mmio.write(offset, val, |_, _| {});
-
                             if offset == 0x044 && val == 1 {
-                                let queue_sel = self.virtiofs.mmio.queue_sel();
-                                log!("  queue {} activated", queue_sel);
-                                self.virtiofs.activate_queue(queue_sel as usize);
+                                let qs = self.virtiofs.mmio.queue_sel();
+                                self.virtiofs.activate_queue(qs as usize);
                             }
-
                             if notify {
-                                log!("  queue notify -> processing FUSE");
                                 self.virtiofs.process_queue(&self.memory);
                                 self.virtiofs.mmio.interrupt_status |= 0x01;
                                 self.vm.set_irq_line(VIRTIO_FS_IRQ, true).ok();
                                 self.vm.set_irq_line(VIRTIO_FS_IRQ, false).ok();
                             }
                         }
+                        VIRTIO_NET_BASE..=0xD000_1FFF => {
+                            if let Some(ref mut net) = self.virtionet {
+                                let offset = addr - VIRTIO_NET_BASE;
+                                let notify = net.mmio.write(offset, val, |_, _| {});
+                                if offset == 0x044 && val == 1 {
+                                    let qs = net.mmio.queue_sel();
+                                    net.activate_queue(qs as usize);
+                                }
+                                if notify {
+                                    // TX queue notification — guest sent packets
+                                    net.process_tx(&self.memory);
+                                    net.mmio.interrupt_status |= 0x01;
+                                    self.vm.set_irq_line(VIRTIO_NET_IRQ, true).ok();
+                                    self.vm.set_irq_line(VIRTIO_NET_IRQ, false).ok();
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
-                VcpuExit::Hlt => {}
+                VcpuExit::Hlt => {
+                    // Check for incoming network packets
+                    if let Some(ref mut net) = self.virtionet {
+                        if net.process_rx(&self.memory) {
+                            net.mmio.interrupt_status |= 0x01;
+                            self.vm.set_irq_line(VIRTIO_NET_IRQ, true).ok();
+                            self.vm.set_irq_line(VIRTIO_NET_IRQ, false).ok();
+                        }
+                    }
+                }
                 VcpuExit::Shutdown => {
                     log!("Guest shutdown");
                     break;
@@ -150,16 +181,17 @@ impl System {
 fn main() {
     log::init();
 
-    let kernel_path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: microvm <kernel> <initrd>");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        eprintln!("Usage: microvm <kernel> <initrd> [net-interface]");
         std::process::exit(1);
-    });
-    let initrd_path = std::env::args().nth(2).unwrap_or_else(|| {
-        eprintln!("Usage: microvm <kernel> <initrd>");
-        std::process::exit(1);
-    });
+    }
 
-    match System::new(&kernel_path, &initrd_path) {
+    let kernel_path = &args[1];
+    let initrd_path = &args[2];
+    let net_ifname = args.get(3).map(|s| s.as_str());
+
+    match System::new(kernel_path, initrd_path, net_ifname) {
         Ok(mut system) => system.run(),
         Err(e) => eprintln!("Error: {e}"),
     }

@@ -15,3 +15,4 @@ fuse-backend-rs = { version = "0.14", features = ["virtiofs"] }
 virtio-queue = "0.17"
 rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-rustls-tls"] }
 tokio = { version = "1.51.0", features = ["rt-multi-thread"] }
+xdp-net = { path = "../../rust-vmm/xdp-net" }

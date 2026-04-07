@@ -64,9 +64,9 @@ fn load_cmdline(memory: &GuestMemoryMmap) -> Result<Cmdline, Box<dyn std::error:
     let mut cmdline = Cmdline::new(512)?;
     cmdline.insert_str("console=ttyS0 earlyprintk=ttyS0 random.trust_cpu=on pci=off")?;
     // Register virtio-mmio device: size@base:irq
-    cmdline.insert_str(" virtio_mmio.device=4K@0xd0000000:5")?;
-    // Root via virtiofs (will be used once we have the initramfs mounting it)
-    // For now, keep the initrd as root
+    // Register virtio-mmio devices: size@base:irq
+    cmdline.insert_str(" virtio_mmio.device=4K@0xd0000000:5")?; // virtio-fs
+    cmdline.insert_str(" virtio_mmio.device=4K@0xd0001000:6")?; // virtio-net
     cmdline.insert_str(" rootfstype=virtiofs root=rootfs rw")?;
 
     linux_loader::loader::load_cmdline(memory, GuestAddress(CMDLINE_ADDR), &cmdline)?;
