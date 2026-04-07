@@ -1,8 +1,24 @@
 // S3-backed filesystem — implements fuse-backend-rs FileSystem trait.
-// Maps FUSE operations to S3 API calls via rust-s3.
+// Maps FUSE operations to S3 API calls via our s3 client module.
 //
 // Each file is an S3 object. Directories are zero-byte objects with trailing '/'.
-// POSIX metadata (uid, gid, mode) stored in S3 object user metadata.
+// POSIX metadata (uid, gid, mode) will be stored in S3 object user metadata.
+//
+// Write strategy: data is buffered in memory per file handle and flushed to S3
+// as a single PUT on file close (release). This means:
+// - Small writes are coalesced naturally (editor save = one PUT)
+// - The guest sees writes complete instantly (buffered locally)
+// - Data hits S3 on close, not on every write syscall
+//
+// TODO: Evaluate whether we need an explicit debounce/flush timer for
+// long-lived files that stay open. Current approach flushes on close only,
+// which is correct for most workflows (editors, compilers, scripts). Files
+// that stay open for writes indefinitely (logs, databases) would lose data
+// on crash. Options:
+// - Periodic flush timer (e.g., every 5s if dirty)
+// - fsync/fdatasync handler that triggers immediate PUT
+// - Accept the risk for now since agent workloads are short-lived writes
+// For the initial implementation, flush-on-close is sufficient.
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -12,16 +28,14 @@ use std::time::Duration;
 
 use fuse_backend_rs::abi::fuse_abi::{stat64, FsOptions, OpenOptions};
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem};
-use s3::Bucket;
-use s3::creds::Credentials;
-use s3::Region;
-use tokio::runtime::Runtime;
+
+use crate::s3::{S3Client, S3Config};
 
 const ROOT_INODE: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
 
 struct InodeEntry {
-    key: String,   // S3 key (e.g., "etc/hosts", "home/agent/")
+    key: String,
     is_dir: bool,
     size: u64,
     mode: u32,
@@ -30,9 +44,46 @@ struct InodeEntry {
 }
 
 pub struct S3Fs {
-    bucket: Bucket,
-    rt: Runtime,
+    client: S3Client,
     inodes: Mutex<InodeTable>,
+    /// Open file handles with write buffers — flushed to S3 on release
+    handles: Mutex<HandleTable>,
+}
+
+struct HandleTable {
+    by_handle: HashMap<u64, HandleEntry>,
+    next_handle: u64,
+}
+
+struct HandleEntry {
+    inode: u64,
+    dirty: bool,
+    data: Option<Vec<u8>>, // None = read-only, Some = buffered for write
+}
+
+impl HandleTable {
+    fn new() -> Self {
+        Self { by_handle: HashMap::new(), next_handle: 1 }
+    }
+
+    fn open(&mut self, inode: u64, writing: bool) -> u64 {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.by_handle.insert(handle, HandleEntry {
+            inode,
+            dirty: false,
+            data: if writing { Some(Vec::new()) } else { None },
+        });
+        handle
+    }
+
+    fn get_mut(&mut self, handle: u64) -> Option<&mut HandleEntry> {
+        self.by_handle.get_mut(&handle)
+    }
+
+    fn remove(&mut self, handle: u64) -> Option<HandleEntry> {
+        self.by_handle.remove(&handle)
+    }
 }
 
 struct InodeTable {
@@ -46,9 +97,8 @@ impl InodeTable {
         let mut t = Self {
             by_ino: HashMap::new(),
             by_key: HashMap::new(),
-            next_ino: 2, // 1 is reserved for root
+            next_ino: 2,
         };
-        // Root directory
         t.by_ino.insert(ROOT_INODE, InodeEntry {
             key: String::new(),
             is_dir: true,
@@ -63,6 +113,10 @@ impl InodeTable {
 
     fn get_or_create(&mut self, key: &str, is_dir: bool, size: u64) -> u64 {
         if let Some(&ino) = self.by_key.get(key) {
+            // Update size if changed
+            if let Some(entry) = self.by_ino.get_mut(&ino) {
+                entry.size = size;
+            }
             return ino;
         }
         let ino = self.next_ino;
@@ -90,28 +144,12 @@ impl InodeTable {
 }
 
 impl S3Fs {
-    pub fn new(endpoint: &str, bucket_name: &str, access_key: &str, secret_key: &str) -> Self {
-        let region = Region::Custom {
-            region: "us-east-1".to_string(),
-            endpoint: endpoint.to_string(),
-        };
-        let credentials = Credentials::new(
-            Some(access_key),
-            Some(secret_key),
-            None, None, None,
-        ).expect("Failed to create S3 credentials");
-
-        let mut bucket = Bucket::new(bucket_name, region, credentials)
-            .expect("Failed to create S3 bucket handle")
-            .with_path_style();
-        bucket.set_request_timeout(Some(std::time::Duration::from_secs(10)));
-
-        let rt = Runtime::new().expect("Failed to create tokio runtime");
-
+    pub fn new(config: S3Config) -> Self {
+        let client = S3Client::new(config);
         S3Fs {
-            bucket: *bucket,
-            rt,
+            client,
             inodes: Mutex::new(InodeTable::new()),
+            handles: Mutex::new(HandleTable::new()),
         }
     }
 
@@ -159,7 +197,6 @@ impl FileSystem for S3Fs {
     ) -> io::Result<Entry> {
         let name_str = name.to_str().map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
 
-        // Build the S3 key for this child
         let parent_key = {
             let inodes = self.inodes.lock().unwrap();
             match inodes.get(parent) {
@@ -176,50 +213,12 @@ impl FileSystem for S3Fs {
 
         log!("S3Fs: lookup parent={} name={} key={}", parent, name_str, child_key);
 
-        // Try as file first (HEAD object)
-        let result = self.rt.block_on(async {
-            self.bucket.head_object(&child_key).await
-        });
-
-        if let Ok((head, code)) = result {
-            log!("S3Fs: lookup HEAD {} -> code={}", child_key, code);
-            if code == 200 {
-            let size = head.content_length.unwrap_or(0) as u64;
-            let mut inodes = self.inodes.lock().unwrap();
-            let ino = inodes.get_or_create(&child_key, false, size);
-            let entry_data = inodes.get(ino).unwrap();
-            let st = self.stat_for(ino, entry_data);
-            return Ok(Entry {
-                inode: ino,
-                generation: 0,
-                attr: st,
-                attr_flags: 0,
-                attr_timeout: TTL,
-                entry_timeout: TTL,
-            });
-        } // code == 200
-        } // head_object Ok
-
-        // Try as directory (list with prefix)
-        let dir_key = format!("{}/", child_key);
-        log!("S3Fs: lookup trying dir list prefix={}", dir_key);
-        let result = self.rt.block_on(async {
-            self.bucket.list(dir_key.clone(), Some("/".to_string())).await
-        });
-
-        if let Ok(results) = result {
-            log!("S3Fs: lookup dir list results: {} pages", results.len());
-            let has_contents = results.iter().any(|r| {
-                !r.contents.is_empty() || !r.common_prefixes.as_ref().map_or(true, |p| p.is_empty())
-            });
-            // Also check if the directory marker object exists
-            let dir_exists = has_contents || self.rt.block_on(async {
-                self.bucket.head_object(&dir_key).await.is_ok()
-            });
-
-            if dir_exists {
+        // Try as file (HEAD object)
+        match self.client.head(&child_key) {
+            Ok(meta) if meta.exists => {
+                log!("S3Fs: lookup {} -> file, size={}", child_key, meta.content_length);
                 let mut inodes = self.inodes.lock().unwrap();
-                let ino = inodes.get_or_create(&dir_key, true, 0);
+                let ino = inodes.get_or_create(&child_key, false, meta.content_length);
                 let entry_data = inodes.get(ino).unwrap();
                 let st = self.stat_for(ino, entry_data);
                 return Ok(Entry {
@@ -230,6 +229,39 @@ impl FileSystem for S3Fs {
                     attr_timeout: TTL,
                     entry_timeout: TTL,
                 });
+            }
+            _ => {}
+        }
+
+        // Try as directory (list prefix/)
+        let dir_key = format!("{}/", child_key);
+        log!("S3Fs: lookup trying dir prefix={}", dir_key);
+
+        match self.client.list(&dir_key, Some("/")) {
+            Ok(result) => {
+                let has_contents = !result.objects.is_empty() || !result.prefixes.is_empty();
+                let dir_marker_exists = self.client.head(&dir_key)
+                    .map(|m| m.exists)
+                    .unwrap_or(false);
+
+                if has_contents || dir_marker_exists {
+                    log!("S3Fs: lookup {} -> dir", dir_key);
+                    let mut inodes = self.inodes.lock().unwrap();
+                    let ino = inodes.get_or_create(&dir_key, true, 0);
+                    let entry_data = inodes.get(ino).unwrap();
+                    let st = self.stat_for(ino, entry_data);
+                    return Ok(Entry {
+                        inode: ino,
+                        generation: 0,
+                        attr: st,
+                        attr_flags: 0,
+                        attr_timeout: TTL,
+                        entry_timeout: TTL,
+                    });
+                }
+            }
+            Err(e) => {
+                log!("S3Fs: lookup list error: {}", e);
             }
         }
 
@@ -253,72 +285,66 @@ impl FileSystem for S3Fs {
             }
         };
 
-        let result = self.rt.block_on(async {
-            self.bucket.list(prefix.clone(), Some("/".to_string())).await
-        });
-
-        let results = result.map_err(|e| {
-            log!("S3Fs: readdir list error: {}", e);
-            io::Error::from_raw_os_error(libc::EIO)
-        })?;
+        let result = self.client.list(&prefix, Some("/"))
+            .map_err(|e| {
+                log!("S3Fs: readdir list error: {}", e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
 
         let mut idx: u64 = 0;
-        for page in &results {
-            // Files
-            for obj in &page.contents {
-                let name = obj.key.strip_prefix(&prefix).unwrap_or(&obj.key);
-                if name.is_empty() || name == "/" { continue; }
-                let name = name.trim_end_matches('/');
 
-                if idx >= offset {
-                    let is_dir = obj.key.ends_with('/');
-                    let d_type = if is_dir { libc::DT_DIR } else { libc::DT_REG };
+        // Files
+        for obj in &result.objects {
+            let name = obj.key.strip_prefix(&prefix).unwrap_or(&obj.key);
+            if name.is_empty() || name == "/" { continue; }
+            let name = name.trim_end_matches('/');
 
-                    let mut inodes = self.inodes.lock().unwrap();
-                    let ino = inodes.get_or_create(&obj.key, is_dir, obj.size as u64);
-                    drop(inodes);
+            if idx >= offset {
+                let is_dir = obj.key.ends_with('/');
+                let d_type = if is_dir { libc::DT_DIR } else { libc::DT_REG };
 
-                    match add_entry(DirEntry {
-                        ino,
-                        offset: idx + 1,
-                        type_: d_type as u32,
-                        name: name.as_bytes(),
-                    }) {
-                        Ok(0) => return Ok(()),  // buffer full
-                        Ok(_) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-                idx += 1;
-            }
+                let mut inodes = self.inodes.lock().unwrap();
+                let ino = inodes.get_or_create(&obj.key, is_dir, obj.size);
+                drop(inodes);
 
-            // Subdirectories (common prefixes)
-            if let Some(prefixes) = &page.common_prefixes {
-                for prefix_entry in prefixes {
-                    let name = prefix_entry.prefix
-                        .strip_prefix(&prefix).unwrap_or(&prefix_entry.prefix)
-                        .trim_end_matches('/');
-                    if name.is_empty() { continue; }
-
-                    if idx >= offset {
-                        let mut inodes = self.inodes.lock().unwrap();
-                        let ino = inodes.get_or_create(&prefix_entry.prefix, true, 0);
-                        drop(inodes);
-
-                        match add_entry(DirEntry {
-                            ino,
-                            offset: idx + 1,
-                            type_: libc::DT_DIR as u32,
-                            name: name.as_bytes(),
-                        }) {
-                            Ok(0) => return Ok(()),
-                            Ok(_) => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    idx += 1;
+                match add_entry(DirEntry {
+                    ino,
+                    offset: idx + 1,
+                    type_: d_type as u32,
+                    name: name.as_bytes(),
+                }) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
                 }
             }
+            idx += 1;
+        }
+
+        // Subdirectories (common prefixes)
+        for prefix_str in &result.prefixes {
+            let name = prefix_str
+                .strip_prefix(&prefix).unwrap_or(prefix_str)
+                .trim_end_matches('/');
+            if name.is_empty() { continue; }
+
+            if idx >= offset {
+                let mut inodes = self.inodes.lock().unwrap();
+                let ino = inodes.get_or_create(prefix_str, true, 0);
+                drop(inodes);
+
+                match add_entry(DirEntry {
+                    ino,
+                    offset: idx + 1,
+                    type_: libc::DT_DIR as u32,
+                    name: name.as_bytes(),
+                }) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            idx += 1;
         }
 
         Ok(())
@@ -343,35 +369,272 @@ impl FileSystem for S3Fs {
             }
         };
 
-        let result = self.rt.block_on(async {
-            self.bucket.get_object_range(
-                &key,
-                offset,
-                Some(offset + size as u64 - 1),
-            ).await
-        });
-
-        match result {
-            Ok(response) => {
-                let data = response.bytes();
-                w.write(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-            }
-            Err(e) => {
+        let data = self.client.get_range(&key, offset, offset + size as u64 - 1)
+            .map_err(|e| {
                 log!("S3Fs: read error for {}: {}", key, e);
-                Err(io::Error::from_raw_os_error(libc::EIO))
-            }
-        }
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        w.write(&data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
     fn open(
         &self,
         _ctx: &Context,
+        inode: Self::Inode,
+        flags: u32,
+        _fuse_flags: u32,
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        let writing = (flags & libc::O_ACCMODE as u32) != libc::O_RDONLY as u32;
+        let mut handles = self.handles.lock().unwrap();
+        let handle = handles.open(inode, writing);
+
+        // If opening for write, preload existing content so writes can modify it
+        if writing {
+            let key = {
+                let inodes = self.inodes.lock().unwrap();
+                inodes.get(inode).map(|e| e.key.clone())
+            };
+            if let Some(key) = key {
+                if let Ok(data) = self.client.get(&key) {
+                    if let Some(entry) = handles.get_mut(handle) {
+                        entry.data = Some(data);
+                    }
+                }
+            }
+        }
+
+        Ok((Some(handle), OpenOptions::empty(), None))
+    }
+
+    fn create(
+        &self,
+        _ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        _args: fuse_backend_rs::abi::fuse_abi::CreateIn,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        let name_str = name.to_str().map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
+        let parent_key = {
+            let inodes = self.inodes.lock().unwrap();
+            match inodes.get(parent) {
+                Some(e) => e.key.clone(),
+                None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            }
+        };
+
+        let child_key = if parent_key.is_empty() {
+            name_str.to_string()
+        } else {
+            format!("{}{}", parent_key, name_str)
+        };
+
+        log!("S3Fs: create {}", child_key);
+
+        // PUT empty object
+        self.client.put(&child_key, &[])
+            .map_err(|e| {
+                log!("S3Fs: create PUT error: {}", e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        let mut inodes = self.inodes.lock().unwrap();
+        let ino = inodes.get_or_create(&child_key, false, 0);
+        let entry_data = inodes.get(ino).unwrap();
+        let st = self.stat_for(ino, entry_data);
+        drop(inodes);
+
+        let mut handles = self.handles.lock().unwrap();
+        let handle = handles.open(ino, true);
+
+        Ok((
+            Entry {
+                inode: ino,
+                generation: 0,
+                attr: st,
+                attr_flags: 0,
+                attr_timeout: TTL,
+                entry_timeout: TTL,
+            },
+            Some(handle),
+            OpenOptions::empty(),
+            None,
+        ))
+    }
+
+    fn write(
+        &self,
+        _ctx: &Context,
         _inode: Self::Inode,
+        handle: Self::Handle,
+        r: &mut dyn fuse_backend_rs::api::filesystem::ZeroCopyReader,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
         _flags: u32,
         _fuse_flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, fuse_backend_rs::abi::fuse_abi::OpenOptions, Option<u32>)> {
-        // Stateless — no file handles needed
-        Ok((Some(0), OpenOptions::empty(), None))
+    ) -> io::Result<usize> {
+        let mut buf = vec![0u8; size as usize];
+        let n = r.read(&mut buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let mut handles = self.handles.lock().unwrap();
+        let entry = handles.get_mut(handle)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+
+        let data = entry.data.get_or_insert_with(Vec::new);
+
+        // Extend buffer if write goes past current end
+        let end = offset as usize + n;
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[offset as usize..end].copy_from_slice(&buf[..n]);
+        entry.dirty = true;
+
+        // Update size in inode table
+        {
+            let mut inodes = self.inodes.lock().unwrap();
+            if let Some(inode_entry) = inodes.by_ino.get_mut(&entry.inode) {
+                inode_entry.size = data.len() as u64;
+            }
+        }
+
+        Ok(n)
+    }
+
+    fn release(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _flags: u32,
+        handle: Self::Handle,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        let entry = {
+            let mut handles = self.handles.lock().unwrap();
+            handles.remove(handle)
+        };
+
+        if let Some(entry) = entry {
+            if entry.dirty {
+                if let Some(data) = &entry.data {
+                    let key = {
+                        let inodes = self.inodes.lock().unwrap();
+                        inodes.get(entry.inode).map(|e| e.key.clone())
+                    };
+                    if let Some(key) = key {
+                        log!("S3Fs: release flush {} ({} bytes)", key, data.len());
+                        self.client.put(&key, data)
+                            .map_err(|e| {
+                                log!("S3Fs: release PUT error: {}", e);
+                                io::Error::from_raw_os_error(libc::EIO)
+                            })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mkdir(
+        &self,
+        _ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        _mode: u32,
+        _umask: u32,
+    ) -> io::Result<Entry> {
+        let name_str = name.to_str().map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
+        let parent_key = {
+            let inodes = self.inodes.lock().unwrap();
+            match inodes.get(parent) {
+                Some(e) => e.key.clone(),
+                None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            }
+        };
+
+        let dir_key = if parent_key.is_empty() {
+            format!("{}/", name_str)
+        } else {
+            format!("{}{}/", parent_key, name_str)
+        };
+
+        log!("S3Fs: mkdir {}", dir_key);
+
+        self.client.put(&dir_key, &[])
+            .map_err(|e| {
+                log!("S3Fs: mkdir PUT error: {}", e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        let mut inodes = self.inodes.lock().unwrap();
+        let ino = inodes.get_or_create(&dir_key, true, 0);
+        let entry_data = inodes.get(ino).unwrap();
+        let st = self.stat_for(ino, entry_data);
+
+        Ok(Entry {
+            inode: ino,
+            generation: 0,
+            attr: st,
+            attr_flags: 0,
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        })
+    }
+
+    fn unlink(
+        &self,
+        _ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+    ) -> io::Result<()> {
+        let name_str = name.to_str().map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+
+        let parent_key = {
+            let inodes = self.inodes.lock().unwrap();
+            match inodes.get(parent) {
+                Some(e) => e.key.clone(),
+                None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            }
+        };
+
+        let child_key = if parent_key.is_empty() {
+            name_str.to_string()
+        } else {
+            format!("{}{}", parent_key, name_str)
+        };
+
+        log!("S3Fs: unlink {}", child_key);
+
+        self.client.delete(&child_key)
+            .map_err(|e| {
+                log!("S3Fs: unlink DELETE error: {}", e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        Ok(())
+    }
+
+    fn setattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _attr: stat64,
+        _handle: Option<Self::Handle>,
+        _valid: fuse_backend_rs::abi::fuse_abi::SetattrValid,
+    ) -> io::Result<(stat64, Duration)> {
+        // Stub: accept the setattr but don't persist to S3 metadata yet
+        let inodes = self.inodes.lock().unwrap();
+        match inodes.get(inode) {
+            Some(entry) => Ok((self.stat_for(inode, entry), TTL)),
+            None => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
     }
 
     fn opendir(
@@ -379,7 +642,7 @@ impl FileSystem for S3Fs {
         _ctx: &Context,
         _inode: Self::Inode,
         _flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, fuse_backend_rs::abi::fuse_abi::OpenOptions)> {
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
         Ok((Some(0), OpenOptions::empty()))
     }
 }

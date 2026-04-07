@@ -5,6 +5,7 @@ mod cpu;
 mod kernel;
 mod memory;
 mod mptable;
+mod s3;
 mod s3fs;
 mod serial;
 mod virtio_fs;
@@ -50,12 +51,7 @@ impl System {
         cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
 
         let serial = serial::create(vm.clone());
-        let s3fs = S3Fs::new(
-            "http://localhost:9090",
-            "rootfs",
-            "minioadmin",
-            "minioadmin",
-        );
+        let s3fs = S3Fs::new(s3::S3Config::default());
         let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ);
 
         let virtionet = if let Some(ifname) = net_ifname {
