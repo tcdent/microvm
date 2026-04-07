@@ -58,7 +58,7 @@ impl System {
 
         let serial = serial::create(&vm);
         let s3fs = S3Fs::new(S3Config::default());
-        let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ);
+        let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ, VIRTIO_FS_BASE);
         vm.register_irqfd(virtiofs.mmio.irqfd_fd(), VIRTIO_FS_IRQ)?;
 
         let virtionet = if let Some(ifname) = net_ifname {
@@ -72,9 +72,7 @@ impl System {
             None
         };
 
-        // Set up epoll for event sources
         let poll = EventPoll::new();
-        poll.add(virtiofs.completion_fd(), EVENT_FUSE_COMPLETION);
 
         Ok(Self { vm, memory, vcpu, serial, virtiofs, virtionet, poll })
     }
@@ -128,22 +126,17 @@ impl System {
                     match addr {
                         VIRTIO_FS_BASE..=0xD000_0FFF => {
                             let offset = addr - VIRTIO_FS_BASE;
-                            let notify = self.virtiofs.mmio.write(offset, val, |_, _| {});
+                            self.virtiofs.mmio.write(offset, val, |_, _| {});
                             if offset == 0x044 && val == 1 {
                                 let qs = self.virtiofs.mmio.queue_sel();
                                 self.virtiofs.activate_queue(qs as usize);
-                            }
-                            if notify {
-                                self.virtiofs.dispatch_requests(&self.memory);
-                                // Block on the eventfd until the worker completes.
-                                // This is a blocking read on the eventfd — the
-                                // worker writes to it when done. More efficient
-                                // than spinning and guarantees we don't miss it.
-                                self.virtiofs.wait_for_completion();
-                                if self.virtiofs.process_completions(&self.memory) {
-                                    self.virtiofs.mmio.inject_irq();
+                                // Start worker when the request queue (1) is activated
+                                if qs == 1 {
+                                    self.virtiofs.start_worker(&self.vm, self.memory.clone());
                                 }
                             }
+                            // QueueNotify (0x050) is handled by ioeventfd →
+                            // worker thread. No dispatch needed here.
                         }
                         VIRTIO_NET_BASE..=0xD000_1FFF => {
                             if let Some(ref mut net) = self.virtionet {
@@ -179,19 +172,11 @@ impl System {
                 }
             }
 
-            // After every vCPU exit, check all event sources (non-blocking)
-            for token in self.poll.poll() {
-                match token {
-                    EVENT_FUSE_COMPLETION => {
-                        if self.virtiofs.process_completions(&self.memory) {
-                            self.virtiofs.mmio.inject_irq();
-                        }
-                    }
-                    // NET_RX is handled entirely by the worker thread via irqfd —
-                    // no epoll drain needed. KVM delivers the interrupt directly.
-                    _ => {}
-                }
-            }
+            // After every vCPU exit, check event sources (non-blocking).
+            // Currently both FUSE and NET signal via irqfd directly from
+            // their worker threads, so the epoll drain is available for
+            // future devices that need main-thread processing.
+            for _token in self.poll.poll() {}
         }
     }
 }
