@@ -2,11 +2,10 @@
 mod log;
 
 mod cpu;
+mod event_loop;
 mod kernel;
 mod memory;
 mod mptable;
-mod s3;
-mod s3fs;
 mod serial;
 mod virtio_fs;
 mod virtio_mmio;
@@ -19,24 +18,31 @@ use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use vm_memory::GuestMemoryMmap;
 use xdp_net::{MacvtapBackend, NetBackend};
 
+use s3_rootfs::{S3Fs, S3Config};
+
+use event_loop::EventPoll;
 use serial::Serial;
 use virtio_fs::VirtioFs;
 use virtio_net::VirtioNet;
-use s3fs::S3Fs;
 
-// MMIO device addresses — each device gets a 4K region
+// MMIO device addresses
 const VIRTIO_FS_BASE: u64 = 0xD000_0000;
 const VIRTIO_FS_IRQ: u32 = 5;
 const VIRTIO_NET_BASE: u64 = 0xD000_1000;
 const VIRTIO_NET_IRQ: u32 = 6;
+
+// Event tokens for epoll
+const EVENT_FUSE_COMPLETION: u64 = 1;
+const EVENT_NET_RX: u64 = 2;
 
 struct System {
     vm: Arc<VmFd>,
     memory: GuestMemoryMmap,
     vcpu: VcpuFd,
     serial: Serial,
-    virtiofs: VirtioFs<S3Fs>,
+    virtiofs: VirtioFs,
     virtionet: Option<VirtioNet<MacvtapBackend>>,
+    poll: EventPoll,
 }
 
 impl System {
@@ -51,7 +57,7 @@ impl System {
         cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
 
         let serial = serial::create(vm.clone());
-        let s3fs = S3Fs::new(s3::S3Config::default());
+        let s3fs = S3Fs::new(S3Config::default());
         let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ);
 
         let virtionet = if let Some(ifname) = net_ifname {
@@ -63,7 +69,14 @@ impl System {
             None
         };
 
-        Ok(Self { vm, memory, vcpu, serial, virtiofs, virtionet })
+        // Set up epoll for event sources
+        let poll = EventPoll::new();
+        poll.add(virtiofs.completion_fd(), EVENT_FUSE_COMPLETION);
+        if let Some(ref net) = virtionet {
+            poll.add(net.rx_fd(), EVENT_NET_RX);
+        }
+
+        Ok(Self { vm, memory, vcpu, serial, virtiofs, virtionet, poll })
     }
 
     fn run(&mut self) {
@@ -121,10 +134,17 @@ impl System {
                                 self.virtiofs.activate_queue(qs as usize);
                             }
                             if notify {
-                                self.virtiofs.process_queue(&self.memory);
-                                self.virtiofs.mmio.interrupt_status |= 0x01;
-                                self.vm.set_irq_line(VIRTIO_FS_IRQ, true).ok();
-                                self.vm.set_irq_line(VIRTIO_FS_IRQ, false).ok();
+                                self.virtiofs.dispatch_requests(&self.memory);
+                                // Block on the eventfd until the worker completes.
+                                // This is a blocking read on the eventfd — the
+                                // worker writes to it when done. More efficient
+                                // than spinning and guarantees we don't miss it.
+                                self.virtiofs.wait_for_completion();
+                                if self.virtiofs.process_completions(&self.memory) {
+                                    self.virtiofs.mmio.interrupt_status |= 0x01;
+                                    self.vm.set_irq_line(VIRTIO_FS_IRQ, true).ok();
+                                    self.vm.set_irq_line(VIRTIO_FS_IRQ, false).ok();
+                                }
                             }
                         }
                         VIRTIO_NET_BASE..=0xD000_1FFF => {
@@ -136,7 +156,6 @@ impl System {
                                     net.activate_queue(qs as usize);
                                 }
                                 if notify {
-                                    // TX queue notification — guest sent packets
                                     net.process_tx(&self.memory);
                                     net.mmio.interrupt_status |= 0x01;
                                     self.vm.set_irq_line(VIRTIO_NET_IRQ, true).ok();
@@ -147,16 +166,7 @@ impl System {
                         _ => {}
                     }
                 }
-                VcpuExit::Hlt => {
-                    // Check for incoming network packets
-                    if let Some(ref mut net) = self.virtionet {
-                        if net.process_rx(&self.memory) {
-                            net.mmio.interrupt_status |= 0x01;
-                            self.vm.set_irq_line(VIRTIO_NET_IRQ, true).ok();
-                            self.vm.set_irq_line(VIRTIO_NET_IRQ, false).ok();
-                        }
-                    }
-                }
+                VcpuExit::Hlt => {}
                 VcpuExit::Shutdown => {
                     log!("Guest shutdown");
                     break;
@@ -170,12 +180,36 @@ impl System {
                     break;
                 }
             }
+
+            // After every vCPU exit, check all event sources (non-blocking)
+            for token in self.poll.poll() {
+                match token {
+                    EVENT_FUSE_COMPLETION => {
+                        if self.virtiofs.process_completions(&self.memory) {
+                            self.virtiofs.mmio.interrupt_status |= 0x01;
+                            self.vm.set_irq_line(VIRTIO_FS_IRQ, true).ok();
+                            self.vm.set_irq_line(VIRTIO_FS_IRQ, false).ok();
+                        }
+                    }
+                    EVENT_NET_RX => {
+                        if let Some(ref mut net) = self.virtionet {
+                            if net.process_rx(&self.memory) {
+                                net.mmio.interrupt_status |= 0x01;
+                                self.vm.set_irq_line(VIRTIO_NET_IRQ, true).ok();
+                                self.vm.set_irq_line(VIRTIO_NET_IRQ, false).ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
 
 fn main() {
     log::init();
+    s3_rootfs::set_log_fn(|msg| crate::log::write(msg));
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
