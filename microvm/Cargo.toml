@@ -1,0 +1,17 @@
+[package]
+name = "microvm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+kvm-ioctls = "0.24"
+vm-memory = { version = "0.17", features = ["backend-mmap"] }
+linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
+nix = { version = "0.30", features = ["fs", "mman", "ioctl", "net", "poll"] }
+vm-superio = "0.8"
+libc = "0.2"
+fuse-backend-rs = { version = "0.14", features = ["virtiofs"] }
+virtio-queue = "0.17"
+rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-rustls-tls"] }
+tokio = { version = "1.51.0", features = ["rt-multi-thread"] }

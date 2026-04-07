@@ -1,0 +1,20 @@
+# Build artifacts
+target/
+microvm/target/
+
+# Kernel source (downloaded, not ours)
+kernel/src/
+
+# Large binary artifacts (downloaded)
+dist/vmlinux
+dist/vmlinuz
+dist/initrd.gz
+dist/initramfs.cpio.gz
+dist/extract-vmlinux
+dist/modules/
+
+# OS junk
+.DS_Store
+
+# Cargo lock in workspace members
+Cargo.lock
