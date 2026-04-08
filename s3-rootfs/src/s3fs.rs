@@ -22,6 +22,12 @@ use crate::s3::{S3Client, S3Config};
 use crate::log;
 
 const ROOT_INODE: u64 = 1;
+
+/// Cache statistics for observability and testing.
+pub struct CacheStats {
+    pub inode_count: usize,
+    pub negative_count: usize,
+}
 const TTL: Duration = Duration::from_secs(1);
 /// Number of S3 keys to fetch per lookup LIST probe.
 /// Includes the target entry + neighbors for cache pre-fill.
@@ -75,6 +81,15 @@ impl S3Fs {
             client: S3Client::new(config),
             cache: Mutex::new(InodeCache::new()),
             handles: Mutex::new(HandleTable::new()),
+        }
+    }
+
+    /// Cache statistics for observability and testing.
+    pub fn cache_stats(&self) -> CacheStats {
+        let cache = self.cache.lock().unwrap();
+        CacheStats {
+            inode_count: cache.inode_count(),
+            negative_count: cache.negative_count(),
         }
     }
 

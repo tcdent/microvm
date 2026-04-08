@@ -121,6 +121,16 @@ impl InodeCache {
     pub fn is_negative(&self, path: &str) -> bool {
         self.negative.contains(path)
     }
+
+    /// Number of cached inodes (excluding root).
+    pub fn inode_count(&self) -> usize {
+        self.by_path.len()
+    }
+
+    /// Number of negatively cached paths.
+    pub fn negative_count(&self) -> usize {
+        self.negative.len()
+    }
 }
 
 #[cfg(test)]
