@@ -565,7 +565,7 @@ a comment explaining the lifetime guarantee.
 | 6 | Notification suppression | Reduces interrupt/exit rate under load | Skipped (no trade-off) |
 | 7 | ioeventfd for queue notify | Eliminates most frequent VM exit | Done (virtio-fs); net TX deferred |
 | 8 | Memory ordering | Correctness under threading | Handled |
-| 9 | S3 request budget | Reduces HTTP round-trips per FS op | Open — see §9 |
+| 9 | S3 request budget | Reduces HTTP round-trips per FS op | Done (metadata-in-keys, cache, pre-fill) |
 
 ---
 
@@ -1202,17 +1202,78 @@ kernel. All other operations parse the fixed 20-byte hex suffix.
    (`/usr` has ~8-10 entries, `/etc` has ~20-30). 12 covers the common
    narrow directories fully and gives partial coverage of wider ones.
 
-### `open` for write preloads unconditionally
+### Resolution — IMPLEMENTED
 
-Separate from the lookup issue. `open` with write flags (`s3fs.rs:434-447`)
-always does a full `GET` to preload the file contents. Necessary for
-read-modify-write, but wasteful for truncate-and-rewrite (the common case
-for editors and compilers). If `O_TRUNC` is set, the preload is wasted.
+The metadata-in-keys design is fully implemented across three new modules:
 
-**Fix:** check for `O_TRUNC` and skip the GET:
+**`keys.rs`**: `encode`/`decode`/`list_prefix` for the `path\x01<20 hex>`
+format. Includes test for sort-order property (directory key < child key).
+
+**`cache.rs`**: Bidirectional `InodeCache` (path↔inode). Populated by
+LIST results via `insert_from_key()`. Preserves inode numbers and symlink
+targets on update. Root inode pre-initialized.
+
+**`s3.rs`**: `list_probe()` — single-page LIST with configurable max-keys,
+no pagination. URL-decodes keys from S3's XML response (handles the
+percent-encoded `\x01` byte correctly).
+
+**`s3fs.rs`**: Full rewrite of the FUSE implementation:
+
+- `lookup`: checks cache first, falls back to `probe_and_cache()` which
+  does `list_probe(prefix=path\x01, max_keys=12)`. All results (target +
+  neighbors) are parsed and cached. One LIST, one code path.
+- `readdir`: LISTs children, decodes every key, populates cache. Filters
+  to direct children. Subsequent lookups are cache hits.
+- `readlink`: cache check → GET on miss → caches target. Target is object
+  body.
+- `read`: reconstructs S3 key from cached path + meta. Direct GET, no
+  LIST.
+- `create`/`mkdir`: construct keys via `keys::encode`, PUT, update cache.
+- `unlink`: reconstruct key from cache, DELETE, evict from cache.
+- `getattr`: purely from cache, zero S3 calls.
+
+**HEAD is eliminated.** Not called anywhere. All metadata from keys.
+
+**Confirmed S3 hit patterns match the design:**
+
+| FUSE op | S3 calls | Verified |
+|---------|----------|----------|
+| lookup (cold) | 1 LIST | `probe_and_cache` with max-keys=12 |
+| lookup (warm) | 0 | cache check at top of `lookup` |
+| readdir | 1 LIST | populates cache for all children |
+| getattr | 0 | served from cache |
+| read | 1 GET | key from cache, no LIST |
+| readlink (cold) | 1 GET | target from object body |
+| readlink (warm) | 0 | `symlink_target` field in cache |
+| open (read) | 0 | handle allocation only |
+| open (write) | 1 GET | preload existing content |
+| release (dirty) | 1 PUT | flush buffer |
+| create | 1 PUT | new key, update cache |
+| mkdir | 1 PUT | new key, update cache |
+| unlink | 1 DELETE | evict from cache |
+
+### Remaining items from §9
+
+**`readdir` without delimiter.** The current implementation does
+`list(prefix, None)` — no delimiter — which returns the entire subtree,
+then filters to direct children in Rust (`child_name.contains('/')`).
+This works correctly but wastes transfer on deep trees. Adding
+`delimiter='/'` would let S3 do the filtering. Direct children still
+appear in Contents with full encoded keys. Subdirectory grouping in
+CommonPrefixes is harmless (we already have the dir entry in Contents
+since directories don't use trailing slashes).
+
+**`open` O_TRUNC optimization.** Not yet implemented. `open` for write
+still unconditionally GETs existing content (`s3fs.rs:344-357`). The
+fix is a one-liner:
+
 ```rust
 let needs_preload = writing && (flags & libc::O_TRUNC as u32) == 0;
 ```
+
+**Negative caching.** Not yet implemented. Lookup misses return ENOENT
+but aren't recorded in the cache. The kernel re-lookups on TTL expiry
+and we re-LIST. Adding a sentinel entry for misses would eliminate this.
 
 ---
 
@@ -1294,3 +1355,161 @@ Net TX queue notifications cause a vCPU exit to dispatch `process_tx()`
 fast and the exit overhead is small relative to the syscall. If net TX
 throughput becomes a concern, adding ioeventfd + a TX worker (mirroring
 the virtio-fs pattern) would eliminate the exit. Low priority.
+
+---
+
+## 10. S3Fs Implementation Gaps
+
+Code review of `s3-rootfs/src/s3fs.rs` and `s3-rootfs/src/s3.rs` against
+the §9 design. The metadata-in-keys, probe-and-cache, and write-buffering
+strategies are implemented correctly. These are the remaining gaps.
+
+### 10a. No read caching — every `read()` is an HTTP round-trip
+
+`read()` (`s3fs.rs:312-338`) calls `get_range()` on every invocation.
+The guest kernel issues FUSE reads in chunks (typically 128KB). Sequential
+`cat bigfile.txt` on a 1MB file is ~8 HTTP GETs, each paying the full
+S3 latency floor (~5-20ms against local MinIO, much more against remote
+S3). That's 40-160ms for 1MB of sequential read.
+
+This is the most impactful data-path gap. Options, in order of complexity:
+
+**A. Cache last GET response.** If the guest reads the same file
+sequentially (common: `read()`, `read()`, `read()` at increasing
+offsets), cache the previous GET response and serve from it if the
+requested range overlaps. One `Vec<u8>` per open file handle, evicted
+on `release`. Covers the dominant access pattern with ~20 lines.
+
+**B. Read-ahead with larger GET ranges.** When a 128KB read arrives,
+fetch 1MB from S3 and cache the excess. Subsequent reads within the
+same 1MB window are served from cache. Trade-off: wastes bandwidth if
+the guest seeks randomly, but sequential access is the common case for
+a coding agent reading source files.
+
+**C. Per-file block cache.** Cache fixed-size blocks (e.g., 256KB) keyed
+by inode + offset. LRU eviction with a configurable memory budget. This
+handles both sequential and random access patterns. More complex but
+would also benefit repeated reads of the same file regions (e.g., shared
+library headers, ELF segments).
+
+**Recommendation:** Start with **B** — fetch 512KB-1MB on first read,
+cache per handle, serve subsequent reads from buffer. This is a natural
+extension of the write buffering pattern already in `HandleEntry.data`.
+The same `data: Option<Vec<u8>>` field could serve double duty: populated
+lazily on first read, used for write buffering if the handle is writable.
+
+### 10b. No cache invalidation or TTL
+
+The `InodeCache` has no eviction. Once an inode is inserted, it lives
+forever with whatever size and metadata it had at insertion time. If
+something modifies the S3 bucket externally (e.g., pushing a new rootfs
+snapshot while the VM is running), the guest sees stale data indefinitely.
+
+The §9 design noted this is acceptable under the single-writer assumption
+(the VM is the only writer). That still holds. But two scenarios need
+consideration:
+
+1. **Host-side file injection.** The VMM may push files into S3 for the
+   guest to pick up (config files, agent instructions). Since the VMM
+   owns both the S3 client and the FUSE server, it can update the inode
+   cache directly — no TTL needed. This path doesn't exist yet but is
+   architecturally straightforward.
+
+2. **Long-running VMs.** If the VM runs for hours/days, memory grows
+   monotonically as new inodes are cached. A coding agent that `find`s
+   the entire filesystem would cache every inode. An LRU or size-bounded
+   cache would cap this, but it's not urgent for 256MB guest RAM VMs
+   where the inode table is small relative to guest memory.
+
+### 10c. `setattr` doesn't persist
+
+`setattr` (`s3fs.rs:543-555`) returns success but only updates the cache.
+The metadata change is never written to S3. This means `chmod`, `chown`,
+`utimes` appear to succeed but are lost on next cold lookup.
+
+For a coding agent VM where everything is root:root 0755, this may not
+matter in practice. But package managers (`apt`, `pip`) and build systems
+(`make`) do check and set permissions. If `setattr` silently lies, subtle
+breakage accumulates.
+
+**Fix:** On `setattr`, if mode/uid/gid changed, we need to rename the S3
+key (since metadata is encoded in the key). This is a copy + delete in
+S3 — no atomic rename. The operation sequence:
+
+```
+1. PUT new key (path\x01<new_meta>) with existing object body
+2. DELETE old key (path\x01<old_meta>)
+3. Update cache
+```
+
+This is expensive (GET + PUT + DELETE = 3 requests) so it should be
+deferred or batched. One option: mark the inode as "meta-dirty" and
+persist on `release` or `fsync`, similar to how data writes are deferred.
+
+### 10d. Write buffer is unbounded
+
+`write()` (`s3fs.rs:403-444`) grows `HandleEntry.data` without limit.
+The design doc mentions a 100MB file limit but it's not enforced. A guest
+writing a large file (or a malicious process) will grow the VMM's heap
+until OOM.
+
+**Fix:** Check `data.len()` against a configured max (e.g., 100MB) and
+return `EFBIG` if exceeded. One-liner in `write()`.
+
+### 10e. No `rename`
+
+`rename` is not implemented. This is the most impactful missing FUSE
+operation for a coding agent workload:
+
+- `mv file.txt new.txt` — fails
+- `sed -i 's/foo/bar/' file.txt` — fails (writes tempfile, renames)
+- Every text editor (vim, nano, emacs) — atomic save via write-tmp + rename
+- `git checkout` — renames files during branch switch
+- `pip install` — renames during package installation
+
+S3 has no rename primitive. Implementation requires copy + delete:
+
+```
+1. GET old key (or skip if we have cached data)
+2. PUT new key (path\x01<meta>) with same body
+3. DELETE old key
+4. Update cache: remove old path, insert new path with same inode
+```
+
+For directories, this requires recursively renaming all children (LIST
+prefix, copy+delete each). This is expensive but necessary for
+correctness.
+
+**Priority:** High. Without rename, the filesystem is effectively
+read-only for most real-world tools.
+
+### 10f. `readdir` loads entire directory before yielding
+
+`readdir` (`s3fs.rs:206-273`) calls `self.client.list()` which paginates
+internally and returns all results, then iterates to yield entries. For
+a directory with 10K files, this fetches and parses all 10K keys before
+returning the first `DirEntry` to the FUSE layer.
+
+The FUSE protocol supports incremental readdir via the `offset` parameter
+and the `add_entry` return value (returns 0 when the buffer is full). The
+current code respects the offset for skipping, but all data is already
+in memory.
+
+For typical system directories (10-100 entries) this is fine. For large
+directories (`node_modules/`, `.git/objects/`) it could be a latency
+spike on first `ls`. Not urgent but worth noting.
+
+### Summary: S3Fs implementation vs design
+
+| Feature | Design (§9) | Implementation | Gap |
+|---------|-------------|----------------|-----|
+| Metadata-in-keys | Full | Full | None |
+| Probe-and-cache (LIST) | max-keys=12 | max-keys=12 | None |
+| Negative caching | Designed | Implemented | None |
+| readdir→lookup pre-fill | Designed | Implemented | None |
+| Read caching | Not designed | Not implemented | **High impact** |
+| Cache eviction/TTL | Deferred | Not implemented | Low (single-writer) |
+| setattr persistence | Not designed | Not implemented | Medium |
+| Write buffer bounds | 100MB limit noted | Unbounded | Low risk, easy fix |
+| rename | Not designed | Not implemented | **High impact** |
+| readdir streaming | Not designed | Loads all first | Low |

@@ -5,7 +5,7 @@
 // HashMap; the trait interface allows swapping in LRU, TTL-based,
 // or shared-memory implementations later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::keys::KeyMeta;
 
@@ -29,6 +29,7 @@ pub struct CachedInode {
 pub struct InodeCache {
     by_path: HashMap<String, CachedInode>,
     by_ino: HashMap<u64, String>, // ino → path (reverse lookup)
+    negative: HashSet<String>,    // paths known to not exist
     next_ino: u64,
 }
 
@@ -37,6 +38,7 @@ impl InodeCache {
         let mut cache = Self {
             by_path: HashMap::new(),
             by_ino: HashMap::new(),
+            negative: HashSet::new(),
             next_ino: 2, // 1 reserved for root
         };
         // Root directory
@@ -63,6 +65,7 @@ impl InodeCache {
 
     /// Insert or update a cache entry. Assigns an inode number if new.
     pub fn insert(&mut self, path: &str, mut entry: CachedInode) -> u64 {
+        self.negative.remove(path);
         if let Some(existing) = self.by_path.get(path) {
             let ino = existing.ino;
             entry.ino = ino;
@@ -107,6 +110,16 @@ impl InodeCache {
         if let Some(entry) = self.by_path.get_mut(path) {
             entry.symlink_target = Some(target);
         }
+    }
+
+    /// Record a negative cache entry (path known to not exist).
+    pub fn insert_negative(&mut self, path: &str) {
+        self.negative.insert(path.to_string());
+    }
+
+    /// Check if a path is negatively cached (known miss).
+    pub fn is_negative(&self, path: &str) -> bool {
+        self.negative.contains(path)
     }
 }
 

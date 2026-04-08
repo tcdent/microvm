@@ -142,6 +142,10 @@ impl S3Fs {
             }
         }
 
+        if found_ino.is_none() {
+            cache.insert_negative(path);
+        }
+
         found_ino.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
     }
 }
@@ -183,6 +187,9 @@ impl FileSystem for S3Fs {
             if let Some(entry) = cache.get(&path) {
                 return Ok(Self::entry_for(entry.ino, entry));
             }
+            if cache.is_negative(&path) {
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
         }
 
         // Cache miss — probe S3 with LIST, pre-fill neighbors
@@ -219,7 +226,7 @@ impl FileSystem for S3Fs {
             format!("{}/", parent_path)
         };
 
-        let result = self.client.list(&list_prefix, None)
+        let result = self.client.list(&list_prefix, Some("/"))
             .map_err(|e| {
                 log!("S3Fs: readdir list error: {}", e);
                 io::Error::from_raw_os_error(libc::EIO)
@@ -341,7 +348,8 @@ impl FileSystem for S3Fs {
         let mut handles = self.handles.lock().unwrap();
         let handle = handles.open(inode, writing);
 
-        if writing {
+        let truncating = (flags & libc::O_TRUNC as u32) != 0;
+        if writing && !truncating {
             let (path, meta) = {
                 let cache = self.cache.lock().unwrap();
                 cache.get_by_ino(inode).map(|(p, e)| (p.to_string(), e.meta))
