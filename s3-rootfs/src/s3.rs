@@ -264,19 +264,21 @@ impl S3Client {
             continuation_token = next_token;
         }
 
-        Ok(ListResult { objects: all_objects, prefixes: all_prefixes })
+        Ok(ListResult { objects: all_objects, prefixes: all_prefixes, is_truncated: false })
     }
 
     /// Lightweight LIST for lookup — single page, no pagination, small result set.
-    /// Used with the \x01 key format: prefix=path\x01, no delimiter, max_keys results.
     /// Returns raw keys + sizes for cache population.
-    pub fn list_probe(&self, prefix: &str, max_keys: u32) -> Result<ListResult, S3Error> {
+    pub fn list_probe(&self, prefix: &str, delimiter: Option<&str>, max_keys: u32) -> Result<ListResult, S3Error> {
         let mut action = self.bucket
             .list_objects_v2(Some(&self.credentials));
 
         let max_keys_str = max_keys.to_string();
         action.query_mut().insert("prefix", prefix);
         action.query_mut().insert("max-keys", &max_keys_str);
+        if let Some(d) = delimiter {
+            action.query_mut().insert("delimiter", d);
+        }
 
         let url = action.sign(self.sign_duration);
 
@@ -293,6 +295,7 @@ impl S3Client {
 pub struct ListResult {
     pub objects: Vec<ListObject>,
     pub prefixes: Vec<String>,
+    pub is_truncated: bool,
 }
 
 pub struct ListObject {
@@ -338,7 +341,11 @@ fn parse_list_response(xml: &str) -> Result<ListResult, S3Error> {
         i += 1;
     }
 
-    Ok(ListResult { objects, prefixes })
+    let is_truncated = extract_tag(xml, "IsTruncated")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    Ok(ListResult { objects, prefixes, is_truncated })
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {

@@ -31,6 +31,10 @@ pub struct InodeCache {
     by_ino: HashMap<u64, String>, // ino → path (reverse lookup)
     negative: HashSet<String>,    // paths known to not exist
     next_ino: u64,
+    // Hit/miss counters for observability
+    pub hits: u64,
+    pub misses: u64,
+    pub negative_hits: u64,
 }
 
 impl InodeCache {
@@ -40,6 +44,9 @@ impl InodeCache {
             by_ino: HashMap::new(),
             negative: HashSet::new(),
             next_ino: 2, // 1 reserved for root
+            hits: 0,
+            misses: 0,
+            negative_hits: 0,
         };
         // Root directory
         cache.insert("", CachedInode {
@@ -52,8 +59,14 @@ impl InodeCache {
     }
 
     /// Look up by path. Returns None on cache miss.
-    pub fn get(&self, path: &str) -> Option<&CachedInode> {
-        self.by_path.get(path)
+    pub fn get(&mut self, path: &str) -> Option<&CachedInode> {
+        if self.by_path.contains_key(path) {
+            self.hits += 1;
+            self.by_path.get(path)
+        } else {
+            self.misses += 1;
+            None
+        }
     }
 
     /// Look up by inode number. Returns (path, inode) on hit.
@@ -118,8 +131,13 @@ impl InodeCache {
     }
 
     /// Check if a path is negatively cached (known miss).
-    pub fn is_negative(&self, path: &str) -> bool {
-        self.negative.contains(path)
+    pub fn is_negative(&mut self, path: &str) -> bool {
+        if self.negative.contains(path) {
+            self.negative_hits += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Number of cached inodes (excluding root).
@@ -139,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_root_exists() {
-        let cache = InodeCache::new();
+        let mut cache = InodeCache::new();
         let root = cache.get("").unwrap();
         assert_eq!(root.ino, 1);
         assert_eq!(root.meta.file_type(), libc::S_IFDIR as u32);

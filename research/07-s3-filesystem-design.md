@@ -171,59 +171,74 @@ after `bin` differ. No ambiguity.
 
 ### Opportunistic pre-fill
 
-Since both files and directories use `path\x01<meta>`, every lookup
-is the same query:
+Pre-fill happens at the **parent directory** level, not the file level.
+When the kernel looks up a child name inside a directory, we LIST the
+parent directory with a small cap instead of doing a precise single-key
+probe:
 
 ```
-LIST prefix=usr/bin/bash\x01&max-keys=12
+LIST prefix=usr/bin/&max-keys=12
 ```
 
-The prefix `usr/bin/bash\x01` precisely matches only keys for that
-exact path — no false matches from `usr/bin/bashrc` (which would be
-`usr/bin/bashrc\x01...`, different bytes after `bash`).
+No `\x01`, no child name in the prefix — just the parent path + `/`.
+S3 returns up to 12 keys starting with `usr/bin/`:
+
+```
+usr/bin/bash\x0181ed...    ← maybe the one we need
+usr/bin/cat\x0181ed...     ← free
+usr/bin/chmod\x0181ed...   ← free
+usr/bin/cp\x0181ed...      ← free
+usr/bin/dash\x0181ed...    ← free
+...up to 12 total
+```
+
+We scan the results for the specific child we're looking for. If it's
+there, we have our answer. Either way, we cache everything we got —
+those siblings are exactly the entries the kernel is likely to ask about
+next (think `$PATH` resolution, `ls`, tab completion).
 
 **Why `max-keys=12` instead of 1?** The round-trip latency dominates
 the cost of a LIST — returning 12 results vs 1 adds negligible overhead
 (a few hundred extra bytes of XML on the wire). By asking for 12, we
-get the entry we're looking for plus up to 11 subsequent entries from
-the sorted keyspace. Those extras are free passengers that pre-fill
-the cache.
+get the entry we're looking for plus up to 11 siblings for free.
 
-After `usr/bin/bash\x01<meta>` in the sorted keyspace, the next keys
-are its lexicographic neighbors:
+**If the child isn't in the first 12 results** (large directory, child
+sorts late alphabetically), we fall back to a precise probe:
 
 ```
-usr/bin/bash\x0181ed...   ← the entry we asked for
-usr/bin/cat\x0181ed...    ← free
-usr/bin/chmod\x0181ed...  ← free
-usr/bin/cp\x0181ed...     ← free
-usr/bin/dash\x0181ed...   ← free
-...up to 11 more
+LIST prefix=usr/bin/zsh\x01&max-keys=1
 ```
 
-These are siblings in the same directory — exactly the entries the
-kernel is likely to ask about next (think `$PATH` resolution, `ls`,
-tab completion). We parse all of them and populate our inode cache.
+This always returns exactly the right entry. The pre-fill was a
+speculative optimization that pays off in narrow directories (which
+are the common case for system paths) and misses gracefully in wide
+directories.
 
-For a directory lookup like `usr\x01`:
+**Example: looking up "lib" inside "usr/":**
 
 ```
-usr\x0141ed...             ← the entry: it's a directory
-usr/bin\x0141ed...         ← free: child directory
-usr/bin/bash\x0181ed...    ← free: grandchild file
-usr/bin/cat\x0181ed...     ← free: grandchild file
-...
+LIST prefix=usr/&max-keys=12
 ```
 
-We get the directory itself plus the first few children (and possibly
-grandchildren), warming the cache for the next several path lookups
-the kernel will make as it walks deeper.
+Returns:
+```
+usr/bin\x0141ed...        ← child directory, cached
+usr/include\x0141ed...    ← child directory, cached
+usr/lib\x0141ed...        ← the one we wanted, cached
+usr/local\x0141ed...      ← child directory, cached
+usr/sbin\x0141ed...       ← child directory, cached
+usr/share\x0141ed...      ← child directory, cached
+```
+
+`/usr` has ~6-10 children. All of them fit in 12. The next time the
+kernel asks about `share` or `local` or `sbin`, they're already cached.
+One LIST pre-filled the entire directory.
 
 The depth of pre-fill depends on the fan-out. A narrow directory like
 `/usr` (8-10 children) gets entirely pre-filled. A wide directory
 like `/usr/bin` (hundreds of entries) gets the first ~11 entries,
-which still helps because it covers the alphabetically early commands
-the kernel tends to probe first.
+which still helps for alphabetically early entries. The rest fall
+through to precise probes.
 
 ### max-keys tuning
 
@@ -244,29 +259,41 @@ result, then `lookup("bin")`, waits, then `lookup("bash")`. Each
 call is serial — the kernel needs the parent inode before it can ask
 about the child. We can't change this; it's how Linux VFS works.
 
-But with `max-keys=12`, each lookup pre-fills the next few steps:
+But with pre-fill, each lookup caches siblings for the next steps:
 
-1. `lookup("usr")` → `LIST prefix=usr\x01&max-keys=12`
-   Returns: `usr` (dir), `usr/bin` (dir), `usr/bin/bash` (file), ...
-   Cache now has: usr, usr/bin, usr/bin/bash, usr/bin/cat, ...
+1. `lookup("usr")` in root → `LIST prefix=&max-keys=12` (root children)
+   Returns: `bin` (symlink), `etc` (dir), `lib` (symlink), `sbin` (symlink),
+   `usr` (dir), `var` (dir), ...
+   Cache now has: bin, etc, lib, sbin, usr, var — the top-level dirs.
+   Found "usr" in results. 1 LIST.
 
-2. `lookup("bin")` → **cache hit** (pre-filled in step 1). 0 requests.
+2. `lookup("bin")` in usr → `LIST prefix=usr/&max-keys=12`
+   Returns: `usr/bin` (dir), `usr/include` (dir), `usr/lib` (dir),
+   `usr/local` (dir), `usr/sbin` (dir), `usr/share` (dir)
+   Cache now has all children of `/usr`. Found "bin". 1 LIST.
 
-3. `lookup("bash")` → **cache hit** (pre-filled in step 1). 0 requests.
+3. `lookup("bash")` in usr/bin → `LIST prefix=usr/bin/&max-keys=12`
+   Returns: `usr/bin/bash`, `usr/bin/cat`, `usr/bin/chmod`, ...
+   Cache now has first 12 entries of `/usr/bin`. Found "bash". 1 LIST.
 
-A 3-component path traversal costs 1 LIST instead of 3. The pre-fill
-naturally covers the serial lookup pattern because the sorted keyspace
-mirrors the directory hierarchy.
+A 3-component path traversal costs 3 LISTs, but each one pre-fills
+siblings at that level. The next path traversal through the same tree
+(e.g., `/usr/lib/libfoo.so`) would cost:
+
+1. `lookup("usr")` → **cache hit** (from step 1). 0 requests.
+2. `lookup("lib")` → **cache hit** (from step 2). 0 requests.
+3. `lookup("libfoo.so")` → 1 LIST (new directory). Caches 12 siblings.
+
+Second traversal: 1 LIST instead of 3. The first traversal pays full
+price but warms the tree for everything that follows.
 
 This works especially well for the shallow, narrow directories at the
 top of the tree (`/usr`, `/etc`, `/var`) which typically have fewer than
-12 direct children. The entire first level or two gets cached on the
-first lookup.
+12 direct children — a single LIST caches the entire level.
 
-For deeper or wider directories, pre-fill covers the first ~11 entries
-alphabetically. The rest require their own lookup when accessed, which
-is the expected cost — we're not trying to cache the entire filesystem,
-just exploit locality for free.
+For wider directories like `/usr/bin` (hundreds of entries), pre-fill
+covers the first ~12 entries alphabetically. The rest fall through to
+precise probes when accessed.
 
 ### The readdir→lookup storm
 
@@ -557,40 +584,40 @@ kernel. All other operations parse the fixed 20-byte hex suffix.
 | O_TRUNC skip preload | `s3fs.rs` | skip GET when truncating on open |
 | Write buffering | `s3fs.rs` | per-handle buffer, flushed on release |
 | Symlink target caching | `cache.rs` | populated on first readlink |
-| Cache observability | `s3fs.rs` | `CacheStats` (inode_count, negative_count) |
+| Cache observability | `s3fs.rs`, `cache.rs` | `CacheStats` with hit/miss/negative_hit counters |
+| Read caching | `s3fs.rs` | configurable via `with_read_cache()`, default 2MB |
+| Dir-level prefill | `s3fs.rs` | LIST parent dir with delimiter, fallback to precise probe |
+| IsTruncated handling | `s3.rs`, `s3fs.rs` | use S3's flag, not object count heuristic |
+| Integration test harness | `tests/` | 43 tests across 5 modules against live RustFS |
+
+### Read caching — implemented, no boot time impact
+
+Read caching is implemented: on first `read()`, files ≤ `read_cache_max`
+(default 2MB, configurable, 0 = disabled) are fetched in full via a single
+GET and cached in the file handle. Subsequent reads serve from the buffer.
+
+This eliminates ~12 sequential GETs per shared library load (e.g., libc.so.6
+at 1.7MB was 12 range GETs, now 1 full GET). However, **boot time testing
+showed no measurable improvement**:
+
+| read_cache_max | Boot time |
+|----------------|-----------|
+| 0 (disabled) | 1min 39.6s |
+| 2MB (default) | ~1min 39s |
+| 5MB | 1min 38.3s |
+
+**Why:** The FUSE worker runs on a dedicated thread (via ioeventfd). S3
+I/O was already overlapped with vCPU execution. The vCPU is CPU-bound
+during boot (systemd service startup, process spawning), not waiting on
+filesystem I/O. Reducing S3 round-trips saves network bandwidth but
+doesn't unblock the critical path.
+
+The read cache is still worth keeping — it reduces S3 request volume and
+will matter for I/O-bound workloads (e.g., `grep -r`, compilation). But
+further boot time optimization needs to target the CPU side: reducing
+systemd services, increasing kernel dentry TTL, or batching FUSE lookups.
 
 ### Remaining Gaps
-
-#### High impact
-
-**No read caching — every `read()` is an HTTP round-trip.**
-`read()` calls `get_range()` on every invocation. The guest kernel issues
-FUSE reads in chunks (typically 128KB). Sequential `cat bigfile.txt` on
-a 1MB file is ~8 HTTP GETs, each paying the full S3 latency floor
-(~5-20ms against local MinIO, much more against remote S3). That's
-40-160ms for 1MB of sequential read.
-
-Options, in order of complexity:
-
-**A. Cache last GET response.** If the guest reads sequentially (common),
-cache the previous GET response and serve from it if the requested range
-overlaps. One `Vec<u8>` per open file handle, evicted on `release`.
-Covers the dominant access pattern with ~20 lines.
-
-**B. Read-ahead with larger GET ranges.** When a 128KB read arrives,
-fetch 1MB from S3 and cache the excess. Subsequent reads within the
-same 1MB window are served from cache. Trade-off: wastes bandwidth if
-the guest seeks randomly, but sequential access is the common case.
-
-**C. Per-file block cache.** Cache fixed-size blocks (e.g., 256KB) keyed
-by inode + offset. LRU eviction with a configurable memory budget. More
-complex but handles both sequential and random access.
-
-**Recommendation:** Start with **B** — fetch 512KB-1MB on first read,
-cache per handle, serve subsequent reads from buffer. This is a natural
-extension of the write buffering pattern already in `HandleEntry.data`.
-The same `data: Option<Vec<u8>>` field could serve double duty: populated
-lazily on first read, used for write buffering if the handle is writable.
 
 **No `rename`.**
 This is the most impactful missing FUSE operation for a coding agent
@@ -680,14 +707,134 @@ spike on first `ls`. Not urgent but worth noting.
 | Feature | Design | Implementation | Gap |
 |---------|--------|----------------|-----|
 | Metadata-in-keys | Full | Full | None |
-| Probe-and-cache (LIST) | max-keys=12 | max-keys=12 | None |
+| Probe-and-cache (LIST) | max-keys=12 parent prefix | Implemented (parent dir + fallback) | None |
 | Negative caching | Designed | Implemented | None |
 | readdir→lookup pre-fill | Designed | Implemented | None |
 | readdir with delimiter | Designed | Implemented | None |
 | O_TRUNC skip preload | Designed | Implemented | None |
-| Read caching | Not designed | Not implemented | **High impact** |
+| Read caching | Designed | Implemented (configurable, default 2MB) | No boot impact (CPU-bound) |
 | Cache eviction/TTL | Deferred | Not implemented | Low (single-writer) |
 | setattr persistence | Not designed | Not implemented | Medium |
 | Write buffer bounds | 100MB limit noted | Unbounded | Low risk, easy fix |
 | rename | Not designed | Not implemented | **High impact** |
 | readdir streaming | Not designed | Loads all first | Low |
+
+---
+
+## Measured Cache Performance
+
+### Test harness
+
+Integration tests in `s3-rootfs/tests/` exercise FUSE operations against
+a live RustFS (S3-compatible) backend. The `InodeCache` tracks hit/miss
+counters on `get()` and `is_negative()`. Tests seed S3 data directly via
+`S3Client`, then call `FileSystem` trait methods on `S3Fs`.
+
+Test modules: `test_read_ops`, `test_write_ops`, `test_readdir`,
+`test_permissions`, `test_cache`. See `tests/harness/` for fixtures.
+
+### Realistic workload: readdir + repeated lookup
+
+Workload: seed 8 files in `src/`, 1 file in `docs/`, then readdir `src/`,
+lookup each child twice, probe 3 nonexistent paths twice.
+
+```
+Phase                    hits  misses  neg_hits  hit_rate
+after readdir src/          0       2         0     0.0%
+after 8 child lookups       8       2         0    80.0%
+after 8 repeat lookups     16       2         0    88.9%
+after 3 misses             16       5         0    76.2%
+after 3 repeat misses      16       8         3    66.7%
+```
+
+**Overall: 66.7% cache hit rate, 3 negative cache hits.**
+
+### What's working
+
+- **readdir→lookup pre-fill works.** All 8 child lookups after `readdir`
+  on `src/` were cache hits. This is the most important optimization — it
+  eliminates the N×requests storm when `ls -l` or a build system stats
+  every file in a directory.
+
+- **Repeat lookups are 100% cached.** The second pass of 8 lookups added
+  8 hits and 0 misses. Once an inode is in cache, it stays there.
+
+- **Negative caching works.** 3 lookups for nonexistent paths produced
+  3 negative cache entries. Repeat lookups for the same missing paths
+  hit the negative cache (3 negative_hits), avoiding 3 LIST round-trips.
+
+- **All fundamental FUSE operations pass.** lookup, getattr, read,
+  readlink, readdir, create, write, release, mkdir, unlink — 40 tests
+  pass, confirming end-to-end correctness against a real S3 backend.
+
+### What's broken: LIST pre-fill not caching neighbors
+
+The `list_probe(prefix, max_keys=12)` call returns only 1 result, not 12.
+The pre-fill design assumed `max-keys=12` would return the target entry
+plus 11 subsequent keys from the sorted keyspace. But that's not how S3
+LIST works — it only returns keys that **match the prefix**. The prefix
+is too precise.
+
+**Root cause:** `list_prefix("usr/bin/bash")` returns `usr/bin/bash\x01`.
+S3 LIST with `prefix=usr/bin/bash\x01` only matches keys starting with
+those exact bytes. The only key that starts with `usr/bin/bash\x01` is
+`usr/bin/bash\x01<meta>` itself. Neighbors like `usr/bin/cat\x01<meta>`
+start with `usr/bin/cat\x01`, not `usr/bin/bash\x01`. So `max-keys=12`
+gets at most 1 result.
+
+S3 LIST is prefix-filtered — it only returns keys matching the prefix,
+not "start reading at this position." The pre-fill design relies on
+listing the **parent directory** (`usr/bin/`) to get siblings, not the
+precise key.
+
+**Test evidence:** Seeding 10 files `file_00` through `file_09` under
+one directory, then looking up `file_00`, results in only 1 new cache
+entry — not the expected ~10. The `lookup_prefills_neighbors` and
+`list_probe_max_keys_boundary` tests both fail.
+
+**Fix:** `probe_and_cache` should use the parent directory prefix, not
+the child path prefix:
+
+```
+LIST prefix=usr/bin/&max-keys=12    ← parent prefix, returns siblings
+```
+
+Instead of:
+
+```
+LIST prefix=usr/bin/bash\x01&max-keys=12  ← too precise, 1 result
+```
+
+This returns up to 12 keys from the parent directory — the target and
+its siblings. Scan results for the exact child path. Cache everything.
+
+If the child isn't found in the first 12 results (wide directory, child
+sorts late alphabetically), fall back to the precise probe:
+
+```
+LIST prefix=usr/bin/bash\x01&max-keys=1   ← precise fallback
+```
+
+The grandchildren issue: `prefix=usr/bin/` also matches keys like
+`usr/bin/subdir/tool\x01...`. Without a delimiter, these eat pre-fill
+slots. But they're still useful cache entries if the kernel walks
+deeper, and the 12-key cap limits waste. Alternatively, add
+`delimiter=/` and read siblings from Contents only.
+
+**Expected improvement when fixed:** The realistic workload above would
+see the initial `lookup("src")` pre-fill `src/file_00` through
+`src/file_07` (the first 8 lexicographic neighbors within max-keys=12).
+The subsequent 8 child lookups would be cache hits even without readdir.
+Hit rate for the same workload would rise from 66.7% to ~85-90%.
+
+### Test failures (expected)
+
+| Test | Status | Why |
+|------|--------|-----|
+| `setattr_mode_change_persists_to_s3` | FAIL | setattr is a no-op, doesn't persist to S3 |
+| `lookup_prefills_neighbors` | FAIL | Pre-fill only caches 1 entry, not neighbors |
+| `list_probe_max_keys_boundary` | FAIL | Same root cause as above |
+
+These are intentional failures — the tests assert correct/designed
+behavior, not current behavior. They'll pass when the underlying issues
+are fixed.

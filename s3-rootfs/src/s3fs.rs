@@ -27,16 +27,24 @@ const ROOT_INODE: u64 = 1;
 pub struct CacheStats {
     pub inode_count: usize,
     pub negative_count: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub negative_hits: u64,
 }
 const TTL: Duration = Duration::from_secs(1);
 /// Number of S3 keys to fetch per lookup LIST probe.
 /// Includes the target entry + neighbors for cache pre-fill.
 pub const LIST_PROBE_MAX_KEYS: u32 = 12;
+/// Default max file size for read caching (0 = disabled).
+const DEFAULT_READ_CACHE_MAX: u64 = 2 * 1024 * 1024;
 
 pub struct S3Fs {
     client: S3Client,
     cache: Mutex<InodeCache>,
     handles: Mutex<HandleTable>,
+    /// Files at or below this size are fully cached on first read.
+    /// Set to 0 to disable read caching.
+    read_cache_max: u64,
 }
 
 struct HandleTable {
@@ -48,6 +56,7 @@ struct HandleEntry {
     inode: u64,
     dirty: bool,
     data: Option<Vec<u8>>,
+    read_cached: bool,
 }
 
 impl HandleTable {
@@ -62,6 +71,7 @@ impl HandleTable {
             inode,
             dirty: false,
             data: if writing { Some(Vec::new()) } else { None },
+            read_cached: false,
         });
         handle
     }
@@ -77,10 +87,15 @@ impl HandleTable {
 
 impl S3Fs {
     pub fn new(config: S3Config) -> Self {
+        Self::with_read_cache(config, DEFAULT_READ_CACHE_MAX)
+    }
+
+    pub fn with_read_cache(config: S3Config, read_cache_max: u64) -> Self {
         S3Fs {
             client: S3Client::new(config),
             cache: Mutex::new(InodeCache::new()),
             handles: Mutex::new(HandleTable::new()),
+            read_cache_max,
         }
     }
 
@@ -90,6 +105,9 @@ impl S3Fs {
         CacheStats {
             inode_count: cache.inode_count(),
             negative_count: cache.negative_count(),
+            hits: cache.hits,
+            misses: cache.misses,
+            negative_hits: cache.negative_hits,
         }
     }
 
@@ -136,10 +154,19 @@ impl S3Fs {
     }
 
     /// Lookup a path via LIST probe, populate cache with results.
-    /// Returns the inode for the requested path, or ENOENT.
+    ///
+    /// Strategy: LIST the parent directory with max-keys=12 to pre-fill
+    /// siblings. If the target isn't in the first 12 results (large dir,
+    /// target sorts late), fall back to a precise single-key probe.
     fn probe_and_cache(&self, path: &str) -> io::Result<u64> {
-        let prefix = keys::list_prefix(path);
-        let result = self.client.list_probe(&prefix, LIST_PROBE_MAX_KEYS)
+        // Phase 1: broad LIST at parent directory level for pre-fill
+        let parent_prefix = match path.rfind('/') {
+            Some(pos) => &path[..=pos], // "usr/bin/" for "usr/bin/bash"
+            None => "",                  // root children have no slash
+        };
+
+        log!("S3 LIST prefill prefix={} max-keys={}", parent_prefix, LIST_PROBE_MAX_KEYS);
+        let result = self.client.list_probe(parent_prefix, Some("/"), LIST_PROBE_MAX_KEYS)
             .map_err(|e| {
                 log!("S3Fs: list_probe error for {}: {}", path, e);
                 io::Error::from_raw_os_error(libc::EIO)
@@ -147,6 +174,7 @@ impl S3Fs {
 
         let mut cache = self.cache.lock().unwrap();
         let mut found_ino = None;
+        let prefill_count = result.objects.len();
 
         for obj in &result.objects {
             if let Some((decoded_path, meta)) = keys::decode(&obj.key) {
@@ -157,8 +185,46 @@ impl S3Fs {
             }
         }
 
-        if found_ino.is_none() {
+        if let Some(ino) = found_ino {
+            log!("  lookup HIT in prefill: {} (cached {} siblings)", path, prefill_count - 1);
+            return Ok(ino);
+        }
+
+        // If the LIST was not truncated, we saw the entire directory.
+        // The target doesn't exist — no need for a precise probe.
+        if !result.is_truncated {
+            log!("  lookup ENOENT: {} (dir complete, {} entries, negative cached)", path, prefill_count);
             cache.insert_negative(path);
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        log!("  lookup MISS in prefill ({} results), falling back to precise probe", prefill_count);
+        drop(cache);
+
+        // Phase 2: precise probe — target wasn't in first 12 results (dir has >12 entries)
+        let precise_prefix = keys::list_prefix(path);
+        log!("S3 LIST precise prefix={}\\x01 max-keys=1", path);
+        let result = self.client.list_probe(&precise_prefix, None, 1)
+            .map_err(|e| {
+                log!("S3Fs: precise probe error for {}: {}", path, e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        let mut cache = self.cache.lock().unwrap();
+        for obj in &result.objects {
+            if let Some((decoded_path, meta)) = keys::decode(&obj.key) {
+                let ino = cache.insert_from_key(decoded_path, meta, obj.size);
+                if decoded_path == path {
+                    found_ino = Some(ino);
+                }
+            }
+        }
+
+        if found_ino.is_none() {
+            log!("  lookup ENOENT: {} (negative cached)", path);
+            cache.insert_negative(path);
+        } else {
+            log!("  lookup HIT in precise probe: {}", path);
         }
 
         found_ino.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
@@ -198,16 +264,19 @@ impl FileSystem for S3Fs {
 
         // Check cache first — readdir or a previous lookup may have warmed it
         {
-            let cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().unwrap();
             if let Some(entry) = cache.get(&path) {
+                log!("lookup CACHE HIT: {}", path);
                 return Ok(Self::entry_for(entry.ino, entry));
             }
             if cache.is_negative(&path) {
+                log!("lookup NEGATIVE HIT: {}", path);
                 return Err(io::Error::from_raw_os_error(libc::ENOENT));
             }
         }
 
         // Cache miss — probe S3 with LIST, pre-fill neighbors
+        log!("lookup CACHE MISS: {}", path);
         let ino = self.probe_and_cache(&path)?;
 
         let cache = self.cache.lock().unwrap();
@@ -241,11 +310,13 @@ impl FileSystem for S3Fs {
             format!("{}/", parent_path)
         };
 
+        log!("S3 LIST readdir prefix={} delimiter=/", list_prefix);
         let result = self.client.list(&list_prefix, Some("/"))
             .map_err(|e| {
                 log!("S3Fs: readdir list error: {}", e);
                 io::Error::from_raw_os_error(libc::EIO)
             })?;
+        log!("  readdir got {} entries for {}", result.objects.len(), list_prefix);
 
         let mut idx: u64 = 0;
         let mut cache = self.cache.lock().unwrap();
@@ -291,8 +362,9 @@ impl FileSystem for S3Fs {
         // Check cache for symlink target
         {
             let cache = self.cache.lock().unwrap();
-            if let Some((_, entry)) = cache.get_by_ino(inode) {
+            if let Some((path, entry)) = cache.get_by_ino(inode) {
                 if let Some(ref target) = entry.symlink_target {
+                    log!("readlink CACHE HIT: {} -> {}", path, target);
                     return Ok(target.as_bytes().to_vec());
                 }
             }
@@ -307,6 +379,7 @@ impl FileSystem for S3Fs {
         };
 
         let key = keys::encode(&path, meta);
+        log!("S3 GET readlink {}", path);
         let data = self.client.get(&key)
             .map_err(|e| {
                 log!("S3Fs: readlink GET error for {}: {}", path, e);
@@ -328,21 +401,70 @@ impl FileSystem for S3Fs {
         &self,
         _ctx: &Context,
         inode: Self::Inode,
-        _handle: Self::Handle,
+        handle: Self::Handle,
         w: &mut dyn fuse_backend_rs::api::filesystem::ZeroCopyWriter,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        let (path, meta) = {
+        // Try serving from the handle's read cache
+        {
+            let handles = self.handles.lock().unwrap();
+            if let Some(entry) = handles.by_handle.get(&handle) {
+                if entry.read_cached {
+                    if let Some(ref data) = entry.data {
+                        let start = (offset as usize).min(data.len());
+                        let end = (offset as usize + size as usize).min(data.len());
+                        if start >= data.len() {
+                            return Ok(0); // EOF
+                        }
+                        return w.write(&data[start..end])
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+                    }
+                }
+            }
+        }
+
+        let (path, meta, file_size) = {
             let cache = self.cache.lock().unwrap();
             let (p, e) = cache.get_by_ino(inode)
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-            (p.to_string(), e.meta)
+            (p.to_string(), e.meta, e.size)
         };
 
         let key = keys::encode(&path, meta);
+
+        // For files within the read cache limit, fetch whole and cache in handle
+        if self.read_cache_max > 0 && file_size <= self.read_cache_max {
+            log!("S3 GET read-cache {} ({} bytes, full file)", path, file_size);
+            let data = self.client.get(&key)
+                .map_err(|e| {
+                    log!("S3Fs: read error for {}: {}", path, e);
+                    io::Error::from_raw_os_error(libc::EIO)
+                })?;
+
+            let start = (offset as usize).min(data.len());
+            let end = (offset as usize + size as usize).min(data.len());
+            let result = if start < data.len() {
+                w.write(&data[start..end])
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            } else {
+                0
+            };
+
+            // Stash in handle for subsequent reads
+            let mut handles = self.handles.lock().unwrap();
+            if let Some(entry) = handles.get_mut(handle) {
+                entry.data = Some(data);
+                entry.read_cached = true;
+            }
+
+            return Ok(result);
+        }
+
+        // Large file — range read, no caching
+        log!("S3 GET read {} offset={} size={}", path, offset, size);
         let data = self.client.get_range(&key, offset, offset + size as u64 - 1)
             .map_err(|e| {
                 log!("S3Fs: read error for {}: {}", path, e);
@@ -372,6 +494,7 @@ impl FileSystem for S3Fs {
 
             if !path.is_empty() {
                 let key = keys::encode(&path, meta);
+                log!("S3 GET open-preload {}", path);
                 if let Ok(data) = self.client.get(&key) {
                     if let Some(entry) = handles.get_mut(handle) {
                         entry.data = Some(data);
@@ -396,7 +519,7 @@ impl FileSystem for S3Fs {
         let meta = KeyMeta::new(libc::S_IFREG as u32 | 0o755, 0, 0);
         let key = keys::encode(&path, meta);
 
-        log!("S3Fs: create {}", path);
+        log!("S3 PUT create {}", path);
         self.client.put(&key, &[])
             .map_err(|e| {
                 log!("S3Fs: create error: {}", e);
@@ -484,7 +607,7 @@ impl FileSystem for S3Fs {
 
                     if !path.is_empty() {
                         let key = keys::encode(&path, meta);
-                        log!("S3Fs: release flush {} ({} bytes)", path, data.len());
+                        log!("S3 PUT release {} ({} bytes)", path, data.len());
                         self.client.put(&key, data)
                             .map_err(|e| {
                                 log!("S3Fs: release PUT error: {}", e);
@@ -511,7 +634,7 @@ impl FileSystem for S3Fs {
         let meta = KeyMeta::new(libc::S_IFDIR as u32 | 0o755, 0, 0);
         let key = keys::encode(&path, meta);
 
-        log!("S3Fs: mkdir {}", path);
+        log!("S3 PUT mkdir {}", path);
         self.client.put(&key, &[])
             .map_err(|e| {
                 log!("S3Fs: mkdir error: {}", e);
@@ -536,13 +659,13 @@ impl FileSystem for S3Fs {
 
         // Need the meta to build the S3 key
         let meta = {
-            let cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().unwrap();
             cache.get(&path).map(|e| e.meta)
         };
 
         if let Some(meta) = meta {
             let key = keys::encode(&path, meta);
-            log!("S3Fs: unlink {}", path);
+            log!("S3 DELETE unlink {}", path);
             self.client.delete(&key)
                 .map_err(|e| {
                     log!("S3Fs: unlink error: {}", e);
