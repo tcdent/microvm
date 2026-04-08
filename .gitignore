@@ -18,3 +18,4 @@ dist/modules/
 
 # Cargo lock in workspace members
 Cargo.lock
+dist/.debootstrap-cache/

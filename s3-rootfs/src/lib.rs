@@ -14,9 +14,13 @@
 //! // Pass `fs` to fuse-backend-rs Server or virtiofs device
 //! ```
 
+pub mod cache;
+pub mod keys;
 mod s3;
 mod s3fs;
 
+pub use cache::{CachedInode, InodeCache};
+pub use keys::{KeyMeta, encode as encode_key, decode as decode_key, list_prefix};
 pub use s3::{S3Client, S3Config, S3Error, ObjectMeta, ListResult, ListObject};
 pub use s3fs::S3Fs;
 

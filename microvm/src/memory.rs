@@ -2,7 +2,7 @@ use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VmFd;
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
-pub const GUEST_MEM_SIZE: usize = 256 * 1024 * 1024; // 256MB
+pub const GUEST_MEM_SIZE: usize = 512 * 1024 * 1024; // 512MB
 
 pub fn setup_guest_memory(vm: &VmFd) -> Result<GuestMemoryMmap, Box<dyn std::error::Error>> {
     let guest_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)])?;

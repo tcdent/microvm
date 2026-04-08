@@ -82,6 +82,10 @@ sleep 0.1
 # Mount the virtiofs root filesystem
 echo "initramfs: mounting virtiofs root..."
 mount -t virtiofs rootfs /sysroot
+echo "initramfs: ls /sysroot:"
+ls -la /sysroot/
+echo "initramfs: ls /sysroot/sbin:"
+ls -la /sysroot/sbin 2>&1 || true
 if [ $? -ne 0 ]; then
     echo "initramfs: ERROR: failed to mount virtiofs root"
     echo "initramfs: available filesystems:"
@@ -90,11 +94,11 @@ if [ $? -ne 0 ]; then
     exec setsid /bin/sh -l < /dev/console > /dev/console 2>&1
 fi
 
-# Prepare for switch_root
-mount --move /proc /sysroot/proc 2>/dev/null
-mount --move /sys /sysroot/sys 2>/dev/null
-mount --move /dev /sysroot/dev 2>/dev/null
-mkdir -p /sysroot/run /sysroot/tmp
+# Move pseudo-filesystem mounts into the new root
+mount --move /proc /sysroot/proc || mount -t proc proc /sysroot/proc || echo "WARN: proc mount failed"
+mount --move /sys /sysroot/sys || mount -t sysfs sysfs /sysroot/sys || echo "WARN: sys mount failed"
+mount --move /dev /sysroot/dev || mount -t devtmpfs devtmpfs /sysroot/dev || echo "WARN: dev mount failed"
+mkdir -p /sysroot/run /sysroot/tmp 2>/dev/null || true
 
 echo "initramfs: switching to virtiofs root"
 exec switch_root /sysroot /sbin/init
