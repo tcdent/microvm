@@ -754,6 +754,40 @@ TX: inline on vCPU thread
 | Test | Throughput | Notes |
 |------|-----------|-------|
 | Ping (localhost) | 0.5ms | |
-| 10MB local HTTP | 182 MB/s (1.5 Gbps) | |
-| 100MB local HTTP | 188 MB/s (1.5 Gbps) | |
-| 1GB local HTTP | 285 MB/s sustained (2.3 Gbps) | peak 304 MB/s, 3.6s |
+| 10MB local HTTP | 182 MB/s (1.5 Gbps) | python http.server |
+| 100MB local HTTP | 188 MB/s (1.5 Gbps) | python http.server |
+| 1GB local HTTP | 285 MB/s sustained (2.3 Gbps) | peak 304 MB/s |
+| iperf3 download (host→guest) | 2.70 Gbps | 0 retransmits, GRO 60KB pkts |
+| iperf3 upload (guest→host) | 1.97 Gbps | 0 retransmits |
+
+### Core pinning with TSO/GRO
+
+With 60KB GRO packets, core pinning results reversed vs small packets:
+
+| Configuration | Download | Upload | Notes |
+|---------------|----------|--------|-------|
+| Unpinned | **2.70 Gbps** | **1.97 Gbps** | Best — cores have real work |
+| Pinned to 1 core | 2.63 Gbps | 1.69 Gbps | vCPU + RX worker contend |
+
+With small (1.5KB) packets, single-core won by 42% due to cache locality
+on virtqueue descriptors. With large (60KB) GRO packets, the per-packet
+overhead is amortized and the vCPU and RX worker have enough work to
+benefit from separate cores. The scheduler naturally keeps them close
+enough for cache sharing without explicit pinning.
+
+Multi-stream (iperf3 -P 4) was worse: 2.17 Gbps down, 1.64 Gbps up.
+Not flow-limited — multiple streams add contention on our single RX
+drain loop and TX writev path. Single stream is optimal.
+
+### TX/upload gap
+
+Upload (1.97 Gbps) trails download (2.70 Gbps). We advertise
+`HOST_TSO4/6` so the guest should send large TCP segments. The gap may
+be due to: (1) macvtap not supporting TSO on the TX path (kernel splits
+segments before they reach our writev), (2) the guest driver not using
+TSO despite negotiation, or (3) TX runs inline on the vCPU thread (MMIO
+exit per QueueNotify) while RX has a dedicated worker thread.
+
+Remaining TX optimizations if needed: ioeventfd for TX QueueNotify
+(eliminate MMIO exit per ACK), or a TX worker thread mirroring the RX
+pattern.

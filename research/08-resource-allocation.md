@@ -258,19 +258,28 @@ Two cores is equivalent to one core because the scheduler keeps the
 threads adjacent on the same physical core's SMT pair or neighboring
 cores that share L2.
 
+### Updated with TSO/GRO (iperf3 benchmarks)
+
+With TSO/GRO enabled (60KB packets), results reversed:
+
+| Configuration | Download | Upload |
+|---------------|----------|--------|
+| Unpinned | **2.70 Gbps** | **1.97 Gbps** |
+| Single core | 2.63 Gbps | 1.69 Gbps |
+
+Large packets amortize per-packet overhead, so the vCPU and RX worker
+benefit from separate cores. The scheduler keeps them close enough for
+cache sharing without explicit pinning.
+
 ### Deployment recommendation
 
-Pin each VM process to a single core: `taskset -c N ./microvm ...`
+**Don't pin.** Let the kernel scheduler handle core assignment. With
+TSO/GRO, unpinned is optimal — the scheduler naturally co-locates
+threads that share memory while giving each enough CPU time.
 
-This gives:
-- Best network throughput (cache locality)
-- Predictable CPU isolation between VMs
-- Simplest scheduling (one core per VM)
-- 0% idle CPU (all threads sleep when no work)
-
-On a 64-core host, that's up to 64 VMs with full network performance,
-each getting a dedicated core. The coding agent workload (mostly idle,
-burst on file I/O and network) is well suited to this model.
+For multi-VM density, use cgroups to limit CPU shares rather than
+hard-pinning to cores. This lets the scheduler balance load across
+the host dynamically.
 
 ---
 
