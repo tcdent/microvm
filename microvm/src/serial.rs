@@ -1,5 +1,6 @@
-use std::io;
-use std::sync::Arc;
+use std::io::{self, Read};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use kvm_ioctls::VmFd;
 use vm_superio::serial::NoEvents;
@@ -22,11 +23,46 @@ impl Trigger for IrqTrigger {
     }
 }
 
-pub type Serial = VmSerial<IrqTrigger, NoEvents, io::Stdout>;
+type InnerSerial = VmSerial<IrqTrigger, NoEvents, io::Stdout>;
+
+pub struct Serial {
+    inner: Arc<Mutex<InnerSerial>>,
+}
+
+impl Serial {
+    pub fn write(&self, offset: u8, value: u8) {
+        self.inner.lock().unwrap().write(offset, value).ok();
+    }
+
+    pub fn read(&self, offset: u8) -> u8 {
+        self.inner.lock().unwrap().read(offset)
+    }
+
+    /// Spawn a thread that reads stdin and feeds bytes to the guest serial.
+    pub fn start_stdin_thread(&self) {
+        let inner = Arc::clone(&self.inner);
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut handle = stdin.lock();
+            let mut buf = [0u8; 64];
+            loop {
+                match handle.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let mut serial = inner.lock().unwrap();
+                        serial.enqueue_raw_bytes(&buf[..n]).ok();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+}
 
 pub fn create(vm: &VmFd) -> Serial {
     let eventfd = EventFd::new(libc::EFD_NONBLOCK).expect("eventfd");
     vm.register_irqfd(&eventfd, SERIAL_IRQ).expect("register serial irqfd");
     let trigger = IrqTrigger { eventfd: Arc::new(eventfd) };
-    Serial::new(trigger, io::stdout())
+    let inner = InnerSerial::new(trigger, io::stdout());
+    Serial { inner: Arc::new(Mutex::new(inner)) }
 }

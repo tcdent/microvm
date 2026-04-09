@@ -79,6 +79,7 @@ impl System {
 
     fn run(&mut self) {
         log!("=== microvm started ===");
+        self.serial.start_stdin_thread();
         loop {
             match self.vcpu.run().expect("KVM_RUN failed") {
                 VcpuExit::IoOut(port, data) => {
@@ -86,8 +87,12 @@ impl System {
                         0x3F8..=0x3FF => {
                             let offset = port - 0x3F8;
                             for &byte in data {
-                                self.serial.write(offset as u8, byte).ok();
+                                self.serial.write(offset as u8, byte);
                             }
+                        }
+                        0x64 if data.first() == Some(&0xFE) => {
+                            log!("Guest requested shutdown (i8042 reset)");
+                            break;
                         }
                         _ => {}
                     }
@@ -145,7 +150,8 @@ impl System {
                                 if offset == 0x044 && val == 1 {
                                     let qs = net.mmio.queue_sel();
                                     net.activate_queue(qs as usize);
-                                    // Start RX worker once both queues are ready
+                                }
+                                if offset == 0x070 && (val & 0x04) != 0 {
                                     net.start_rx_worker(self.memory.clone());
                                 }
                                 if notify {
@@ -172,12 +178,28 @@ impl System {
                 }
             }
 
-            // After every vCPU exit, check event sources (non-blocking).
-            // Currently both FUSE and NET signal via irqfd directly from
-            // their worker threads, so the epoll drain is available for
-            // future devices that need main-thread processing.
-            for _token in self.poll.poll() {}
+            // RX is handled by the worker thread via irqfd.
+            // TX completions are signaled inline above.
         }
+    }
+}
+
+fn setup_raw_terminal() -> Option<libc::termios> {
+    unsafe {
+        let mut orig: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
+            return None;
+        }
+        let mut raw = orig;
+        libc::cfmakeraw(&mut raw);
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
+        Some(orig)
+    }
+}
+
+fn restore_terminal(orig: &libc::termios) {
+    unsafe {
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
     }
 }
 
@@ -195,8 +217,14 @@ fn main() {
     let initrd_path = &args[2];
     let net_ifname = args.get(3).map(|s| s.as_str());
 
+    let orig_term = setup_raw_terminal();
+
     match System::new(kernel_path, initrd_path, net_ifname) {
         Ok(mut system) => system.run(),
         Err(e) => eprintln!("Error: {e}"),
+    }
+
+    if let Some(ref orig) = orig_term {
+        restore_terminal(orig);
     }
 }

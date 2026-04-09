@@ -656,13 +656,9 @@ site. The existing comment (`// SAFETY: guest memory is Arc-wrapped, valid
 for VM lifetime`) is close but should say the memory is owned by this
 thread and outlives all readers/writers created from it.
 
-### 4. RX worker `yield_now()` after irqfd write
+### 4. RX worker `yield_now()` after irqfd write — RESOLVED
 
-`virtio_net.rs:197`: `std::thread::yield_now()` after delivering packets.
-`yield_now` on Linux calls `sched_yield()` which doesn't guarantee the
-vCPU thread runs next — it yields to any runnable thread. Since the
-interrupt is delivered via irqfd (in-kernel), the guest sees it regardless
-of whether the worker yields. This call can be removed.
+Removed. Was causing forced context switches after every batch.
 
 ### 5. `interrupt_status` pointer cast in both workers
 
@@ -686,8 +682,78 @@ relationship explicit to both the compiler and the reader.
 
 ### 6. Net TX still uses MMIO exit path
 
-Net TX queue notifications cause a vCPU exit to dispatch `process_tx()`
-(`main.rs:151-153`). This is fine for now — `writev` to the tap fd is
-fast and the exit overhead is small relative to the syscall. If net TX
-throughput becomes a concern, adding ioeventfd + a TX worker (mirroring
-the virtio-fs pattern) would eliminate the exit. Low priority.
+Net TX queue notifications cause a vCPU exit to dispatch `process_tx()`.
+Fine for now — `writev` to a tap fd is fast. Low priority.
+
+---
+
+## Network Throughput Resolution (2026-04-08)
+
+### Journey: 8 KB/s → 2.4 Gbps
+
+The network performance work went through multiple iterations. Summary
+of what mattered and what didn't:
+
+**What didn't move the needle:**
+- Spin-drain after EAGAIN (50 spin_loop iterations): marginal
+- Interrupt coalescing (50μs delay before IRQ): REGRESSED (halved batch
+  rate without proportional batch size increase)
+- Skip-poll-after-batch: no measurable improvement
+- TUNSETSNDBUF (1MB send buffer on macvtap): no measurable improvement
+- Zero-copy readv vs host-buffer copy: ~40% improvement (2.63→3.72 MB/s)
+- Stack-allocated iovecs vs Vec: included in the readv change
+
+**What fixed bugs:**
+- Non-blocking `kick_fd` in virtio-fs worker: was spinning at 100% CPU,
+  starving other threads. Fix: create eventfd without `EFD_NONBLOCK`.
+- Wasted descriptors on WouldBlock: every drain cycle consumed a guest
+  RX buffer with 0 bytes. Fix: read into host buffer first (later: readv
+  with go_to_previous_position on EAGAIN).
+- `yield_now()` after irqfd write: forced context switch for no reason.
+  Fix: removed.
+- Worker starting before guest posts buffers: 197MB of "no descriptors"
+  log spam, zero throughput. Fix: wait for first pop_descriptor_chain to
+  succeed before entering drain loop.
+
+**What actually mattered (40x improvement):**
+- `VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6`: enables GRO on
+  the macvtap path. The kernel aggregates TCP segments into 60KB packets
+  before delivering to our readv. One readv call returns 60KB instead of
+  1.5KB. Same batch rate, 40x more data per batch.
+- `VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6`: enables TSO on the
+  TX path. Guest sends large segments, kernel splits them.
+- `VIRTIO_NET_F_CSUM | VIRTIO_NET_F_GUEST_CSUM`: guest accepts partial
+  checksums, avoiding software checksum computation.
+
+**Key lesson:** the bottleneck was never the drain loop — it was the
+packet size. At 1.5KB/packet, per-packet overhead (poll + readv +
+add_used + irqfd + KVM interrupt + guest NAPI) created a ~2000 batch/sec
+ceiling = ~3 MB/s max. No loop optimization could break through. At
+60KB/packet, the same overhead is amortized over 40x more data.
+
+### Final architecture
+
+```
+RX: worker thread
+  poll(tap_fd, -1)          ← block until data
+  loop:
+    pop_descriptor_chain    ← get guest buffer (16 iovecs, 60KB)
+    readv(tap_fd, iovecs)   ← zero-copy into guest memory
+    add_used                ← mark buffer consumed
+  irqfd.write(1)            ← one interrupt per batch
+
+TX: inline on vCPU thread
+  pop_descriptor_chain      ← get guest packet
+  writev(dup_fd, iovecs)    ← zero-copy from guest memory
+  add_used                  ← mark buffer consumed
+  inject_irq                ← signal completion
+```
+
+### Measured throughput
+
+| Test | Throughput | Notes |
+|------|-----------|-------|
+| Ping (localhost) | 0.5ms | |
+| 10MB local HTTP | 182 MB/s (1.5 Gbps) | |
+| 100MB local HTTP | 188 MB/s (1.5 Gbps) | |
+| 1GB local HTTP | 285 MB/s sustained (2.3 Gbps) | peak 304 MB/s, 3.6s |

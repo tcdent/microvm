@@ -69,7 +69,7 @@ impl VirtioFs {
             QUEUE_SIZE,
         );
 
-        let kick_fd = EventFd::new(libc::EFD_NONBLOCK).expect("eventfd");
+        let kick_fd = EventFd::new(0).expect("eventfd");
 
         Self {
             mmio,

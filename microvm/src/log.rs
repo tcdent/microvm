@@ -26,3 +26,20 @@ macro_rules! log {
         $crate::log::write(&format!($($arg)*))
     };
 }
+
+/// Debug log — compiles to nothing in release builds.
+/// Use for hot-path tracing (FUSE ops, MMIO, packet I/O).
+/// Keep `log!` for lifecycle events (init, shutdown, errors).
+#[cfg(debug_assertions)]
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::log::write(&format!($($arg)*))
+    };
+}
+
+#[cfg(not(debug_assertions))]
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {};
+}

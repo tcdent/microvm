@@ -13,6 +13,8 @@ use std::io;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::debug;
+
 use fuse_backend_rs::abi::fuse_abi::{stat64, FsOptions, OpenOptions};
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem};
 
@@ -165,7 +167,7 @@ impl S3Fs {
             None => "",                  // root children have no slash
         };
 
-        log!("S3 LIST prefill prefix={} max-keys={}", parent_prefix, LIST_PROBE_MAX_KEYS);
+        debug!("S3 LIST prefill prefix={} max-keys={}", parent_prefix, LIST_PROBE_MAX_KEYS);
         let result = self.client.list_probe(parent_prefix, Some("/"), LIST_PROBE_MAX_KEYS)
             .map_err(|e| {
                 log!("S3Fs: list_probe error for {}: {}", path, e);
@@ -186,24 +188,24 @@ impl S3Fs {
         }
 
         if let Some(ino) = found_ino {
-            log!("  lookup HIT in prefill: {} (cached {} siblings)", path, prefill_count - 1);
+            debug!("  lookup HIT in prefill: {} (cached {} siblings)", path, prefill_count - 1);
             return Ok(ino);
         }
 
         // If the LIST was not truncated, we saw the entire directory.
         // The target doesn't exist — no need for a precise probe.
         if !result.is_truncated {
-            log!("  lookup ENOENT: {} (dir complete, {} entries, negative cached)", path, prefill_count);
+            debug!("  lookup ENOENT: {} (dir complete, {} entries, negative cached)", path, prefill_count);
             cache.insert_negative(path);
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
 
-        log!("  lookup MISS in prefill ({} results), falling back to precise probe", prefill_count);
+        debug!("  lookup MISS in prefill ({} results), falling back to precise probe", prefill_count);
         drop(cache);
 
         // Phase 2: precise probe — target wasn't in first 12 results (dir has >12 entries)
         let precise_prefix = keys::list_prefix(path);
-        log!("S3 LIST precise prefix={}\\x01 max-keys=1", path);
+        debug!("S3 LIST precise prefix={}\\x01 max-keys=1", path);
         let result = self.client.list_probe(&precise_prefix, None, 1)
             .map_err(|e| {
                 log!("S3Fs: precise probe error for {}: {}", path, e);
@@ -221,10 +223,10 @@ impl S3Fs {
         }
 
         if found_ino.is_none() {
-            log!("  lookup ENOENT: {} (negative cached)", path);
+            debug!("  lookup ENOENT: {} (negative cached)", path);
             cache.insert_negative(path);
         } else {
-            log!("  lookup HIT in precise probe: {}", path);
+            debug!("  lookup HIT in precise probe: {}", path);
         }
 
         found_ino.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
@@ -266,17 +268,17 @@ impl FileSystem for S3Fs {
         {
             let mut cache = self.cache.lock().unwrap();
             if let Some(entry) = cache.get(&path) {
-                log!("lookup CACHE HIT: {}", path);
+                debug!("lookup CACHE HIT: {}", path);
                 return Ok(Self::entry_for(entry.ino, entry));
             }
             if cache.is_negative(&path) {
-                log!("lookup NEGATIVE HIT: {}", path);
+                debug!("lookup NEGATIVE HIT: {}", path);
                 return Err(io::Error::from_raw_os_error(libc::ENOENT));
             }
         }
 
         // Cache miss — probe S3 with LIST, pre-fill neighbors
-        log!("lookup CACHE MISS: {}", path);
+        debug!("lookup CACHE MISS: {}", path);
         let ino = self.probe_and_cache(&path)?;
 
         let cache = self.cache.lock().unwrap();
@@ -310,13 +312,13 @@ impl FileSystem for S3Fs {
             format!("{}/", parent_path)
         };
 
-        log!("S3 LIST readdir prefix={} delimiter=/", list_prefix);
+        debug!("S3 LIST readdir prefix={} delimiter=/", list_prefix);
         let result = self.client.list(&list_prefix, Some("/"))
             .map_err(|e| {
                 log!("S3Fs: readdir list error: {}", e);
                 io::Error::from_raw_os_error(libc::EIO)
             })?;
-        log!("  readdir got {} entries for {}", result.objects.len(), list_prefix);
+        debug!("  readdir got {} entries for {}", result.objects.len(), list_prefix);
 
         let mut idx: u64 = 0;
         let mut cache = self.cache.lock().unwrap();
@@ -364,7 +366,7 @@ impl FileSystem for S3Fs {
             let cache = self.cache.lock().unwrap();
             if let Some((path, entry)) = cache.get_by_ino(inode) {
                 if let Some(ref target) = entry.symlink_target {
-                    log!("readlink CACHE HIT: {} -> {}", path, target);
+                    debug!("readlink CACHE HIT: {} -> {}", path, target);
                     return Ok(target.as_bytes().to_vec());
                 }
             }

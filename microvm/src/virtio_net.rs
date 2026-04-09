@@ -1,18 +1,19 @@
 // Virtio-net device — bridges guest networking to xdp-net NetBackend.
 //
-// Ownership model:
-// - TX queue + backend fd: owned by vCPU thread, used synchronously
-// - RX queue + backend fd: moved to worker thread after activation
-// - No Arc, no Mutex in the hot path
-// - Interrupt signaling via atomic interrupt_status + irqfd
+// TX: inline on vCPU thread (guest kicks QueueNotify → MMIO exit → writev)
+// RX: dedicated worker thread (poll tap fd → readv into guest → irqfd)
+//
+// RX uses readv directly into guest memory via iovecs built from the
+// descriptor chain — zero copies. TSO/GRO features allow the macvtap
+// to deliver aggregated 60KB+ packets, giving us ~2.4 Gbps throughput.
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
-use virtio_queue::{Queue, QueueT};
+use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{GuestMemory, GuestMemoryMmap};
-use xdp_net::{NetBackend, NetError};
+use xdp_net::NetBackend;
 
 use crate::virtio_mmio::{QueueConfig, VirtioMmioDevice};
 
@@ -24,16 +25,26 @@ const NUM_QUEUES: usize = 2;
 const RX_QUEUE: usize = 0;
 const TX_QUEUE: usize = 1;
 
+// Feature bits
+const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
+const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+const VIRTIO_NET_F_GUEST_TSO4: u64 = 1 << 7;
+const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
+const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
+const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
+const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
+
+/// Max iovec entries per descriptor chain.
+const MAX_IOVECS: usize = 16;
 
 pub struct VirtioNet<B: NetBackend + Send + 'static> {
     pub mmio: VirtioMmioDevice,
     tx_queue: Queue,
-    // RX queue starts here, moves to worker thread on start_rx_worker()
     rx_queue: Option<Queue>,
     backend: Option<B>,
-    // Raw fd for TX — the backend owns the fd, we dup it so TX and RX
-    // each have their own fd to the same macvtap device
+    /// Dup'd fd for TX on the vCPU thread. The worker thread owns the
+    /// backend (and its fd) for RX. Full duplex, no interference.
     tx_fd: RawFd,
     mac: [u8; 6],
     _rx_worker: Option<thread::JoinHandle<()>>,
@@ -44,13 +55,15 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
         let mmio = VirtioMmioDevice::new(
             VIRTIO_DEV_NET,
             VENDOR_ID,
-            VIRTIO_NET_F_MAC,
+            VIRTIO_NET_F_CSUM | VIRTIO_NET_F_GUEST_CSUM
+            | VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6
+            | VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6
+            | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS,
             irq,
             NUM_QUEUES,
             QUEUE_SIZE,
         );
 
-        // Dup the fd so TX (vCPU thread) and RX (worker thread) each have their own
         let tx_fd = unsafe { libc::dup(backend.tx_fd()) };
         assert!(tx_fd >= 0, "Failed to dup tx_fd");
 
@@ -116,13 +129,11 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
         }
     }
 
-    /// Start the RX worker thread. Moves the RX queue and backend into the
-    /// worker — after this call, only the worker touches them. No sharing.
+    /// Start the RX worker thread. Call after the guest writes DRIVER_OK.
     pub fn start_rx_worker(&mut self, memory: GuestMemoryMmap) {
-        // Take ownership — these move into the worker thread
-        let mut rx_queue = match self.rx_queue.take() {
+        let rx_queue = match self.rx_queue.take() {
             Some(q) => q,
-            None => return, // already started
+            None => return,
         };
         let backend = match self.backend.take() {
             Some(b) => b,
@@ -134,93 +145,107 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
         let rx_fd = backend.rx_fd();
 
         self._rx_worker = Some(thread::spawn(move || {
-            // backend is moved here — worker owns it entirely
             let _backend = backend;
+            let mut rx_queue = rx_queue;
+
+            // Wait for the guest to post RX buffers. This happens after
+            // DRIVER_OK when the interface comes up (virtnet_open).
+            loop {
+                if rx_queue.pop_descriptor_chain(&memory).is_some() {
+                    rx_queue.go_to_previous_position();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
 
             loop {
-                // Block until the macvtap fd is readable
+                // Block until tap fd has data.
                 let mut pollfd = libc::pollfd {
                     fd: rx_fd,
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                if unsafe { libc::poll(&mut pollfd, 1, -1) } <= 0 { continue; }
+                if unsafe { libc::poll(&mut pollfd, 1, -1) } <= 0 {
+                    continue;
+                }
 
-                // Drain all available packets into guest memory
+                // Drain all available packets via readv into guest memory.
                 let mut delivered = 0u32;
                 loop {
-                    let desc_chain = match rx_queue.pop_descriptor_chain(&memory) {
+                    let dc = match rx_queue.pop_descriptor_chain(&memory) {
                         Some(dc) => dc,
                         None => break,
                     };
-                    let head = desc_chain.head_index();
+                    let head = dc.head_index();
 
-                    let mut iovecs: Vec<libc::iovec> = desc_chain.writable()
-                        .filter_map(|desc| {
-                            memory.get_host_address(desc.addr()).ok().map(|ptr| {
-                                libc::iovec {
-                                    iov_base: ptr as *mut libc::c_void,
-                                    iov_len: desc.len() as usize,
-                                }
-                            })
-                        })
-                        .collect();
+                    // Build iovecs pointing directly into guest memory.
+                    let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; MAX_IOVECS];
+                    let mut iov_count = 0usize;
+                    for desc in dc.writable() {
+                        if iov_count >= MAX_IOVECS { break; }
+                        if let Ok(ptr) = memory.get_host_address(desc.addr()) {
+                            iovecs[iov_count] = libc::iovec {
+                                iov_base: ptr as *mut libc::c_void,
+                                iov_len: desc.len() as usize,
+                            };
+                            iov_count += 1;
+                        }
+                    }
 
-                    if iovecs.is_empty() {
+                    if iov_count == 0 {
                         rx_queue.add_used(&memory, head, 0).ok();
                         break;
                     }
 
-                    match _backend.recv_iovec(&mut iovecs) {
-                        Ok(n) => {
-                            rx_queue.add_used(&memory, head, n as u32).ok();
-                            delivered += 1;
-                        }
-                        Err(NetError::WouldBlock) => {
-                            rx_queue.add_used(&memory, head, 0).ok();
-                            break;
-                        }
-                        Err(_) => {
-                            rx_queue.add_used(&memory, head, 0).ok();
-                            break;
-                        }
+                    // readv directly into guest memory — zero copies.
+                    let ret = unsafe {
+                        libc::readv(rx_fd, iovecs.as_ptr(), iov_count as i32)
+                    };
+
+                    if ret <= 0 {
+                        // EAGAIN or error — push descriptor back.
+                        rx_queue.go_to_previous_position();
+                        break;
                     }
+
+                    rx_queue.add_used(&memory, head, ret as u32).ok();
+                    delivered += 1;
                 }
 
+                // One interrupt for the whole batch.
                 if delivered > 0 {
-                    // SAFETY: pointer to AtomicU32 in mmio, valid for VM lifetime
                     unsafe {
                         let status = &*(interrupt_status as *const AtomicU32);
                         status.fetch_or(0x01, Ordering::Relaxed);
                     }
                     irqfd.write(1).ok();
-                    std::thread::yield_now();
                 }
             }
         }));
     }
 
-    /// Process TX queue — guest sent packets via iovec, zero copy (vCPU thread).
-    /// Uses the dup'd fd directly — no lock, no shared state.
+    /// Process TX — guest sent packets, forward to tap. Inline on vCPU thread.
     pub fn process_tx(&mut self, memory: &GuestMemoryMmap) {
         while let Some(desc_chain) = self.tx_queue.pop_descriptor_chain(memory) {
             let head_index = desc_chain.head_index();
 
-            let iovecs: Vec<libc::iovec> = desc_chain.readable()
-                .filter_map(|desc| {
-                    memory.get_host_address(desc.addr()).ok().map(|ptr| {
-                        libc::iovec {
-                            iov_base: ptr as *mut libc::c_void,
-                            iov_len: desc.len() as usize,
-                        }
-                    })
-                })
-                .collect();
+            // Stack-allocated iovecs — no heap allocation per packet.
+            let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; MAX_IOVECS];
+            let mut iov_count = 0usize;
+            for desc in desc_chain.readable() {
+                if iov_count >= MAX_IOVECS { break; }
+                if let Ok(ptr) = memory.get_host_address(desc.addr()) {
+                    iovecs[iov_count] = libc::iovec {
+                        iov_base: ptr as *mut libc::c_void,
+                        iov_len: desc.len() as usize,
+                    };
+                    iov_count += 1;
+                }
+            }
 
-            if !iovecs.is_empty() {
-                // writev directly to our dup'd fd — no backend lock needed
+            if iov_count > 0 {
                 unsafe {
-                    libc::writev(self.tx_fd, iovecs.as_ptr(), iovecs.len() as i32);
+                    libc::writev(self.tx_fd, iovecs.as_ptr(), iov_count as i32);
                 }
             }
 

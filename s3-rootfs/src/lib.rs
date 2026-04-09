@@ -51,3 +51,22 @@ macro_rules! log {
         $crate::_log(&format!($($arg)*))
     };
 }
+
+/// Debug log — compiles to nothing in release builds.
+/// Use for hot-path tracing (lookup, readdir, read, cache hits/misses).
+/// Keep `log!` for S3 requests, errors, and lifecycle events.
+#[cfg(debug_assertions)]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::_log(&format!($($arg)*))
+    };
+}
+
+#[cfg(not(debug_assertions))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! debug {
+    ($($arg:tt)*) => {};
+}
