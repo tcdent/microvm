@@ -757,8 +757,31 @@ TX: inline on vCPU thread
 | 10MB local HTTP | 182 MB/s (1.5 Gbps) | python http.server |
 | 100MB local HTTP | 188 MB/s (1.5 Gbps) | python http.server |
 | 1GB local HTTP | 285 MB/s sustained (2.3 Gbps) | peak 304 MB/s |
-| iperf3 download (host→guest) | 2.70 Gbps | 0 retransmits, GRO 60KB pkts |
-| iperf3 upload (guest→host) | 1.97 Gbps | 0 retransmits |
+| iperf3 download (host→guest) | **2.77 Gbps** | adaptive drain, macvtap ceiling |
+| iperf3 upload (guest→host) | **1.98 Gbps** | 0 retransmits |
+
+### Macvtap ceiling analysis
+
+Download shows ~18K retransmits per 5-second test, but macvtap drop
+counters show zero drops during the test (the historical 155K drops
+were from earlier broken builds). The retransmits are TCP sender-side
+spurious retransmits — RACK/FACK loss detection triggered by timing
+jitter in the macvtap → readv path. They consume ~0.3% bandwidth but
+don't trigger actual congestion backoff.
+
+2.77 Gbps appears to be the macvtap path ceiling. Tuning tried with
+no improvement: TUNSETSNDBUF (1MB→4MB), txqueuelen (500→10000), TCP
+window size (-w 8M), Nagle (--no-delay), larger send buffer (-l 1M),
+GSO/ECN/UFO feature bits, queue size (256→1024).
+
+### Path to 10 Gbps: AF_XDP
+
+The AF_XDP backend (already integrated into Firecracker, achieving
+11 Gbps) bypasses the kernel networking stack entirely. Packets go
+directly between the NIC and userspace via shared UMEM rings — no
+macvtap, no socket buffers, no kernel TCP accounting. This is the
+proven path for 10 Gbps+ in our stack. See `xdp-net` crate and the
+Firecracker integration patch in `../rust-vmm/firecracker`.
 
 ### Core pinning with TSO/GRO
 

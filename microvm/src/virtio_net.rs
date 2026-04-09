@@ -25,14 +25,21 @@ const NUM_QUEUES: usize = 2;
 const RX_QUEUE: usize = 0;
 const TX_QUEUE: usize = 1;
 
-// Feature bits
+// Feature bits — enable all offloads for maximum throughput.
+// TSO/GRO is the biggest win: macvtap delivers 60KB+ aggregated packets.
+// ECN is required alongside TSO for ECN-marked connections.
 const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
 const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+const VIRTIO_NET_F_GSO: u64 = 1 << 6;
 const VIRTIO_NET_F_GUEST_TSO4: u64 = 1 << 7;
 const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
+const VIRTIO_NET_F_GUEST_ECN: u64 = 1 << 9;
+const VIRTIO_NET_F_GUEST_UFO: u64 = 1 << 10;
 const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
 const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
+const VIRTIO_NET_F_HOST_ECN: u64 = 1 << 13;
+const VIRTIO_NET_F_HOST_UFO: u64 = 1 << 14;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 
 /// Max iovec entries per descriptor chain.
@@ -158,18 +165,23 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
+            // Outer loop: block on poll when idle, busy-drain when active.
+            // After delivering packets, skip poll and immediately retry —
+            // the IRQ is in-flight, more packets likely arriving. Only
+            // fall back to blocking poll after two consecutive empty drains.
+            let mut idle = true;
             loop {
-                // Block until tap fd has data.
-                let mut pollfd = libc::pollfd {
-                    fd: rx_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut pollfd, 1, -1) } <= 0 {
-                    continue;
+                if idle {
+                    let mut pollfd = libc::pollfd {
+                        fd: rx_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if unsafe { libc::poll(&mut pollfd, 1, -1) } <= 0 {
+                        continue;
+                    }
                 }
 
-                // Drain all available packets via readv into guest memory.
                 let mut delivered = 0u32;
                 loop {
                     let dc = match rx_queue.pop_descriptor_chain(&memory) {
@@ -178,7 +190,6 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
                     };
                     let head = dc.head_index();
 
-                    // Build iovecs pointing directly into guest memory.
                     let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; MAX_IOVECS];
                     let mut iov_count = 0usize;
                     for desc in dc.writable() {
@@ -197,13 +208,11 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
                         break;
                     }
 
-                    // readv directly into guest memory — zero copies.
                     let ret = unsafe {
                         libc::readv(rx_fd, iovecs.as_ptr(), iov_count as i32)
                     };
 
                     if ret <= 0 {
-                        // EAGAIN or error — push descriptor back.
                         rx_queue.go_to_previous_position();
                         break;
                     }
@@ -212,13 +221,20 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
                     delivered += 1;
                 }
 
-                // One interrupt for the whole batch.
                 if delivered > 0 {
                     unsafe {
                         let status = &*(interrupt_status as *const AtomicU32);
                         status.fetch_or(0x01, Ordering::Relaxed);
                     }
                     irqfd.write(1).ok();
+                    idle = false; // stay in busy-drain mode
+                } else {
+                    if idle {
+                        // Already was idle and got nothing — stay in poll
+                    } else {
+                        // Was active, got nothing — one more try before sleeping
+                        idle = true;
+                    }
                 }
             }
         }));
