@@ -231,6 +231,51 @@ request or network send.
 | I/O rate limits | None | Token bucket per device | Not needed for single-VM |
 | CPU capping | None | Host cgroups (external) | Use cgroups if deploying |
 
+---
+
+## Core Pinning (Measured 2026-04-08)
+
+### Results
+
+100MB local HTTP download, release build:
+
+| Configuration | Throughput | Notes |
+|---------------|-----------|-------|
+| No pinning (default) | 127 MB/s | Scheduler bounces threads across cores |
+| All threads on 1 core (`taskset -c 0`) | 180 MB/s | **Best** — L1/L2 cache locality |
+| 2 cores (`taskset -c 0,1`) | 179 MB/s | Equivalent to single core |
+
+### Analysis
+
+Single-core pinning wins by 42% over unpinned. The vCPU thread and RX
+worker thread share the virtqueue descriptor rings in guest memory —
+the vCPU writes available ring entries, the RX worker reads them, and
+vice versa for the used ring. On one core, those cache lines stay in
+L1/L2. Unpinned, the scheduler bounces threads across cores, causing
+cache line migration on every virtqueue interaction.
+
+Two cores is equivalent to one core because the scheduler keeps the
+threads adjacent on the same physical core's SMT pair or neighboring
+cores that share L2.
+
+### Deployment recommendation
+
+Pin each VM process to a single core: `taskset -c N ./microvm ...`
+
+This gives:
+- Best network throughput (cache locality)
+- Predictable CPU isolation between VMs
+- Simplest scheduling (one core per VM)
+- 0% idle CPU (all threads sleep when no work)
+
+On a 64-core host, that's up to 64 VMs with full network performance,
+each getting a dedicated core. The coding agent workload (mostly idle,
+burst on file I/O and network) is well suited to this model.
+
+---
+
+## Summary
+
 The key insight: demand paging and KVM's scheduling give us most of
 what we need without any VMM complexity. Balloon and multi-vCPU are
 well-understood extensions we can add when the workload demands it,
