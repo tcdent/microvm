@@ -390,31 +390,47 @@ Each phase is small enough to review in isolation, has a clear bench gate
 (vs the previous commit per the new methodology), and can be reverted
 cleanly if issues surface.
 
-| Phase | Scope | Status | Bench gate | Depends on |
-|---|---|---|---|---|
-| 0a | InodeCache TTL removal | ✓ landed (50385c7) | Flat vs df0734a | — |
-| 0b | RamBlobCache + TieredBlobCache scaffolds | ✓ landed (586c815), now being removed | Flat (no wiring) | 0a |
-| 1 | `S3Client::with_shared_agent` | ✓ landed (2662e9f) | Flat | — |
-| 2 | `GoldenInodeCache` + `GoldenBlobCache` + manifest loader + bulk S3 fetch at init | — | Flat (not wired); init-time cost measured separately | — |
-| 3 | *cancelled — superseded by single flat RAM cache in Phase 2* | — | — | — |
-| 3′ | Remove Phase 0b blob cache scaffolds (delete RamBlobCache/DiskBlobCache/TieredBlobCache/BlobCache trait) | — | Flat (no callers) | — |
-| 4 | `FsConfig::golden` + `S3Fs::new` plumbing: hold `Arc<GoldenInodeCache>` + `Arc<GoldenBlobCache>` | — | Flat (disabled by default) | 1, 2, 3′ |
-| 5 | `lookup()` Tier 2 check against golden inode cache | — | New baseline: cold lookup latency on golden-inherited paths | 4 |
-| 6 | `read()` + `open()` serve golden-inherited files from `GoldenBlobCache` | — | First-read-after-init ≈ memcpy (no S3 round-trip) | 4, 5 |
-| 7 | `unlink()` + `readdir()` filter for deletion via negative-cache entries | — | Flat lookups, correct behavior under unit tests | 5 |
-| 8 | Bootstrap pipeline: BLAKE3 hashing, golden PUTs, manifest generation | — | Offline tool, bench not applicable | — |
-| 9 | End-to-end VM boot test on goldenref rootfs | — | Cold boot time improvement target; in-VM I/O benches | 6, 7, 8 |
+| Phase | Scope | Status | Bench gate |
+|---|---|---|---|
+| 0a | InodeCache TTL removal | ✓ landed (50385c7) | Flat vs df0734a |
+| 0b | Blob cache scaffolds (rotating-offset LFU port) | ✓ landed (586c815), later removed in 3′ | Flat (no wiring) |
+| 1 | `S3Client::with_shared_agent` | ✓ landed (2662e9f) | Flat |
+| 3′ | Remove 0b scaffolds (premature abstraction superseded by single flat RAM cache) | ✓ landed (653b55b) | Flat (no callers) |
+| 2 | `GoldenInodeCache` + `GoldenBlobCache` + manifest loader + bulk parallel S3 fetch at init + multi-bucket `S3Client::get_from` | ✓ landed (f921cbf) | Flat (not wired); init-time measured separately |
+| **G1** | **Golden FUSE integration** — `FsConfig::golden` plumbing, S3Fs holds the Arcs, `lookup()` tier-2 check, `read()`/`open()` serve from `GoldenBlobCache`, `unlink()`/`readdir()` filter via negative cache | — | First-read-after-init ≈ memcpy; cold lookup latency on golden paths |
+| **G2** | **Bootstrap pipeline** — BLAKE3 hashing in `dist/s3-upload`, golden PUTs, manifest emission in `bootstrap-rootfs.sh` | — | Offline tool, bench not applicable |
+| **G3** | **End-to-end VM boot on golden rootfs** — test harness against existing in-VM baseline; measure boot time with full golden serving | — | In-VM cold boot time vs pre-golden baseline |
 
-**Phase 3′ (remove 0b scaffolds) is independent** and can land any time
-before Phase 2 lights up the replacement. Phase 2 is the integration
-point for the new golden-caches architecture. Phases 5–9 build
-incrementally from there.
+### Phase compression
 
-**Guest-startup benchmarks do not include orchestrator init.** The
-~1–2s cost of populating the golden caches from S3 happens once per
-orchestrator lifetime and serves all VMs that boot subsequently — it's
-an infrastructure startup cost, not a per-VM cost, and measured
-separately.
+The original plan split the golden integration across four phases (4/5/6/7)
+for "scaffold-first" discipline. In practice they form one atomic conceptual
+change — shipping them separately produces intermediate commits with broken
+read paths (a lookup that resolves to golden but a read that can't serve
+from the cache). Merged into **G1**.
+
+**G1** is the biggest diff of the three, probably 200-300 lines across
+`s3fs.rs`, `config.rs`, and helpers. If it gets unwieldy the natural seam
+is `G1a` (wire + lookup + read/open) / `G1b` (unlink/readdir delete
+semantics). Start combined; split only if review feedback says to.
+
+**G2** is independent of G1 at compile time; can land in parallel. Different
+code area (shell + `s3-upload` Rust), different review concerns, different
+bench methodology (offline tool).
+
+**G3** depends on G1 + G2 being done — it's the integration measurement.
+
+### Bench methodology reminders
+
+- Baseline is always the previous commit, never a weeks-old reference
+- N=3 minimum on S3-bound reads; ±20% noise budget for <1GB cells
+- Orchestrator init (the ~1-2s bulk fetch of the golden pool) is
+  infrastructure startup, not per-VM startup — excluded from guest
+  boot-time benches. It's a one-time cost amortized across every VM
+  that subsequently boots against the ready caches.
+- G3's boot-time number is what validates the whole effort. Don't
+  stash it, don't apologize for warm-up — just run vs the existing
+  in-VM baseline and report the delta.
 
 ---
 
