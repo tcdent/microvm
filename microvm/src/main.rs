@@ -7,6 +7,7 @@ mod kernel;
 mod memory;
 mod mptable;
 mod serial;
+mod virtio_console;
 mod virtio_fs;
 mod virtio_mmio;
 mod virtio_net;
@@ -22,6 +23,7 @@ use s3_rootfs::{S3Fs, S3Config};
 
 use event_loop::EventPoll;
 use serial::Serial;
+use virtio_console::VirtioConsole;
 use virtio_fs::VirtioFs;
 use virtio_net::VirtioNet;
 
@@ -30,6 +32,8 @@ const VIRTIO_FS_BASE: u64 = 0xD000_0000;
 const VIRTIO_FS_IRQ: u32 = 5;
 const VIRTIO_NET_BASE: u64 = 0xD000_1000;
 const VIRTIO_NET_IRQ: u32 = 6;
+const VIRTIO_CONSOLE_BASE: u64 = 0xD000_2000;
+const VIRTIO_CONSOLE_IRQ: u32 = 7;
 
 // Event tokens for epoll
 const EVENT_FUSE_COMPLETION: u64 = 1;
@@ -40,6 +44,7 @@ struct System {
     memory: GuestMemoryMmap,
     vcpu: VcpuFd,
     serial: Serial,
+    console: VirtioConsole,
     virtiofs: VirtioFs,
     virtionet: Option<VirtioNet<MacvtapBackend>>,
     poll: EventPoll,
@@ -57,6 +62,10 @@ impl System {
         cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
 
         let serial = serial::create(&vm);
+
+        let console = VirtioConsole::stdio(VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_BASE);
+        vm.register_irqfd(console.mmio.irqfd_fd(), VIRTIO_CONSOLE_IRQ)?;
+
         let mut s3_config = S3Config::default();
         s3_config.endpoint = s3_endpoint.to_string();
         let s3fs = S3Fs::new(s3_config);
@@ -76,12 +85,13 @@ impl System {
 
         let poll = EventPoll::new();
 
-        Ok(Self { vm, memory, vcpu, serial, virtiofs, virtionet, poll })
+        Ok(Self { vm, memory, vcpu, serial, console, virtiofs, virtionet, poll })
     }
 
     fn run(&mut self) {
         log!("=== microvm started ===");
-        self.serial.start_stdin_thread();
+        // stdin goes to virtio-console (hvc0), not serial (ttyS0).
+        // Serial is output-only for boot messages.
         loop {
             match self.vcpu.run().expect("KVM_RUN failed") {
                 VcpuExit::IoOut(port, data) => {
@@ -119,6 +129,10 @@ impl System {
                                 let offset = addr - VIRTIO_NET_BASE;
                                 net.mmio.read(offset, |off| net.config_read(off))
                             } else { 0 }
+                        }
+                        VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
+                            let offset = addr - VIRTIO_CONSOLE_BASE;
+                            self.console.mmio.read(offset, |off| self.console.config_read(off))
                         }
                         _ => { data.fill(0); continue; }
                     };
@@ -160,6 +174,22 @@ impl System {
                                     net.process_tx(&self.memory);
                                     net.mmio.inject_irq();
                                 }
+                            }
+                        }
+                        VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
+                            let offset = addr - VIRTIO_CONSOLE_BASE;
+                            let notify = self.console.mmio.write(offset, val, |_, _| {});
+                            if offset == 0x044 && val == 1 {
+                                let qs = self.console.mmio.queue_sel();
+                                self.console.activate_queue(qs as usize);
+                            }
+                            // Start RX worker on DRIVER_OK
+                            if offset == 0x070 && (val & 0x04) != 0 {
+                                self.console.start_rx_worker(self.memory.clone());
+                            }
+                            if notify {
+                                self.console.process_tx(&self.memory);
+                                self.console.mmio.inject_irq();
                             }
                         }
                         _ => {}

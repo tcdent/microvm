@@ -56,22 +56,20 @@ mkdir -p "$CACHE_DIR"
 
 echo "==> Configuring rootfs for microVM..."
 
-# Direct service file for serial console — simpler than template + .wants symlink
-
-# Direct service file — no % in the filename, avoids the encoding bug
+# Interactive console on hvc0 (virtio-console) — no FIFO limits, supports paste
 mkdir -p "$WORK/etc/systemd/system"
 cat > "$WORK/etc/systemd/system/serial-console.service" << 'GETTY'
 [Unit]
-Description=Serial Console on ttyS0
+Description=Console on hvc0 (virtio-console)
 After=systemd-user-sessions.service
 
 [Service]
-ExecStart=/sbin/agetty --autologin root --noclear ttyS0 115200 linux
+ExecStart=/sbin/agetty --autologin root --noclear hvc0 115200 linux
 Restart=always
 RestartSec=0
 StandardInput=tty
 StandardOutput=tty
-TTYPath=/dev/ttyS0
+TTYPath=/dev/hvc0
 TTYReset=yes
 TTYVHangup=yes
 UtmpIdentifier=ttyS0
@@ -89,6 +87,10 @@ ln -sf /etc/systemd/system/serial-console.service \
 # Set default target to multi-user (no graphical)
 ln -sf /lib/systemd/system/multi-user.target \
     "$WORK/etc/systemd/system/default.target"
+
+# Mask stock serial-getty templates — they wait 90s for udev (no udev in our VM)
+ln -sf /dev/null "$WORK/etc/systemd/system/serial-getty@ttyS0.service"
+ln -sf /dev/null "$WORK/etc/systemd/system/serial-getty@hvc0.service"
 
 # Allow root login without password (dev only)
 sed -i 's/^root:\*:/root::/' "$WORK/etc/shadow" 2>/dev/null || true

@@ -66,6 +66,7 @@ fn load_cmdline(memory: &GuestMemoryMmap) -> Result<Cmdline, Box<dyn std::error:
     // Register virtio-mmio devices: size@base:irq
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0000000:5")?; // virtio-fs
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0001000:6")?; // virtio-net
+    cmdline.insert_str(" virtio_mmio.device=4K@0xd0002000:7")?; // virtio-console
     cmdline.insert_str(" rootfstype=virtiofs root=rootfs rw systemd.unit=multi-user.target systemd.log_level=info systemd.log_target=console")?;
 
     linux_loader::loader::load_cmdline(memory, GuestAddress(CMDLINE_ADDR), &cmdline)?;
