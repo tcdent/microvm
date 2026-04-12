@@ -32,6 +32,12 @@ use crate::S3Config;
 /// is no external writer whose changes we could miss. The memory
 /// footprint (a few MB over a VM's lifetime) is well under any
 /// threshold where reaping would pay for itself.
+///
+/// There is no `BlobCacheConfig`. The golden blob cache (research/12)
+/// is either populated in full at orchestrator init or not active —
+/// nothing to tune at the per-VM `FsConfig` level. When Phase 2 lands,
+/// `S3Fs::new` will take an optional `Arc<GoldenBlobCache>` alongside
+/// `FsConfig`, not an embedded config struct.
 #[derive(Debug, Clone)]
 pub struct FsConfig {
     /// S3 endpoint, bucket, credentials, timeouts.
@@ -47,10 +53,6 @@ pub struct FsConfig {
     /// `read_cache_max`. A single GET fetches up to this many bytes;
     /// subsequent reads within the window hit memory.
     pub read_ahead_size: usize,
-
-    /// Blob-cache (content-addressed, future) configuration. Empty
-    /// by default since the feature isn't wired up yet.
-    pub blob_cache: BlobCacheConfig,
 }
 
 impl Default for FsConfig {
@@ -59,27 +61,8 @@ impl Default for FsConfig {
             s3: S3Config::default(),
             read_cache_max: 16 * 1024 * 1024,
             read_ahead_size: 16 * 1024 * 1024,
-            blob_cache: BlobCacheConfig::default(),
         }
     }
-}
-
-/// Content-addressed blob cache configuration.
-///
-/// Scaffold for the future golden-image path (research/10-fs-daemon.md):
-/// shared host-side cache of blob hashes → bytes, populated once and
-/// read by many VMs. Not wired up today — the struct exists so
-/// callers can pre-plumb config without a breaking change later.
-#[derive(Debug, Clone, Default)]
-pub struct BlobCacheConfig {
-    /// When set, points at the host directory backing the on-disk
-    /// tier of the blob cache. `None` disables blob caching entirely.
-    /// TODO: define semantics when we actually implement it.
-    pub cache_dir: Option<std::path::PathBuf>,
-
-    /// Approximate cap for the in-memory (RAM) tier. `0` means no
-    /// RAM cache; bytes come straight from disk/S3.
-    pub ram_budget_bytes: usize,
 }
 
 #[cfg(test)]
@@ -91,7 +74,6 @@ mod tests {
         let cfg = FsConfig::default();
         assert!(cfg.read_cache_max > 0);
         assert!(cfg.read_ahead_size > 0);
-        assert!(cfg.blob_cache.cache_dir.is_none());
     }
 
     #[test]
