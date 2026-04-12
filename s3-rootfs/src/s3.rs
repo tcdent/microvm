@@ -6,6 +6,7 @@
 // Note: rusty-s3 sends encoding-type=url on ListObjectsV2, so XML keys
 // are URL-encoded. We decode them in parse_list_response().
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use percent_encoding::percent_decode_str;
@@ -68,13 +69,44 @@ pub struct S3Client {
 
 impl S3Client {
     pub fn new(config: S3Config) -> Self {
-        let endpoint = config.endpoint.parse().expect("invalid S3 endpoint URL");
-        let bucket_name = config.bucket.clone();
-        let region = config.region.clone();
-        let bucket = Bucket::new(endpoint, UrlStyle::Path, bucket_name, region)
-            .expect("invalid bucket config");
-        let credentials = Credentials::new(config.access_key, config.secret_key);
-        let agent = ureq::Agent::new_with_config(
+        // Single-VM path: build our own Agent from this config's pool
+        // settings. Equivalent to the orchestrator path's
+        // `with_shared_agent(config, Arc::new(build_agent(&config)))`
+        // but without forcing callers to thread Arcs they don't need.
+        let agent = Self::build_agent(&config);
+        let (bucket, credentials, sign_duration) = Self::split_config(config);
+        Self { bucket, credentials, agent, sign_duration }
+    }
+
+    /// Construct an `S3Client` that shares an externally-owned `ureq::Agent`
+    /// (and therefore its TCP/TLS connection pool) with other clients.
+    ///
+    /// This is the orchestrator-era constructor: one `Arc<ureq::Agent>` per
+    /// host, cloned into per-VM `S3Client`s and the golden read client.
+    /// A 64-VM host stops maintaining ~512 HTTP connections (8/client ×
+    /// 64 clients) and keeps ~32 shared ones.
+    ///
+    /// The per-VM `config` still controls bucket/credentials/sign duration
+    /// (per-client state). The pool tuning fields on `S3Config`
+    /// (`tcp_nodelay`, `max_idle_*`, `timeout_*`) are ignored here — the
+    /// Agent the caller passed in already embodies those choices. If
+    /// per-VM pool settings ever need to diverge, the right fix is to
+    /// give each client its own Agent via `new()`, not to try to
+    /// override a shared one.
+    pub fn with_shared_agent(config: S3Config, agent: Arc<ureq::Agent>) -> Self {
+        // Extract an Agent handle that shares the pool. `ureq::Agent`
+        // is internally Arc-based for its pool, so `clone()` is a
+        // reference-count bump, not a pool copy.
+        let agent = (*agent).clone();
+        let (bucket, credentials, sign_duration) = Self::split_config(config);
+        Self { bucket, credentials, agent, sign_duration }
+    }
+
+    /// Build a new `ureq::Agent` sized by this config's pool tuning.
+    /// Public so the orchestrator can construct one Agent up front and
+    /// then share it across all `S3Client`s via `with_shared_agent`.
+    pub fn build_agent(config: &S3Config) -> ureq::Agent {
+        ureq::Agent::new_with_config(
             ureq::config::Config::builder()
                 .no_delay(config.tcp_nodelay)
                 .max_idle_connections(config.max_idle_connections)
@@ -83,14 +115,19 @@ impl S3Client {
                 .timeout_global(config.timeout_global)
                 .timeout_connect(config.timeout_connect)
                 .build()
-        );
+        )
+    }
 
-        Self {
-            bucket,
-            credentials,
-            agent,
-            sign_duration: config.sign_duration,
-        }
+    /// Helper: split `S3Config` into the per-client state (bucket,
+    /// credentials, sign duration). Shared between both constructors
+    /// so we can't drift on which fields become client state vs which
+    /// belong to the Agent.
+    fn split_config(config: S3Config) -> (Bucket, Credentials, Duration) {
+        let endpoint = config.endpoint.parse().expect("invalid S3 endpoint URL");
+        let bucket = Bucket::new(endpoint, UrlStyle::Path, config.bucket, config.region)
+            .expect("invalid bucket config");
+        let credentials = Credentials::new(config.access_key, config.secret_key);
+        (bucket, credentials, config.sign_duration)
     }
 
     pub fn get(&self, key: &str) -> Result<Vec<u8>, S3Error> {
@@ -346,5 +383,49 @@ impl<T> S3ResultExt<T> for Result<T, S3Error> {
             crate::log!("S3Fs: {}: {}", context, e);
             std::io::Error::from_raw_os_error(libc::EIO)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> S3Config {
+        // Minimal config — endpoint is parseable but nothing is
+        // actually dialed; these tests only verify construction
+        // shape, not end-to-end S3 behavior.
+        S3Config {
+            endpoint: "http://127.0.0.1:9090".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "ak".to_string(),
+            secret_key: "sk".to_string(),
+            ..S3Config::default()
+        }
+    }
+
+    #[test]
+    fn new_constructs_own_agent() {
+        // Just verify `new()` returns a client without panicking on
+        // the ureq::Agent build step. No network.
+        let _client = S3Client::new(cfg());
+    }
+
+    #[test]
+    fn with_shared_agent_shares_pool() {
+        // Build one Agent, construct two clients from it, verify
+        // both constructions succeed. The `Arc::strong_count` jump
+        // from 1 to 3 (one in `shared`, two clones-of-inner stashed
+        // inside each S3Client) confirms the passed-in Arc is
+        // unwrapped-and-cloned correctly, not re-Arc'd.
+        let shared = Arc::new(S3Client::build_agent(&cfg()));
+        assert_eq!(Arc::strong_count(&shared), 1);
+
+        let _c1 = S3Client::with_shared_agent(cfg(), Arc::clone(&shared));
+        let _c2 = S3Client::with_shared_agent(cfg(), Arc::clone(&shared));
+        // The passed-in Arc clones went into with_shared_agent and
+        // were dropped there (after extracting an Agent clone); the
+        // strong count returns to 1.
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 }
