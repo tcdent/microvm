@@ -41,8 +41,15 @@ pub struct InodeCache {
     by_ino: HashMap<u64, String>,             // ino → path (reverse lookup)
     negative: HashMap<String, Instant>,       // paths known to not exist + when cached
     next_ino: u64,
-    /// TTL for memory reclamation — entries not accessed within this
-    /// window are eligible for reaping. Does NOT affect correctness.
+    /// TTL serves two distinct roles:
+    /// (a) Eviction timer for positive cache entries — pure memory
+    ///     reclamation. The positive cache is authoritative (single-writer
+    ///     through this process), so evicting an entry only forces a re-LIST
+    ///     on next access; it never changes the answer.
+    /// (b) Expiry timer for negative cache entries — correctness-relevant.
+    ///     If something outside this process writes the bucket, a negative
+    ///     entry would otherwise shadow the new object forever; the TTL
+    ///     bounds that staleness window.
     ttl: Duration,
     /// Operation counter for triggering periodic reap
     op_count: u64,
@@ -91,7 +98,12 @@ impl InodeCache {
 
         if self.by_path.contains_key(path) {
             self.hits += 1;
-            // Update last_accessed
+            // Two-lookup pattern is intentional: bumping self.hits and
+            // updating entry.last_accessed each need a disjoint &mut borrow
+            // of self, and the borrow checker can't split them through a
+            // single get_mut. Splitting costs one extra HashMap probe on a
+            // hot path; the code-reader tax of a hand-rolled unsafe shortcut
+            // is worse than one probe.
             if let Some(entry) = self.by_path.get_mut(path) {
                 entry.last_accessed = Instant::now();
             }
@@ -140,7 +152,10 @@ impl InodeCache {
     }
 
     /// Insert from a decoded S3 key (path + KeyMeta) with a known size.
-    /// Convenience for populating from LIST results.
+    /// Convenience for populating from LIST results. The `last_accessed`
+    /// value is overwritten inside `insert()` — we pass `Instant::now()`
+    /// here only because `CachedInode` requires one, not because callers
+    /// should rely on it being preserved.
     pub fn insert_from_key(&mut self, path: &str, meta: KeyMeta, size: u64) -> u64 {
         self.insert(path, CachedInode {
             ino: 0, // will be assigned
@@ -198,13 +213,31 @@ impl InodeCache {
         }
     }
 
-    /// Redis-style probabilistic reap. Samples up to 20 entries, evicts stale ones.
-    /// If >25% of sample was stale, samples again (max 3 rounds, 60 entries total).
-    /// Root inode (ino=1) is never reaped.
+    /// Redis-style probabilistic reap. Samples up to 20 entries per round,
+    /// evicts stale ones; if >25% of the sample was stale, samples again
+    /// (max 3 rounds, 60 entries total). Root inode (ino=1) is never reaped.
+    ///
+    /// Sampling strategy: `HashMap` iteration order is deterministic within
+    /// one instance, so a naive `keys().take(20)` would hit the same 20
+    /// entries every call — biased against whichever keys happened to land
+    /// early in the hash layout. We pick a rotating offset seeded from
+    /// `op_count` and the round index, then `skip(offset).take(20)`. Not
+    /// cryptographic randomness; just enough to give every key eventual
+    /// coverage across invocations without pulling in a PRNG crate.
     fn maybe_reap(&mut self) {
         let now = Instant::now();
-        for _round in 0..3 {
+        for round in 0..3u64 {
+            let len = self.by_path.len();
+            if len == 0 { break; }
+
+            // Knuth-multiplicative hash on (op_count, round) gives us a
+            // cheap pseudo-random offset. Wrapping arithmetic is fine —
+            // we just mod into [0, len) anyway.
+            let seed = self.op_count.wrapping_add(round).wrapping_mul(2654435761);
+            let offset = (seed as usize) % len;
+
             let paths: Vec<String> = self.by_path.keys()
+                .skip(offset)
                 .take(20)
                 .cloned()
                 .collect();
@@ -226,14 +259,20 @@ impl InodeCache {
                 }
             }
 
-            // Also reap stale negative entries
-            let neg_paths: Vec<String> = self.negative.iter()
-                .filter(|(_, ts)| now.duration_since(**ts) > self.ttl)
-                .map(|(p, _)| p.clone())
-                .take(20)
-                .collect();
-            for path in &neg_paths {
-                self.negative.remove(path);
+            // Also reap stale negative entries. Same rotating-offset trick
+            // so we don't always sweep the same head of the map.
+            let neg_len = self.negative.len();
+            if neg_len > 0 {
+                let neg_offset = (seed as usize) % neg_len;
+                let neg_paths: Vec<String> = self.negative.iter()
+                    .skip(neg_offset)
+                    .filter(|(_, ts)| now.duration_since(**ts) > self.ttl)
+                    .map(|(p, _)| p.clone())
+                    .take(20)
+                    .collect();
+                for path in &neg_paths {
+                    self.negative.remove(path);
+                }
             }
 
             // If <25% of sample was stale, stop

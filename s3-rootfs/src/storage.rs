@@ -37,6 +37,15 @@ pub const HARDLINK_REF_PREFIX: &str = "hardlink:";
 #[allow(dead_code)]
 pub const GOLDEN_REF_PREFIX: &str = "ref:";
 
+/// Is `name` a top-level entry reserved by the storage layer and hidden
+/// from guest-visible readdir? Currently just the `.hardlinks` directory
+/// that stores shared hardlink data; extends cleanly to a future
+/// `.golden/` pool (research/10) when that lands.
+pub fn is_reserved_name(name: &str) -> bool {
+    name == HARDLINK_PREFIX.trim_end_matches('/')
+    // Future: || name == GOLDEN_PREFIX.trim_end_matches('/')
+}
+
 /// Decoded interpretation of an S3 object body.
 ///
 /// Which variant applies depends on both the key metadata (file type

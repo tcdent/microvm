@@ -328,3 +328,23 @@ impl std::fmt::Display for S3Error {
 }
 
 impl std::error::Error for S3Error {}
+
+/// Extension trait to convert `Result<T, S3Error>` into `io::Result<T>`
+/// with logged context. All S3 failures collapse to `EIO` because the
+/// FUSE caller (kernel) can't act on a finer classification, but the
+/// log line preserves the underlying cause so debugging doesn't require
+/// git-archaeology. Centralizing the conversion here keeps the 25+ call
+/// sites in `s3fs.rs` readable: `.io_err("release PUT")?` in place of a
+/// multi-line `.map_err(|e| { log!(...); io::Error::from_raw_os_error(EIO) })`.
+pub trait S3ResultExt<T> {
+    fn io_err(self, context: &str) -> std::io::Result<T>;
+}
+
+impl<T> S3ResultExt<T> for Result<T, S3Error> {
+    fn io_err(self, context: &str) -> std::io::Result<T> {
+        self.map_err(|e| {
+            crate::log!("S3Fs: {}: {}", context, e);
+            std::io::Error::from_raw_os_error(libc::EIO)
+        })
+    }
+}

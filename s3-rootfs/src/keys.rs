@@ -35,15 +35,21 @@ impl KeyMeta {
 /// Example: encode("usr/bin/bash", KeyMeta { mode: 0o100755, uid: 0, gid: 0 })
 ///   → "usr/bin/bash\x0181ed0000000000000000"
 pub fn encode(path: &str, meta: KeyMeta) -> String {
+    use std::fmt::Write;
     let mut key = String::with_capacity(path.len() + 1 + META_LEN);
     key.push_str(path);
     key.push(META_SEP as char);
-    // mode: 4 hex chars (16-bit value from st_mode)
-    key.push_str(&format!("{:04x}", meta.mode & 0xFFFF));
-    // uid: 8 hex chars
-    key.push_str(&format!("{:08x}", meta.uid));
-    // gid: 8 hex chars
-    key.push_str(&format!("{:08x}", meta.gid));
+    // Single formatted write into the pre-allocated buffer — no
+    // intermediate String allocations (vs three format!() temporaries).
+    // `write!` into `String` is infallible; the unwrap is reachable only
+    // if the allocator panics, which it won't at this size.
+    write!(
+        &mut key,
+        "{:04x}{:08x}{:08x}",
+        meta.mode & 0xFFFF,
+        meta.uid,
+        meta.gid,
+    ).unwrap();
     key
 }
 
