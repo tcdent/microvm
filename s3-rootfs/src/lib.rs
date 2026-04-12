@@ -25,7 +25,7 @@ pub mod storage;
 
 pub use inode_cache::{CachedInode, InodeCache};
 pub use keys::{KeyMeta, encode as encode_key, decode as decode_key, list_prefix};
-pub use s3::{S3Client, S3Config, S3Error, ObjectMeta, ListResult, ListObject};
+pub use s3::{S3Client, S3Config, S3Error, ListResult, ListObject};
 pub use s3fs::{S3Fs, CacheStats, LIST_PROBE_MAX_KEYS};
 
 use std::sync::Mutex;

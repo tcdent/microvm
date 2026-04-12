@@ -66,15 +66,6 @@ pub struct S3Client {
     sign_duration: Duration,
 }
 
-pub struct ObjectMeta {
-    pub content_length: u64,
-    pub exists: bool,
-    pub mode: Option<u32>,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
-    pub symlink_target: Option<String>,
-}
-
 impl S3Client {
     pub fn new(config: S3Config) -> Self {
         let endpoint = config.endpoint.parse().expect("invalid S3 endpoint URL");
@@ -99,39 +90,6 @@ impl S3Client {
             credentials,
             agent,
             sign_duration: config.sign_duration,
-        }
-    }
-
-    pub fn head(&self, key: &str) -> Result<ObjectMeta, S3Error> {
-        let url = self.bucket
-            .head_object(Some(&self.credentials), key)
-            .sign(self.sign_duration);
-
-        match self.agent.head(url.as_str()).call() {
-            Ok(response) => {
-                let h = response.headers();
-                let len = h.get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let mode = h.get("x-amz-meta-mode")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| u32::from_str_radix(v, 8).ok());
-                let uid = h.get("x-amz-meta-uid")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u32>().ok());
-                let gid = h.get("x-amz-meta-gid")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u32>().ok());
-                let symlink_target = h.get("x-amz-meta-target")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.to_string());
-                Ok(ObjectMeta { content_length: len, exists: true, mode, uid, gid, symlink_target })
-            }
-            Err(ureq::Error::StatusCode(404)) => {
-                Ok(ObjectMeta { content_length: 0, exists: false, mode: None, uid: None, gid: None, symlink_target: None })
-            }
-            Err(e) => Err(S3Error::Http(format!("{e}"))),
         }
     }
 
