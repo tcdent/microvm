@@ -716,8 +716,237 @@ spike on first `ls`. Not urgent but worth noting.
 | Cache eviction/TTL | Deferred | Not implemented | Low (single-writer) |
 | setattr persistence | Not designed | Not implemented | Medium |
 | Write buffer bounds | 100MB limit noted | Unbounded | Low risk, easy fix |
-| rename | Not designed | Not implemented | **High impact** |
+| rename | Designed | Implemented (server-side copy) | URL-encoding fix needed for \x01 in copy-source |
+| statfs | Not designed | Implemented (reports 4TB) | None — apt needs free space to install |
 | readdir streaming | Not designed | Loads all first | Low |
+| link (hardlink) | Designed | Implemented (server-side copy) | Correct semantics, not symlink alias |
+| rmdir | Designed | Implemented (empty check + DELETE) | None |
+| symlink (create) | Designed | Implemented (PUT with S_IFLNK + target body) | None |
+| fsync / flush | Designed | Implemented (flush dirty handle to S3) | Clones data for PUT — could be optimized |
+| mknod | Designed | Implemented (regular files only) | Device nodes / FIFOs return ENOSYS |
+| access | Designed | Implemented (always OK) | No POSIX permission enforcement |
+| fallocate | Designed | Implemented (no-op) | S3 doesn't support preallocation |
+| xattr (get/list) | Designed | Implemented (ENODATA / empty) | No xattr storage |
+| truncate via setattr | Not designed | Not implemented | Medium — `>file` truncation |
+
+---
+
+## Gaps Found During Real-World Testing (apt, dpkg, systemd)
+
+Tested by running `apt-get update` and `apt-get install iperf3` inside
+the booted VM. These are the FUSE operations that failed or behaved
+incorrectly, in order of impact.
+
+### rename — IMPLEMENTED
+
+`apt` and `dpkg` use rename extensively: write to temp file, rename
+over the target for atomic updates. Implemented via S3 server-side
+copy (`x-amz-copy-source` header) + delete. The copy source header
+must be URL-encoded because our keys contain `\x01` bytes which are
+invalid in HTTP header values.
+
+Directory rename recursively copies all children (LIST prefix, copy+
+delete each). This is O(n) S3 requests for n children — expensive but
+correct.
+
+### statfs — IMPLEMENTED
+
+`apt` checks available disk space before downloading packages. Without
+`statfs`, the FUSE default reports 0 free blocks and apt refuses to
+install anything (`E: You don't have enough free space`). Reports 4TB
+free — S3 is effectively unlimited.
+
+### setattr — STUB ONLY
+
+`setattr` returns success and updates the cache but doesn't persist
+metadata changes to S3. `chmod`, `chown`, `utimes` appear to work
+within a session but are lost on VM restart or cache eviction.
+
+**Trade-off:** Persisting setattr requires renaming the S3 key (since
+metadata is encoded in the key): server-side copy to new key with
+updated metadata, delete old key. Deferred for now — most tools work
+because the cache serves the updated metadata during the session.
+
+### link (hardlink) — IMPLEMENTED (server-side copy)
+
+Emulated via S3 server-side copy. Creates an independent copy of the
+data, not a reference. This means hardlinks consume double storage
+and modifications to one don't affect the other.
+
+**Trade-off:** True hardlink semantics (shared data, refcounted) are
+impossible in S3. Copy semantics are correct for dpkg's use case
+(backup before overwrite) where the hardlink preserves the old data.
+Would break tools that expect `stat()` to return the same inode for
+both names — our implementation returns different inodes.
+
+### rmdir — IMPLEMENTED
+
+Deletes the directory marker key from S3. Checks directory is empty
+first via `LIST prefix=path/&max-keys=1`. Returns ENOTEMPTY if
+children exist.
+
+### symlink (create) — IMPLEMENTED
+
+PUT with `S_IFLNK` mode, target path as object body. Symlink target
+is immediately cached. Consistent with how readlink works (GET body).
+
+### access — IMPLEMENTED (always OK)
+
+Returns success unconditionally. The guest runs as root and we don't
+enforce POSIX permission checks.
+
+**Trade-off:** Tools that rely on `access()` for permission checking
+will always see "permitted". This is correct for a single-user root
+agent VM but would be wrong for multi-user.
+
+### flush / fsync — IMPLEMENTED
+
+Flushes dirty handle data to S3 via PUT. Currently clones the data
+buffer to release the handle lock during the PUT — could be optimized
+with a shared reference.
+
+### mknod — IMPLEMENTED (regular files only)
+
+Creates regular files. Device nodes and FIFOs return ENOSYS — not
+applicable for an S3-backed filesystem.
+
+### fallocate — IMPLEMENTED (no-op)
+
+S3 doesn't support preallocation. Returns success without doing
+anything. Tools that use `posix_fallocate()` for performance hints
+won't break.
+
+### xattr — IMPLEMENTED (empty)
+
+`getxattr` returns ENODATA, `listxattr` returns empty. No xattr
+storage in S3. SELinux and ACLs won't work.
+
+### Remaining gaps
+
+**setattr persistence** — metadata changes lost on restart. See above.
+
+**truncate via setattr** — Implemented but with a subtlety. When
+the kernel sends `setattr(FATTR_SIZE=0)` for `O_TRUNC`, there's a
+race with the write path: the kernel may send setattr *while* the
+write handle is open and being written to. If we blindly `resize(0)`
+the handle's data buffer, we destroy bytes that curl/wget are
+actively writing.
+
+Fix: only truncate handle buffers that already contain data (non-empty).
+Handles created by `open(O_TRUNC)` skip the preload GET and start with
+an empty buffer — setattr sees this and leaves them alone. Handles
+from explicit `ftruncate()` on an existing file DO have data, so the
+truncate applies. This distinction is safe because `O_TRUNC` is
+handled in `open()` (skip preload), and `ftruncate()` is a deliberate
+truncate of an already-open file.
+
+Bug found: the naive implementation (truncate all matching handles)
+caused `curl -o file` to fail — the kernel sent `setattr(size=0)`
+after `open(O_CREAT|O_TRUNC)`, which zeroed the empty write buffer
+and confused curl's write callback into returning short writes.
+
+**rename flags** — `renameat2` with `RENAME_NOREPLACE` or
+`RENAME_EXCHANGE` flags are ignored. May cause subtle issues with
+atomic rename patterns.
+
+**Streaming writes / multipart upload.** Currently the entire file
+is buffered in memory per handle and flushed to S3 as a single PUT
+on release. The write buffer limit is 512MB. This means:
+
+1. Files >512MB cannot be written (returns EFBIG)
+2. Large files consume VMM heap proportional to file size
+3. Flush latency scales with file size (single PUT)
+
+The fix is S3 multipart upload: start an upload on first write,
+stream 5MB+ parts as the buffer fills, complete on release. This
+removes the size limit entirely and caps memory at one part's worth
+(~5-16MB). The `rusty-s3` crate supports `CreateMultipartUpload`,
+`UploadPart`, and `CompleteMultipartUpload`.
+
+Priority: medium. The 512MB limit covers the Claude Code binary
+(~105MB) and most development artifacts. Becomes urgent for large
+model files, datasets, or docker images written inside the VM.
+
+---
+
+## FUSE Operation Coverage
+
+Full list of FUSE operations from `fuse-backend-rs` FileSystem trait,
+our implementation status, and what needs each one.
+
+### Implemented
+
+| Op | What it does | Notes / Trade-offs |
+|----|-------------|-------|
+| `init` | Filesystem startup | Returns empty FsOptions |
+| `lookup` | Resolve name in directory | Two-phase: parent prefill + precise fallback |
+| `getattr` | stat() | Served from cache, zero S3 |
+| `setattr` | chmod/chown/utimes | **Stub** — updates cache, doesn't persist to S3 |
+| `readlink` | Symlink target | GET from S3, cached after first read |
+| `symlink` | Create symlink | PUT with S_IFLNK mode, target as body |
+| `mknod` | Create file node | Regular files only; devices/FIFOs return ENOSYS |
+| `mkdir` | Create directory | PUT dir marker, update cache |
+| `unlink` | Delete file | DELETE from S3, evict from cache |
+| `rmdir` | Delete directory | Verifies empty (LIST max-keys=1), then DELETE |
+| `rename` | Move/rename | Server-side copy + delete; recursive for dirs |
+| `link` | Hard link | **Emulated via copy** — independent data, different inode |
+| `open` | Open file | Preloads content for write (skip if O_TRUNC) |
+| `create` | Create + open | PUT empty object, update cache |
+| `read` | File content | Read cache for files ≤2MB (configurable) |
+| `write` | File writes | Buffered per-handle, flushed on release |
+| `flush` | Flush to storage | Clones dirty buffer and PUTs to S3 |
+| `fsync` | Sync to storage | Same as flush |
+| `release` | Close file | Flushes dirty buffer to S3 via PUT |
+| `readdir` | List directory | LIST with delimiter, populates cache |
+| `opendir` | Open directory | No-op, returns handle |
+| `statfs` | df / free space | Reports 4TB (S3 is unlimited) |
+| `access` | Permission check | **Always OK** — no POSIX enforcement, guest is root |
+| `fallocate` | Preallocate space | **No-op** — S3 doesn't support preallocation |
+| `getxattr` | Get extended attr | Returns ENODATA (no xattr storage) |
+| `listxattr` | List extended attrs | Returns empty |
+
+### Not implemented
+
+| Op | Status | Notes |
+|----|--------|-------|
+| `setattr` (persist) | Stub | Cache-only; S3 key rename needed for durable metadata |
+| `truncate` (via setattr) | Missing | `ftruncate()` / `>file` not handled |
+| `readdirplus` | Missing | Would avoid separate getattr per entry; low impact since we cache |
+| `forget` | Missing | No inode eviction, safe to ignore |
+| `setxattr` | ENOSYS | No xattr storage in key format |
+| `removexattr` | ENOSYS | |
+| `lseek` | ENOSYS | S3 objects aren't sparse |
+| `getlk/setlk/setlkw` | ENOSYS | No file locking; single-writer VM |
+| `fsyncdir` | Missing | No-op needed — dirs are markers |
+| `releasedir` | Missing | No-op needed |
+
+### Design trade-offs
+
+**link = copy, not reference.** S3 has no concept of shared data
+between keys. Our `link()` creates an independent copy via server-side
+copy. This means: (1) double storage, (2) modifications to one don't
+affect the other, (3) different inode numbers. Correct for dpkg's
+backup use case (preserve old data before overwrite). Would break tools
+that expect `stat()` to return the same inode for hardlinked files.
+
+**access = always OK.** Guest runs as root, we don't enforce POSIX
+perms. Tools that check `access()` before operations will always
+succeed. Correct for single-user agent VM. Wrong for multi-user.
+
+**setattr = cache-only.** Metadata changes (chmod, chown, utimes) are
+visible within the session but lost on restart. Persisting requires
+S3 key rename (metadata is in the key). Deferred because most tools
+work within a session and the cost of copy+delete per setattr is high.
+
+**flush clones data.** To avoid holding the handle lock during S3 PUT,
+we clone the dirty buffer. For large files this is wasteful. Could be
+optimized with `Arc<Vec<u8>>` or by flushing directly from the locked
+handle with a short critical section.
+
+**fallocate = no-op.** Tools that preallocate space get success but
+no actual reservation. Could cause issues if the VM's write buffer
+grows beyond host memory, but bounded by the write buffer limit
+(not yet enforced).
 
 ---
 

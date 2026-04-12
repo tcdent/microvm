@@ -19,3 +19,12 @@ dist/modules/
 # Cargo lock in workspace members
 Cargo.lock
 dist/.debootstrap-cache/
+
+# S3 data volume (RustFS persistence)
+.s3-data/
+
+# Runtime logs
+/tmp/microvm.log
+
+# Claude Code config (per-user)
+.claude/

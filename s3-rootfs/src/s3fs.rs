@@ -10,12 +10,13 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::debug;
 
-use fuse_backend_rs::abi::fuse_abi::{stat64, FsOptions, OpenOptions};
+use fuse_backend_rs::abi::fuse_abi::{stat64, statvfs64, FsOptions, OpenOptions};
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem};
 
 use crate::cache::{CachedInode, InodeCache};
@@ -39,6 +40,27 @@ const TTL: Duration = Duration::from_secs(1);
 pub const LIST_PROBE_MAX_KEYS: u32 = 12;
 /// Default max file size for read caching (0 = disabled).
 const DEFAULT_READ_CACHE_MAX: u64 = 2 * 1024 * 1024;
+/// Maximum write buffer per file handle (512MB).
+const WRITE_BUFFER_MAX: usize = 512 * 1024 * 1024;
+/// Hidden directory for hardlink data objects.
+const HARDLINK_PREFIX: &str = ".hardlinks/";
+/// Body prefix for hardlink references.
+const HARDLINK_REF_PREFIX: &str = "hardlink:";
+
+static HARDLINK_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn generate_hardlink_uuid() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let seq = HARDLINK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}{:016x}", ts, seq)
+}
+/// Reported filesystem size (1TB). S3 is effectively unlimited;
+/// this just needs to be large enough that tools like apt don't
+/// refuse to write.
+const FS_TOTAL_BLOCKS: u64 = 1024 * 1024 * 1024; // 1T blocks at 4K = 4TB
 
 pub struct S3Fs {
     client: S3Client,
@@ -136,6 +158,24 @@ impl S3Fs {
             attr_timeout: TTL,
             entry_timeout: TTL,
         }
+    }
+
+    /// Build the S3 key for a hardlink data object.
+    fn hardlink_data_key(uuid: &str, meta: KeyMeta) -> String {
+        let path = format!("{}{}", HARDLINK_PREFIX, uuid);
+        keys::encode(&path, meta)
+    }
+
+    /// Resolve the S3 data key for an inode — follows hardlink redirects.
+    /// Returns the key to use for GET/PUT of actual file data.
+    fn data_key_for(&self, path: &str, meta: KeyMeta) -> String {
+        let cache = self.cache.lock().unwrap();
+        if let Some(entry) = cache.get_by_path(path) {
+            if let Some(ref uuid) = entry.hardlink_target {
+                return Self::hardlink_data_key(uuid, meta);
+            }
+        }
+        keys::encode(path, meta)
     }
 
     /// Resolve path from parent inode + child name
@@ -331,6 +371,10 @@ impl FileSystem for S3Fs {
                 if child_name.is_empty() || child_name.contains('/') {
                     continue; // skip self or grandchildren
                 }
+                // Hide the .hardlinks/ directory from listings
+                if child_name == ".hardlinks" {
+                    continue;
+                }
 
                 // Populate cache
                 let ino = cache.insert_from_key(decoded_path, meta, obj.size);
@@ -428,23 +472,42 @@ impl FileSystem for S3Fs {
             }
         }
 
-        let (path, meta, file_size) = {
+        let (path, meta, file_size, hl_uuid) = {
             let cache = self.cache.lock().unwrap();
             let (p, e) = cache.get_by_ino(inode)
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-            (p.to_string(), e.meta, e.size)
+            (p.to_string(), e.meta, e.size, e.hardlink_target.clone())
         };
 
-        let key = keys::encode(&path, meta);
+        // Resolve data key — follows hardlink redirect if present
+        let key = match hl_uuid {
+            Some(ref uuid) => Self::hardlink_data_key(uuid, meta),
+            None => keys::encode(&path, meta),
+        };
 
         // For files within the read cache limit, fetch whole and cache in handle
         if self.read_cache_max > 0 && file_size <= self.read_cache_max {
             log!("S3 GET read-cache {} ({} bytes, full file)", path, file_size);
-            let data = self.client.get(&key)
+            let mut data = self.client.get(&key)
                 .map_err(|e| {
                     log!("S3Fs: read error for {}: {}", path, e);
                     io::Error::from_raw_os_error(libc::EIO)
                 })?;
+
+            // Detect hardlink reference on first read (if not already resolved)
+            if hl_uuid.is_none() {
+                if let Ok(body) = std::str::from_utf8(&data) {
+                    if let Some(uuid) = body.strip_prefix(HARDLINK_REF_PREFIX) {
+                        let uuid = uuid.trim().to_string();
+                        log!("  detected hardlink ref: {} -> .hardlinks/{}", path, uuid);
+                        let hl_key = Self::hardlink_data_key(&uuid, meta);
+                        data = self.client.get(&hl_key)
+                            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+                        let mut cache = self.cache.lock().unwrap();
+                        cache.set_hardlink_target(&path, uuid);
+                    }
+                }
+            }
 
             let start = (offset as usize).min(data.len());
             let end = (offset as usize + size as usize).min(data.len());
@@ -489,13 +552,16 @@ impl FileSystem for S3Fs {
 
         let truncating = (flags & libc::O_TRUNC as u32) != 0;
         if writing && !truncating {
-            let (path, meta) = {
+            let (path, meta, hl_uuid) = {
                 let cache = self.cache.lock().unwrap();
-                cache.get_by_ino(inode).map(|(p, e)| (p.to_string(), e.meta))
+                cache.get_by_ino(inode).map(|(p, e)| (p.to_string(), e.meta, e.hardlink_target.clone()))
             }.unwrap_or_default();
 
             if !path.is_empty() {
-                let key = keys::encode(&path, meta);
+                let key = match hl_uuid {
+                    Some(ref uuid) => Self::hardlink_data_key(uuid, meta),
+                    None => keys::encode(&path, meta),
+                };
                 log!("S3 GET open-preload {}", path);
                 if let Ok(data) = self.client.get(&key) {
                     if let Some(entry) = handles.get_mut(handle) {
@@ -559,6 +625,9 @@ impl FileSystem for S3Fs {
 
         let data = entry.data.get_or_insert_with(Vec::new);
         let end = offset as usize + size as usize;
+        if end > WRITE_BUFFER_MAX {
+            return Err(io::Error::from_raw_os_error(libc::EFBIG));
+        }
         if end > data.len() {
             data.resize(end, 0);
         }
@@ -601,15 +670,24 @@ impl FileSystem for S3Fs {
         if let Some(entry) = entry {
             if entry.dirty {
                 if let Some(data) = &entry.data {
-                    let (path, meta) = {
+                    let (path, meta, hl_uuid) = {
                         let cache = self.cache.lock().unwrap();
                         cache.get_by_ino(entry.inode)
-                            .map(|(p, e)| (p.to_string(), e.meta))
+                            .map(|(p, e)| (p.to_string(), e.meta, e.hardlink_target.clone()))
                     }.unwrap_or_default();
 
                     if !path.is_empty() {
-                        let key = keys::encode(&path, meta);
-                        log!("S3 PUT release {} ({} bytes)", path, data.len());
+                        // Write to hardlink data object if this is a hardlink reference
+                        let key = match hl_uuid {
+                            Some(ref uuid) => {
+                                log!("S3 PUT release hardlink {} -> .hardlinks/{} ({} bytes)", path, uuid, data.len());
+                                Self::hardlink_data_key(uuid, meta)
+                            }
+                            None => {
+                                log!("S3 PUT release {} ({} bytes)", path, data.len());
+                                keys::encode(&path, meta)
+                            }
+                        };
                         self.client.put(&key, data)
                             .map_err(|e| {
                                 log!("S3Fs: release PUT error: {}", e);
@@ -680,14 +758,125 @@ impl FileSystem for S3Fs {
         Ok(())
     }
 
+    fn rename(
+        &self,
+        _ctx: &Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        _flags: u32,
+    ) -> io::Result<()> {
+        let old_name_str = oldname.to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let new_name_str = newname.to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let old_path = self.child_path(olddir, old_name_str)?;
+        let new_path = self.child_path(newdir, new_name_str)?;
+
+        log!("S3 rename {} -> {}", old_path, new_path);
+
+        // Get the old entry's metadata
+        let (meta, is_dir) = {
+            let mut cache = self.cache.lock().unwrap();
+            match cache.get(&old_path) {
+                Some(e) => (e.meta, e.meta.file_type() == libc::S_IFDIR as u32),
+                None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            }
+        };
+
+        if is_dir {
+            // Directory rename: LIST all children, copy+delete each
+            let old_prefix = format!("{}/", old_path);
+            let result = self.client.list(&old_prefix, None)
+                .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+
+            for obj in &result.objects {
+                if let Some((decoded_path, child_meta)) = keys::decode(&obj.key) {
+                    let suffix = &decoded_path[old_prefix.len()..];
+                    let new_child_path = format!("{}/{}", new_path, suffix);
+                    let old_key = keys::encode(decoded_path, child_meta);
+                    let new_key = keys::encode(&new_child_path, child_meta);
+
+                    self.client.copy(&old_key, &new_key)
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+                    self.client.delete(&old_key)
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+
+                    let mut cache = self.cache.lock().unwrap();
+                    if let Some(entry) = cache.get(decoded_path).cloned() {
+                        cache.remove(decoded_path);
+                        cache.insert(&new_child_path, entry);
+                    }
+                }
+            }
+        }
+
+        // Rename the entry itself — server-side copy, no data through client
+        let old_key = keys::encode(&old_path, meta);
+        let new_key = keys::encode(&new_path, meta);
+
+        self.client.copy(&old_key, &new_key)
+            .map_err(|e| {
+                log!("S3Fs: rename copy error {} -> {}: {}", old_key, new_key, e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+        self.client.delete(&old_key)
+            .map_err(|e| {
+                log!("S3Fs: rename delete error {}: {}", old_key, e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        // Update cache
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(entry) = cache.get(&old_path).cloned() {
+            cache.remove(&old_path);
+            cache.insert(&new_path, entry);
+        }
+
+        Ok(())
+    }
+
     fn setattr(
         &self,
         _ctx: &Context,
         inode: Self::Inode,
-        _attr: stat64,
+        attr: stat64,
         _handle: Option<Self::Handle>,
-        _valid: fuse_backend_rs::abi::fuse_abi::SetattrValid,
+        valid: fuse_backend_rs::abi::fuse_abi::SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
+        // Handle truncate (ftruncate, >file)
+        // Only truncate to 0 if there's no open write handle — avoids racing
+        // with active writes (O_TRUNC is already handled in open())
+        if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::SIZE) {
+            let new_size = attr.st_size as usize;
+            log!("setattr truncate ino={} size={}", inode, new_size);
+
+            // Update cached size
+            let mut cache = self.cache.lock().unwrap();
+            if let Some((_, cached)) = cache.get_by_ino(inode) {
+                let mut updated = cached.clone();
+                updated.size = new_size as u64;
+                let path = cache.get_by_ino(inode).unwrap().0.to_string();
+                cache.insert(&path, updated);
+            }
+            drop(cache);
+
+            // Only truncate handle buffers for explicit ftruncate, not O_TRUNC
+            // (O_TRUNC skips the open preload, so the buffer starts empty)
+            let mut handles = self.handles.lock().unwrap();
+            for entry in handles.by_handle.values_mut() {
+                if entry.inode == inode {
+                    if let Some(ref mut data) = entry.data {
+                        if !data.is_empty() {
+                            data.resize(new_size, 0);
+                            entry.dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+
         let cache = self.cache.lock().unwrap();
         let (_, entry) = cache.get_by_ino(inode)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
@@ -701,5 +890,277 @@ impl FileSystem for S3Fs {
         _flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
         Ok((Some(0), OpenOptions::empty()))
+    }
+
+    fn statfs(&self, _ctx: &Context, _inode: Self::Inode) -> io::Result<statvfs64> {
+        let mut st: statvfs64 = unsafe { std::mem::zeroed() };
+        st.f_bsize = 4096;
+        st.f_frsize = 4096;
+        st.f_blocks = FS_TOTAL_BLOCKS;
+        st.f_bfree = FS_TOTAL_BLOCKS;
+        st.f_bavail = FS_TOTAL_BLOCKS;
+        st.f_files = 1_000_000;
+        st.f_ffree = 1_000_000;
+        st.f_namemax = 255;
+        Ok(st)
+    }
+
+    fn symlink(
+        &self,
+        _ctx: &Context,
+        linkname: &CStr,
+        parent: Self::Inode,
+        name: &CStr,
+    ) -> io::Result<Entry> {
+        let name_str = name.to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let target = linkname.to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let path = self.child_path(parent, name_str)?;
+        let meta = KeyMeta::new(libc::S_IFLNK as u32 | 0o777, 0, 0);
+        let key = keys::encode(&path, meta);
+
+        log!("S3 PUT symlink {} -> {}", path, target);
+        self.client.put(&key, target.as_bytes())
+            .map_err(|e| {
+                log!("S3Fs: symlink error: {}", e);
+                io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        let mut cache = self.cache.lock().unwrap();
+        let ino = cache.insert_from_key(&path, meta, target.len() as u64);
+        cache.set_symlink_target(&path, target.to_string());
+        let entry = cache.get_by_ino(ino).unwrap().1;
+        Ok(Self::entry_for(ino, entry))
+    }
+
+    fn rmdir(
+        &self,
+        _ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+    ) -> io::Result<()> {
+        let name_str = name.to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let path = self.child_path(parent, name_str)?;
+
+        // Check it's a directory and get its meta for the S3 key
+        let meta = {
+            let mut cache = self.cache.lock().unwrap();
+            match cache.get(&path) {
+                Some(e) if e.meta.file_type() == libc::S_IFDIR as u32 => e.meta,
+                Some(_) => return Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+                None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            }
+        };
+
+        // Verify directory is empty — LIST with max-keys=1
+        let prefix = format!("{}/", path);
+        let result = self.client.list_probe(&prefix, None, 1)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+        if !result.objects.is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+        }
+
+        let key = keys::encode(&path, meta);
+        log!("S3 DELETE rmdir {}", path);
+        self.client.delete(&key)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+
+        let mut cache = self.cache.lock().unwrap();
+        cache.remove(&path);
+        Ok(())
+    }
+
+    fn link(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        newparent: Self::Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
+        // Hardlink emulation via .hardlinks/ directory.
+        // File data moves to .hardlinks/<uuid>, both paths become references.
+        // TODO: hardlink cleanup — when all references to a UUID are deleted,
+        // the .hardlinks/<uuid> object becomes orphaned. Need refcount or GC.
+        let new_name_str = newname.to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let new_path = self.child_path(newparent, new_name_str)?;
+
+        let (old_path, meta, size, existing_uuid) = {
+            let cache = self.cache.lock().unwrap();
+            let (p, e) = cache.get_by_ino(inode)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            (p.to_string(), e.meta, e.size, e.hardlink_target.clone())
+        };
+
+        let uuid = if let Some(ref uuid) = existing_uuid {
+            // Already a hardlink — reuse the same UUID
+            uuid.clone()
+        } else {
+            // First hardlink — move data to .hardlinks/<uuid>
+            let uuid = generate_hardlink_uuid();
+            let old_key = keys::encode(&old_path, meta);
+            let hl_key = Self::hardlink_data_key(&uuid, meta);
+
+            log!("S3 hardlink: moving data {} -> .hardlinks/{}", old_path, uuid);
+            self.client.copy(&old_key, &hl_key)
+                .map_err(|e| {
+                    log!("S3Fs: hardlink copy error: {}", e);
+                    io::Error::from_raw_os_error(libc::EIO)
+                })?;
+
+            // Overwrite old path with reference
+            let ref_body = format!("{}{}", HARDLINK_REF_PREFIX, uuid);
+            self.client.put(&old_key, ref_body.as_bytes())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+
+            // Update cache for old path
+            let mut cache = self.cache.lock().unwrap();
+            cache.set_hardlink_target(&old_path, uuid.clone());
+            drop(cache);
+
+            uuid
+        };
+
+        // Create new path as reference
+        let new_key = keys::encode(&new_path, meta);
+        let ref_body = format!("{}{}", HARDLINK_REF_PREFIX, uuid);
+
+        log!("S3 PUT hardlink ref {} -> .hardlinks/{}", new_path, uuid);
+        self.client.put(&new_key, ref_body.as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+
+        // Cache new path with hardlink UUID
+        let mut cache = self.cache.lock().unwrap();
+        let ino = cache.insert_from_key(&new_path, meta, size);
+        cache.set_hardlink_target(&new_path, uuid);
+        let entry = cache.get_by_ino(ino).unwrap().1;
+        Ok(Self::entry_for(ino, entry))
+    }
+
+    fn access(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _mask: u32,
+    ) -> io::Result<()> {
+        // Guest runs as root, S3 doesn't enforce POSIX perms
+        Ok(())
+    }
+
+    fn flush(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        handle: Self::Handle,
+        _lock_owner: u64,
+    ) -> io::Result<()> {
+        // Flush dirty handle to S3 (same as release but keeps the handle open)
+        let (path, meta, data) = {
+            let handles = self.handles.lock().unwrap();
+            match handles.by_handle.get(&handle) {
+                Some(entry) if entry.dirty => {
+                    if let Some(ref data) = entry.data {
+                        let cache = self.cache.lock().unwrap();
+                        match cache.get_by_ino(entry.inode) {
+                            Some((p, e)) => (p.to_string(), e.meta, data.clone()),
+                            None => return Ok(()),
+                        }
+                    } else {
+                        return Ok(());
+                    }
+                }
+                _ => return Ok(()),
+            }
+        };
+
+        if !path.is_empty() {
+            let key = keys::encode(&path, meta);
+            log!("S3 PUT flush {} ({} bytes)", path, data.len());
+            self.client.put(&key, &data)
+                .map_err(|e| {
+                    log!("S3Fs: flush PUT error: {}", e);
+                    io::Error::from_raw_os_error(libc::EIO)
+                })?;
+        }
+        Ok(())
+    }
+
+    fn fsync(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _datasync: bool,
+        handle: Self::Handle,
+    ) -> io::Result<()> {
+        // Same as flush — write dirty data to S3
+        self.flush(_ctx, inode, handle, 0)
+    }
+
+    fn mknod(
+        &self,
+        _ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        _umask: u32,
+    ) -> io::Result<Entry> {
+        // Only support regular files — devices/fifos not applicable for S3
+        if (mode & libc::S_IFMT as u32) != libc::S_IFREG as u32 && (mode & libc::S_IFMT as u32) != 0 {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        let name_str = name.to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let path = self.child_path(parent, name_str)?;
+        let file_mode = if (mode & libc::S_IFMT as u32) == 0 {
+            libc::S_IFREG as u32 | (mode & 0o7777)
+        } else {
+            mode
+        };
+        let meta = KeyMeta::new(file_mode, 0, 0);
+        let key = keys::encode(&path, meta);
+
+        log!("S3 PUT mknod {}", path);
+        self.client.put(&key, &[])
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+
+        let mut cache = self.cache.lock().unwrap();
+        let ino = cache.insert_from_key(&path, meta, 0);
+        let entry = cache.get_by_ino(ino).unwrap().1;
+        Ok(Self::entry_for(ino, entry))
+    }
+
+    fn fallocate(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _mode: u32,
+        _offset: u64,
+        _length: u64,
+    ) -> io::Result<()> {
+        // No-op — S3 doesn't support preallocation
+        Ok(())
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _name: &CStr,
+        _size: u32,
+    ) -> io::Result<fuse_backend_rs::api::filesystem::GetxattrReply> {
+        Err(io::Error::from_raw_os_error(libc::ENODATA))
+    }
+
+    fn listxattr(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _size: u32,
+    ) -> io::Result<fuse_backend_rs::api::filesystem::ListxattrReply> {
+        Ok(fuse_backend_rs::api::filesystem::ListxattrReply::Count(0))
     }
 }

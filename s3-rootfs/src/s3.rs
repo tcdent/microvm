@@ -40,7 +40,7 @@ pub struct S3Config {
 impl Default for S3Config {
     fn default() -> Self {
         Self {
-            endpoint: "http://localhost:9090".into(),
+            endpoint: "http://192.168.88.15:9090".into(),
             bucket: "vm-dev".into(),
             region: "us-east-1".into(),
             access_key: "minioadmin".into(),
@@ -208,6 +208,29 @@ impl S3Client {
         }
 
         req.send(data)
+            .map_err(|e| S3Error::Http(format!("{e}")))?;
+        Ok(())
+    }
+
+    /// Server-side copy — no data transferred through the client.
+    pub fn copy(&self, src_key: &str, dst_key: &str) -> Result<(), S3Error> {
+        let url = self.bucket
+            .put_object(Some(&self.credentials), dst_key)
+            .sign(self.sign_duration);
+
+        // URL-encode the copy source — keys contain \x01 which is invalid in HTTP headers
+        let encoded_key: String = src_key.bytes().map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'/' || b == b'-' || b == b'_' || b == b'.' {
+                format!("{}", b as char)
+            } else {
+                format!("%{:02X}", b)
+            }
+        }).collect();
+        let copy_source = format!("/{}/{}", self.bucket.name(), encoded_key);
+
+        self.agent.put(url.as_str())
+            .header("x-amz-copy-source", &copy_source)
+            .send(&[] as &[u8])
             .map_err(|e| S3Error::Http(format!("{e}")))?;
         Ok(())
     }

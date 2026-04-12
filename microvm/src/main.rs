@@ -46,18 +46,20 @@ struct System {
 }
 
 impl System {
-    fn new(kernel_path: &str, initrd_path: &str, net_ifname: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(kernel_path: &str, initrd_path: &str, net_ifname: Option<&str>, mem_mb: usize, s3_endpoint: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let (kvm, vm) = vm::create_vm()?;
         let vm = Arc::new(vm);
-        let memory = memory::setup_guest_memory(&vm)?;
+        let memory = memory::setup_guest_memory(&vm, mem_mb)?;
         mptable::write(&memory)?;
         let vcpu = cpu::create_vcpu(&kvm, &vm, &memory)?;
 
-        let (kernel_entry, boot_params_addr) = kernel::load(&memory, kernel_path, initrd_path)?;
+        let (kernel_entry, boot_params_addr) = kernel::load(&memory, kernel_path, initrd_path, mem_mb * 1024 * 1024)?;
         cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
 
         let serial = serial::create(&vm);
-        let s3fs = S3Fs::new(S3Config::default());
+        let mut s3_config = S3Config::default();
+        s3_config.endpoint = s3_endpoint.to_string();
+        let s3fs = S3Fs::new(s3_config);
         let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ, VIRTIO_FS_BASE);
         vm.register_irqfd(virtiofs.mmio.irqfd_fd(), VIRTIO_FS_IRQ)?;
 
@@ -203,23 +205,26 @@ fn restore_terminal(orig: &libc::termios) {
     }
 }
 
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
 fn main() {
     log::init();
     s3_rootfs::set_log_fn(|msg| crate::log::write(msg));
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: microvm <kernel> <initrd> [net-interface]");
-        std::process::exit(1);
-    }
+    let kernel_path = env_or("VM_KERNEL", "dist/vmlinux");
+    let initrd_path = env_or("VM_INITRD", "dist/initramfs.cpio.gz");
+    let net_ifname = std::env::var("VM_NET").ok();
+    let mem_mb: usize = env_or("VM_MEMORY", "1024").parse().unwrap_or(1024);
+    let s3_endpoint = env_or("VM_S3_ENDPOINT", "http://192.168.88.15:9090");
 
-    let kernel_path = &args[1];
-    let initrd_path = &args[2];
-    let net_ifname = args.get(3).map(|s| s.as_str());
+    log!("Config: memory={}MB kernel={} initrd={} net={:?} s3={}",
+        mem_mb, kernel_path, initrd_path, net_ifname, s3_endpoint);
 
     let orig_term = setup_raw_terminal();
 
-    match System::new(kernel_path, initrd_path, net_ifname) {
+    match System::new(&kernel_path, &initrd_path, net_ifname.as_deref(), mem_mb, &s3_endpoint) {
         Ok(mut system) => system.run(),
         Err(e) => eprintln!("Error: {e}"),
     }

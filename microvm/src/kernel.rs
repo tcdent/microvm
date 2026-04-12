@@ -6,8 +6,6 @@ use linux_loader::loader::elf::{Elf, PvhBootCapability};
 use linux_loader::loader::{KernelLoader, KernelLoaderResult};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use crate::memory::GUEST_MEM_SIZE;
-
 const HIMEM_START: u64 = 0x0010_0000;       // 1MB — where the kernel is loaded
 const CMDLINE_ADDR: u64 = 0x0002_0000;      // 128KB — kernel command line
 pub const BOOT_PARAMS_ADDR: u64 = 0x0000_7000; // "zero page" — boot parameters
@@ -20,11 +18,12 @@ pub fn load(
     memory: &GuestMemoryMmap,
     kernel_path: &str,
     initrd_path: &str,
+    mem_size: usize,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let kernel_result = load_kernel(memory, kernel_path)?;
     let (initrd_addr, initrd_size) = load_initrd(memory, kernel_result.kernel_end, initrd_path)?;
     let cmdline = load_cmdline(memory)?;
-    configure_boot_params(memory, &kernel_result, &cmdline, initrd_addr, initrd_size)?;
+    configure_boot_params(memory, &kernel_result, &cmdline, initrd_addr, initrd_size, mem_size)?;
 
     let entry = kernel_result.kernel_load.raw_value();
     log!("Kernel loaded: entry=0x{:x} boot_params=0x{:x}", entry, BOOT_PARAMS_ADDR);
@@ -80,6 +79,7 @@ fn configure_boot_params(
     cmdline: &Cmdline,
     initrd_addr: u64,
     initrd_size: u64,
+    mem_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut params = boot_params::default();
 
@@ -99,7 +99,7 @@ fn configure_boot_params(
 
     // E820 memory map — tell Linux what memory it has
     add_e820_entry(&mut params, 0, 0x0009_FC00, E820_RAM);
-    add_e820_entry(&mut params, 0x0010_0000, GUEST_MEM_SIZE as u64 - 0x0010_0000, E820_RAM);
+    add_e820_entry(&mut params, 0x0010_0000, mem_size as u64 - 0x0010_0000, E820_RAM);
 
     LinuxBootConfigurator::write_bootparams::<GuestMemoryMmap>(
         &BootParams::new::<boot_params>(&params, GuestAddress(BOOT_PARAMS_ADDR)),

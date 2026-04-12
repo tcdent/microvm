@@ -16,8 +16,18 @@ SUITE="${1:-trixie}"
 SNAPSHOT_DATE="${2:-$(date +%Y%m%d)}"
 BUCKET="${3:-template-debian-${SUITE}-${SNAPSHOT_DATE}}"
 MIRROR="${DEBOOTSTRAP_MIRROR:-http://deb.debian.org/debian}"
-ENDPOINT="${4:-http://localhost:9090}"
+ENDPOINT="${4:-http://192.168.88.15:9090}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Packages to include in the rootfs beyond minbase.
+# Core system
+PACKAGES="systemd-sysv,procps,less,sudo,locales"
+# Networking
+PACKAGES="$PACKAGES,iproute2,iputils-ping,curl,wget,ca-certificates,bind9-dnsutils,net-tools,systemd-timesyncd,isc-dhcp-client"
+# Development
+PACKAGES="$PACKAGES,git,python3,build-essential,openssh-client"
+# Benchmarks / tools
+PACKAGES="$PACKAGES,vim-tiny,apt-transport-https,iperf3"
 
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
@@ -40,7 +50,7 @@ echo "    Bucket: $BUCKET"
 
 CACHE_DIR="${DIR}/.debootstrap-cache"
 mkdir -p "$CACHE_DIR"
-/usr/sbin/debootstrap --variant=minbase --include=systemd-sysv --cache-dir="$CACHE_DIR" "$SUITE" "$WORK" "$MIRROR"
+/usr/sbin/debootstrap --variant=minbase --include="$PACKAGES" --cache-dir="$CACHE_DIR" "$SUITE" "$WORK" "$MIRROR"
 
 # ── microVM configuration (applied before upload) ──────────────
 
@@ -82,6 +92,27 @@ ln -sf /lib/systemd/system/multi-user.target \
 
 # Allow root login without password (dev only)
 sed -i 's/^root:\*:/root::/' "$WORK/etc/shadow" 2>/dev/null || true
+
+# Network: DHCP on eth0 via simple oneshot service
+# systemd-networkd doesn't detect eth0 without udev, so we use a direct script
+# dhclient handles IP, gateway, and DNS resolver
+cat > "$WORK/etc/systemd/system/network-setup.service" << 'NETCFG'
+[Unit]
+Description=Configure network
+After=systemd-modules-load.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip link set eth0 up && dhclient eth0'
+
+[Install]
+WantedBy=multi-user.target
+NETCFG
+ln -sf /etc/systemd/system/network-setup.service \
+    "$WORK/etc/systemd/system/multi-user.target.wants/network-setup.service"
+
 
 # Set hostname
 echo "microvm" > "$WORK/etc/hostname"

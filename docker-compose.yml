@@ -1,0 +1,13 @@
+services:
+  s3:
+    image: docker.io/rustfs/rustfs:latest
+    container_name: vm-s3
+    restart: unless-stopped
+    ports:
+      - "192.168.88.15:9090:9090"
+    volumes:
+      - ./.s3-data:/data
+    environment:
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+    command: server /data --address 0.0.0.0:9090

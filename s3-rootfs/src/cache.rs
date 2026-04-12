@@ -17,6 +17,9 @@ pub struct CachedInode {
     pub size: u64,
     /// Symlink target — populated on first readlink, cached thereafter
     pub symlink_target: Option<String>,
+    /// Hardlink UUID — if set, file data lives at .hardlinks/<uuid>
+    /// and this path's S3 object body is just "hardlink:<uuid>"
+    pub hardlink_target: Option<String>,
 }
 
 /// Cache for inode metadata, keyed by filesystem path.
@@ -54,6 +57,7 @@ impl InodeCache {
             meta: KeyMeta::new(libc::S_IFDIR as u32 | 0o755, 0, 0),
             size: 0,
             symlink_target: None,
+            hardlink_target: None,
         });
         cache
     }
@@ -82,9 +86,12 @@ impl InodeCache {
         if let Some(existing) = self.by_path.get(path) {
             let ino = existing.ino;
             entry.ino = ino;
-            // Preserve symlink target if we had one and the new entry doesn't
+            // Preserve symlink/hardlink targets if we had them and new entry doesn't
             if entry.symlink_target.is_none() {
                 entry.symlink_target = existing.symlink_target.clone();
+            }
+            if entry.hardlink_target.is_none() {
+                entry.hardlink_target = existing.hardlink_target.clone();
             }
             self.by_path.insert(path.to_string(), entry);
             ino
@@ -108,6 +115,7 @@ impl InodeCache {
             meta,
             size,
             symlink_target: None,
+            hardlink_target: None,
         })
     }
 
@@ -122,6 +130,18 @@ impl InodeCache {
     pub fn set_symlink_target(&mut self, path: &str, target: String) {
         if let Some(entry) = self.by_path.get_mut(path) {
             entry.symlink_target = Some(target);
+        }
+    }
+
+    /// Look up by path without mutating (no hit/miss counting).
+    pub fn get_by_path(&self, path: &str) -> Option<&CachedInode> {
+        self.by_path.get(path)
+    }
+
+    /// Set the hardlink UUID for a cached inode.
+    pub fn set_hardlink_target(&mut self, path: &str, uuid: String) {
+        if let Some(entry) = self.by_path.get_mut(path) {
+            entry.hardlink_target = Some(uuid);
         }
     }
 
