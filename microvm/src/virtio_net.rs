@@ -151,7 +151,7 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
         let interrupt_status = &self.mmio.interrupt_status as *const AtomicU32 as usize;
         let rx_fd = backend.rx_fd();
 
-        self._rx_worker = Some(thread::spawn(move || {
+        self._rx_worker = Some(thread::Builder::new().name("vm-net-rx".into()).spawn(move || {
             let _backend = backend;
             let mut rx_queue = rx_queue;
 
@@ -237,7 +237,7 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
                     }
                 }
             }
-        }));
+        }).unwrap());
     }
 
     /// Process TX — guest sent packets, forward to tap. Inline on vCPU thread.

@@ -51,7 +51,7 @@ struct System {
 }
 
 impl System {
-    fn new(kernel_path: &str, initrd_path: &str, net_ifname: Option<&str>, mem_mb: usize, s3_endpoint: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(kernel_path: &str, initrd_path: &str, net_ifname: Option<&str>, mem_mb: usize, s3_endpoint: &str, read_ahead_mb: usize, cache_ttl_secs: u64) -> Result<Self, Box<dyn std::error::Error>> {
         let (kvm, vm) = vm::create_vm()?;
         let vm = Arc::new(vm);
         let memory = memory::setup_guest_memory(&vm, mem_mb)?;
@@ -68,7 +68,9 @@ impl System {
 
         let mut s3_config = S3Config::default();
         s3_config.endpoint = s3_endpoint.to_string();
-        let s3fs = S3Fs::new(s3_config);
+        let read_cache_max = 16 * 1024 * 1024; // 16MB — matches s3fs default
+        let cache_ttl = std::time::Duration::from_secs(cache_ttl_secs);
+        let s3fs = S3Fs::with_options(s3_config, read_cache_max, read_ahead_mb * 1024 * 1024, cache_ttl);
         let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ, VIRTIO_FS_BASE);
         vm.register_irqfd(virtiofs.mmio.irqfd_fd(), VIRTIO_FS_IRQ)?;
 
@@ -240,6 +242,10 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn main() {
+    // Set process name so it shows as "microvm" in top/btop/ps
+    let name = std::ffi::CString::new("microvm").unwrap();
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()); }
+
     log::init();
     s3_rootfs::set_log_fn(|msg| crate::log::write(msg));
 
@@ -248,13 +254,15 @@ fn main() {
     let net_ifname = std::env::var("VM_NET").ok();
     let mem_mb: usize = env_or("VM_MEMORY", "1024").parse().unwrap_or(1024);
     let s3_endpoint = env_or("VM_S3_ENDPOINT", "http://192.168.88.15:9090");
+    let read_ahead_mb: usize = env_or("VM_READ_AHEAD", "16").parse().unwrap_or(16);
+    let cache_ttl_secs: u64 = env_or("VM_CACHE_TTL", "300").parse().unwrap_or(300);
 
-    log!("Config: memory={}MB kernel={} initrd={} net={:?} s3={}",
-        mem_mb, kernel_path, initrd_path, net_ifname, s3_endpoint);
+    log!("Config: memory={}MB kernel={} initrd={} net={:?} s3={} read_ahead={}MB cache_ttl={}s",
+        mem_mb, kernel_path, initrd_path, net_ifname, s3_endpoint, read_ahead_mb, cache_ttl_secs);
 
     let orig_term = setup_raw_terminal();
 
-    match System::new(&kernel_path, &initrd_path, net_ifname.as_deref(), mem_mb, &s3_endpoint) {
+    match System::new(&kernel_path, &initrd_path, net_ifname.as_deref(), mem_mb, &s3_endpoint, read_ahead_mb, cache_ttl_secs) {
         Ok(mut system) => system.run(),
         Err(e) => eprintln!("Error: {e}"),
     }

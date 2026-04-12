@@ -41,7 +41,7 @@ impl Serial {
     /// Spawn a thread that reads stdin and feeds bytes to the guest serial.
     pub fn start_stdin_thread(&self) {
         let inner = Arc::clone(&self.inner);
-        thread::spawn(move || {
+        thread::Builder::new().name("vm-stdin".into()).spawn(move || {
             let stdin = io::stdin();
             let mut handle = stdin.lock();
             let mut buf = [0u8; 64];
@@ -55,7 +55,7 @@ impl Serial {
                     Err(_) => break,
                 }
             }
-        });
+        }).unwrap();
     }
 }
 

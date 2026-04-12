@@ -38,10 +38,18 @@ const TTL: Duration = Duration::from_secs(1);
 /// Number of S3 keys to fetch per lookup LIST probe.
 /// Includes the target entry + neighbors for cache pre-fill.
 pub const LIST_PROBE_MAX_KEYS: u32 = 12;
-/// Default max file size for read caching (0 = disabled).
-const DEFAULT_READ_CACHE_MAX: u64 = 2 * 1024 * 1024;
+/// Default max file size for whole-file read caching.
+/// Files at or below this size are fetched in a single GET and cached
+/// in the handle for subsequent reads. Larger files use range GETs.
+/// 16MB covers nearly all source code, configs, and build artifacts.
+const DEFAULT_READ_CACHE_MAX: u64 = 16 * 1024 * 1024;
 /// Maximum write buffer per file handle (512MB).
 const WRITE_BUFFER_MAX: usize = 512 * 1024 * 1024;
+/// Read-ahead chunk size for large file reads.
+/// Files larger than read_cache_max use this for sequential read-ahead.
+/// Default read-ahead chunk size for large file sequential reads.
+/// Benchmarked: 4MB=123MB/s, 16MB=176MB/s, 64MB=172MB/s, 128MB=243MB/s.
+const DEFAULT_READ_AHEAD: usize = 16 * 1024 * 1024; // 16MB
 /// Hidden directory for hardlink data objects.
 const HARDLINK_PREFIX: &str = ".hardlinks/";
 /// Body prefix for hardlink references.
@@ -69,6 +77,8 @@ pub struct S3Fs {
     /// Files at or below this size are fully cached on first read.
     /// Set to 0 to disable read caching.
     read_cache_max: u64,
+    /// Read-ahead chunk size for files larger than read_cache_max.
+    read_ahead_size: usize,
 }
 
 struct HandleTable {
@@ -81,6 +91,10 @@ struct HandleEntry {
     dirty: bool,
     data: Option<Vec<u8>>,
     read_cached: bool,
+    /// Read-ahead buffer for large files (> read_cache_max).
+    /// Holds a chunk of file data starting at read_ahead_offset.
+    read_ahead: Option<Vec<u8>>,
+    read_ahead_offset: u64,
 }
 
 impl HandleTable {
@@ -94,6 +108,8 @@ impl HandleTable {
         self.by_handle.insert(handle, HandleEntry {
             inode,
             dirty: false,
+            read_ahead: None,
+            read_ahead_offset: 0,
             data: if writing { Some(Vec::new()) } else { None },
             read_cached: false,
         });
@@ -111,15 +127,20 @@ impl HandleTable {
 
 impl S3Fs {
     pub fn new(config: S3Config) -> Self {
-        Self::with_read_cache(config, DEFAULT_READ_CACHE_MAX)
+        Self::with_options(config, DEFAULT_READ_CACHE_MAX, DEFAULT_READ_AHEAD, crate::cache::DEFAULT_CACHE_TTL)
     }
 
     pub fn with_read_cache(config: S3Config, read_cache_max: u64) -> Self {
+        Self::with_options(config, read_cache_max, DEFAULT_READ_AHEAD, crate::cache::DEFAULT_CACHE_TTL)
+    }
+
+    pub fn with_options(config: S3Config, read_cache_max: u64, read_ahead_size: usize, cache_ttl: Duration) -> Self {
         S3Fs {
             client: S3Client::new(config),
-            cache: Mutex::new(InodeCache::new()),
+            cache: Mutex::new(InodeCache::with_ttl(cache_ttl)),
             handles: Mutex::new(HandleTable::new()),
             read_cache_max,
+            read_ahead_size,
         }
     }
 
@@ -277,9 +298,16 @@ impl FileSystem for S3Fs {
     type Inode = u64;
     type Handle = u64;
 
-    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
-        log!("S3Fs: init (key format v2)");
-        Ok(FsOptions::empty())
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        // Enable features that improve throughput:
+        // - BIG_WRITES: allows max_write up to 1MB (vs ~8KB default)
+        // - MAX_PAGES: allows max_pages=256 for 1MB FUSE requests
+        // Only enable what the kernel offered (intersection).
+        let want = FsOptions::BIG_WRITES
+            | FsOptions::MAX_PAGES;
+        let enabled = capable & want;
+        log!("S3Fs: init capable={:#x} enabled={:#x}", capable.bits(), enabled.bits());
+        Ok(enabled)
     }
 
     fn getattr(
@@ -528,15 +556,47 @@ impl FileSystem for S3Fs {
             return Ok(result);
         }
 
-        // Large file — range read, no caching
-        log!("S3 GET read {} offset={} size={}", path, offset, size);
-        let data = self.client.get_range(&key, offset, offset + size as u64 - 1)
+        // Large file — read-ahead: fetch self.read_ahead_size chunk, serve from buffer
+        {
+            let handles = self.handles.lock().unwrap();
+            if let Some(entry) = handles.by_handle.get(&handle) {
+                if let Some(ref ra) = entry.read_ahead {
+                    let ra_start = entry.read_ahead_offset;
+                    let ra_end = ra_start + ra.len() as u64;
+                    if offset >= ra_start && offset + size as u64 <= ra_end {
+                        // Cache hit — serve from read-ahead buffer
+                        let buf_offset = (offset - ra_start) as usize;
+                        let buf_end = buf_offset + size as usize;
+                        return w.write(&ra[buf_offset..buf_end.min(ra.len())])
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+                    }
+                }
+            }
+        }
+
+        // Read-ahead miss — fetch a large chunk
+        let chunk_start = offset;
+        let chunk_end = std::cmp::min(chunk_start + self.read_ahead_size as u64, file_size);
+        log!("S3 GET read-ahead {} offset={} size={}", path, chunk_start, chunk_end - chunk_start);
+        let ra_data = self.client.get_range(&key, chunk_start, chunk_end - 1)
             .map_err(|e| {
                 log!("S3Fs: read error for {}: {}", path, e);
                 io::Error::from_raw_os_error(libc::EIO)
             })?;
 
-        w.write(&data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        // Serve the requested slice from the fetched chunk
+        let buf_end = std::cmp::min(size as usize, ra_data.len());
+        let result = w.write(&ra_data[..buf_end])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Stash the read-ahead buffer for subsequent reads
+        let mut handles = self.handles.lock().unwrap();
+        if let Some(entry) = handles.get_mut(handle) {
+            entry.read_ahead = Some(ra_data);
+            entry.read_ahead_offset = chunk_start;
+        }
+
+        Ok(result)
     }
 
     fn open(

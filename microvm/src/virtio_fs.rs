@@ -140,7 +140,7 @@ impl VirtioFs {
         let irqfd = self.mmio.irqfd.try_clone().expect("clone irqfd");
         let interrupt_status = &self.mmio.interrupt_status as *const AtomicU32 as usize;
 
-        self._worker = Some(thread::spawn(move || {
+        self._worker = Some(thread::Builder::new().name("vm-fuse".into()).spawn(move || {
             loop {
                 // Block until guest writes to QueueNotify
                 kick.read().ok();
@@ -176,6 +176,6 @@ impl VirtioFs {
                     irqfd.write(1).ok();
                 }
             }
-        }));
+        }).unwrap());
     }
 }

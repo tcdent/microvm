@@ -142,7 +142,7 @@ impl S3Client {
         let response = self.agent.get(url.as_str()).call()
             .map_err(|e| S3Error::Http(format!("{e}")))?;
 
-        let body = response.into_body().read_to_vec()
+        let body = response.into_body().with_config().limit(u64::MAX).read_to_vec()
             .map_err(|e| S3Error::Http(format!("{e}")))?;
         Ok(body)
     }
@@ -158,7 +158,7 @@ impl S3Client {
             .call()
             .map_err(|e| S3Error::Http(format!("{e}")))?;
 
-        let body = response.into_body().read_to_vec()
+        let body = response.into_body().with_config().limit(u64::MAX).read_to_vec()
             .map_err(|e| S3Error::Http(format!("{e}")))?;
         Ok(body)
     }

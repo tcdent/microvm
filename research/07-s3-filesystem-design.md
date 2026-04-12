@@ -549,6 +549,116 @@ from 1min 44s to 1min 39s after the switch, which validates the approach.
 
 ---
 
+## FUSE Init Flags and Read/Write Performance
+
+### FUSE init negotiation
+
+The `init()` handler now enables `BIG_WRITES` and `MAX_PAGES`:
+
+- **`BIG_WRITES`** (bit 0x20): allows `max_write` up to 1MB. Without
+  this, the kernel sends writes in ~4KB chunks — 2560 FUSE_WRITE calls
+  for a 10MB file. With it: 10 calls. **2x write throughput gain.**
+
+- **`MAX_PAGES`** (bit 0x400000): sets `max_pages=256` for 1MB FUSE
+  requests (256 × 4KB pages). The fuse-backend-rs library hardcodes
+  `MAX_REQ_PAGES = 256` — this is the ceiling without forking the crate.
+
+Negotiated flags: `capable=0x805bfffffb enabled=0x400020`.
+
+### Read caching
+
+Files up to `read_cache_max` (default 16MB) are fetched in a single
+GET on first read and cached in the file handle. Subsequent reads at
+any offset are served from the cached buffer. Files above the limit
+use per-read range GETs.
+
+The 16MB limit covers nearly all source code, configs, package
+manifests, and build artifacts. A coding agent's hot files are
+typically well under 1MB.
+
+### Measured read/write throughput (local RustFS)
+
+| Operation | Before | After | Change |
+|-----------|--------|-------|--------|
+| Read 10MB (cached) | 23 MB/s | 128 MB/s | 5.5x — single GET |
+| Read 100MB (range GETs) | 22 MB/s | 176 MB/s | 8x — 16MB read-ahead |
+| Read 500MB (range GETs) | ~22 MB/s | 176 MB/s | 8x — 16MB read-ahead |
+| Write 10MB | 21 MB/s | 43 MB/s | 2x — BIG_WRITES |
+| Write 100MB | 27 MB/s | 53 MB/s | 2x — BIG_WRITES |
+
+Block size has minimal impact above 128KB — the kernel's FUSE layer
+caps requests at 1MB regardless of the userspace `dd bs=` value.
+Below 128KB, FUSE request overhead dominates (2560 requests at 4KB
+vs 10 at 1MB).
+
+### Read-ahead for large files — IMPLEMENTED
+
+For files above `read_cache_max`, a sliding-window read-ahead buffer
+fetches larger chunks per GET and serves subsequent FUSE reads from
+the buffer. Default chunk size: 16MB (`VM_READ_AHEAD` env var override).
+
+On read: if the requested range falls within the current read-ahead
+buffer, serve from memory. Otherwise, fetch a new chunk starting at
+the requested offset (no alignment — simpler, optimal for sequential).
+
+Benchmarks (500MB file, local RustFS):
+
+| Chunk size | Throughput | vs baseline | Memory/handle |
+|-----------|-----------|-------------|---------------|
+| None (128KB GETs) | 21.9 MB/s | baseline | ~0 |
+| 4MB | 123 MB/s | 5.6x | 4MB |
+| 16MB (default) | 176 MB/s | 8x | 16MB |
+| 64MB | 172 MB/s | 7.8x | 64MB |
+| 128MB | 243 MB/s | 11x | 128MB |
+
+16MB is the sweet spot — 8x improvement at modest memory cost.
+Diminishing returns between 16-64MB. 128MB wins on raw throughput
+but 8x more memory for 38% more speed. Configurable via
+`VM_READ_AHEAD` for workloads that need it.
+
+---
+
+## Hardlink Emulation
+
+S3 has no native hardlink concept. We emulate hardlinks using a hidden
+`.hardlinks/` directory that stores actual file data, with lightweight
+reference objects at the visible paths.
+
+### Design
+
+When `link(old_path, new_path)` is called:
+
+1. Generate a UUID (timestamp + atomic counter, 32 hex chars)
+2. Copy the file data to `.hardlinks/<uuid>` via S3 server-side copy
+3. Overwrite old path's body with `hardlink:<uuid>` (reference marker)
+4. Create new path's body with `hardlink:<uuid>` (same reference)
+5. Cache both paths with the UUID as `hardlink_target`
+
+Subsequent `link()` calls on an already-hardlinked file reuse the
+existing UUID — no additional data copy.
+
+### Read/write redirect
+
+- **Read**: first GET detects the `hardlink:` prefix in the body,
+  extracts the UUID, follows the redirect to `.hardlinks/<uuid>`,
+  and caches the UUID. Subsequent reads use the cached redirect.
+- **Write/release**: if the inode has a `hardlink_target`, PUT goes
+  to `.hardlinks/<uuid>` instead of the visible path.
+- **readdir**: `.hardlinks` is hidden from directory listings.
+
+### Trade-offs
+
+- Both paths share the same data (writes through one are visible
+  through the other) — correct hardlink semantics.
+- `stat()` returns different inode numbers for each path — not fully
+  POSIX compliant but acceptable for dpkg's backup use case.
+- First read of a hardlink reference pays an extra GET (body check +
+  redirect). Subsequent reads are cached.
+- TODO: orphan cleanup — when all references to a UUID are deleted,
+  the `.hardlinks/<uuid>` object is orphaned. Needs refcount or GC.
+
+---
+
 ## Rootfs Packing
 
 The upload tool (`dist/s3-upload/`) encodes keys in the new format:
@@ -686,12 +796,9 @@ to consider eventually:
    size-bounded cache would cap this, but it's not urgent for 256MB guest
    RAM VMs where the inode table is small relative to guest memory.
 
-**Write buffer is unbounded.**
-`write()` grows `HandleEntry.data` without limit. A guest writing a large
-file will grow the VMM's heap until OOM.
-
-**Fix:** Check `data.len()` against a configured max (e.g., 100MB) and
-return `EFBIG` if exceeded. One-liner in `write()`.
+**Write buffer is bounded (512MB).**
+`write()` returns `EFBIG` if `offset + size` exceeds `WRITE_BUFFER_MAX`
+(512MB). Prevents unbounded heap growth from large file writes.
 
 **`readdir` loads entire directory before yielding.**
 `readdir` calls `list()` which paginates internally and returns all
@@ -712,14 +819,14 @@ spike on first `ls`. Not urgent but worth noting.
 | readdir→lookup pre-fill | Designed | Implemented | None |
 | readdir with delimiter | Designed | Implemented | None |
 | O_TRUNC skip preload | Designed | Implemented | None |
-| Read caching | Designed | Implemented (configurable, default 2MB) | No boot impact (CPU-bound) |
+| Read caching | Designed | Implemented (configurable, default 16MB) | 5.5x for cached files |
 | Cache eviction/TTL | Deferred | Not implemented | Low (single-writer) |
 | setattr persistence | Not designed | Not implemented | Medium |
-| Write buffer bounds | 100MB limit noted | Unbounded | Low risk, easy fix |
+| Write buffer bounds | 100MB limit noted | Implemented (512MB limit) | None |
 | rename | Designed | Implemented (server-side copy) | URL-encoding fix needed for \x01 in copy-source |
 | statfs | Not designed | Implemented (reports 4TB) | None — apt needs free space to install |
 | readdir streaming | Not designed | Loads all first | Low |
-| link (hardlink) | Designed | Implemented (server-side copy) | Correct semantics, not symlink alias |
+| link (hardlink) | Designed | Implemented (.hardlinks/ UUID refs) | TODO: orphan cleanup |
 | rmdir | Designed | Implemented (empty check + DELETE) | None |
 | symlink (create) | Designed | Implemented (PUT with S_IFLNK + target body) | None |
 | fsync / flush | Designed | Implemented (flush dirty handle to S3) | Clones data for PUT — could be optimized |
@@ -727,7 +834,7 @@ spike on first `ls`. Not urgent but worth noting.
 | access | Designed | Implemented (always OK) | No POSIX permission enforcement |
 | fallocate | Designed | Implemented (no-op) | S3 doesn't support preallocation |
 | xattr (get/list) | Designed | Implemented (ENODATA / empty) | No xattr storage |
-| truncate via setattr | Not designed | Not implemented | Medium — `>file` truncation |
+| truncate via setattr | Designed | Implemented (FATTR_SIZE) | None |
 
 ---
 
@@ -767,17 +874,15 @@ metadata is encoded in the key): server-side copy to new key with
 updated metadata, delete old key. Deferred for now — most tools work
 because the cache serves the updated metadata during the session.
 
-### link (hardlink) — IMPLEMENTED (server-side copy)
+### link (hardlink) — REIMPLEMENTED (.hardlinks/ UUID)
 
-Emulated via S3 server-side copy. Creates an independent copy of the
-data, not a reference. This means hardlinks consume double storage
-and modifications to one don't affect the other.
+Emulated via `.hardlinks/` hidden directory. File data is stored at
+`.hardlinks/<uuid>`, both paths become lightweight references with
+body `hardlink:<uuid>`. Writes to either path go to the shared data
+object. See "Hardlink Emulation" section above for full design.
 
-**Trade-off:** True hardlink semantics (shared data, refcounted) are
-impossible in S3. Copy semantics are correct for dpkg's use case
-(backup before overwrite) where the hardlink preserves the old data.
-Would break tools that expect `stat()` to return the same inode for
-both names — our implementation returns different inodes.
+Replaces the previous server-side-copy approach which created
+independent copies (double storage, no shared writes).
 
 ### rmdir — IMPLEMENTED
 
@@ -922,12 +1027,11 @@ our implementation status, and what needs each one.
 
 ### Design trade-offs
 
-**link = copy, not reference.** S3 has no concept of shared data
-between keys. Our `link()` creates an independent copy via server-side
-copy. This means: (1) double storage, (2) modifications to one don't
-affect the other, (3) different inode numbers. Correct for dpkg's
-backup use case (preserve old data before overwrite). Would break tools
-that expect `stat()` to return the same inode for hardlinked files.
+**link = shared via .hardlinks/ UUID.** Data is stored once at
+`.hardlinks/<uuid>`, both paths reference it. Writes through either
+path go to the shared object. Different inode numbers per path (not
+fully POSIX) but shared data (correct for most tools). TODO: orphan
+cleanup when all references deleted.
 
 **access = always OK.** Guest runs as root, we don't enforce POSIX
 perms. Tools that check `access()` before operations will always

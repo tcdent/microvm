@@ -6,8 +6,12 @@
 // or shared-memory implementations later.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::keys::KeyMeta;
+
+/// Default cache TTL — entries older than this are evicted on access.
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 /// Cached metadata for a filesystem entry
 #[derive(Debug, Clone)]
@@ -20,6 +24,9 @@ pub struct CachedInode {
     /// Hardlink UUID — if set, file data lives at .hardlinks/<uuid>
     /// and this path's S3 object body is just "hardlink:<uuid>"
     pub hardlink_target: Option<String>,
+    /// When this entry was last accessed — used for memory reclamation only.
+    /// Cache is always correct (single-writer), TTL just frees unused memory.
+    pub last_accessed: Instant,
 }
 
 /// Cache for inode metadata, keyed by filesystem path.
@@ -31,9 +38,14 @@ pub struct CachedInode {
 /// - create/mkdir (new entries)
 pub struct InodeCache {
     by_path: HashMap<String, CachedInode>,
-    by_ino: HashMap<u64, String>, // ino → path (reverse lookup)
-    negative: HashSet<String>,    // paths known to not exist
+    by_ino: HashMap<u64, String>,             // ino → path (reverse lookup)
+    negative: HashMap<String, Instant>,       // paths known to not exist + when cached
     next_ino: u64,
+    /// TTL for memory reclamation — entries not accessed within this
+    /// window are eligible for reaping. Does NOT affect correctness.
+    ttl: Duration,
+    /// Operation counter for triggering periodic reap
+    op_count: u64,
     // Hit/miss counters for observability
     pub hits: u64,
     pub misses: u64,
@@ -42,11 +54,17 @@ pub struct InodeCache {
 
 impl InodeCache {
     pub fn new() -> Self {
+        Self::with_ttl(DEFAULT_CACHE_TTL)
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
         let mut cache = Self {
             by_path: HashMap::new(),
             by_ino: HashMap::new(),
-            negative: HashSet::new(),
+            negative: HashMap::new(),
             next_ino: 2, // 1 reserved for root
+            ttl,
+            op_count: 0,
             hits: 0,
             misses: 0,
             negative_hits: 0,
@@ -58,14 +76,25 @@ impl InodeCache {
             size: 0,
             symlink_target: None,
             hardlink_target: None,
+            last_accessed: Instant::now(),
         });
         cache
     }
 
-    /// Look up by path. Returns None on cache miss.
+    /// Look up by path. Always returns the entry if present — cache is
+    /// authoritative (single-writer). Triggers periodic reap for memory.
     pub fn get(&mut self, path: &str) -> Option<&CachedInode> {
+        self.op_count += 1;
+        if self.op_count % 100 == 0 {
+            self.maybe_reap();
+        }
+
         if self.by_path.contains_key(path) {
             self.hits += 1;
+            // Update last_accessed
+            if let Some(entry) = self.by_path.get_mut(path) {
+                entry.last_accessed = Instant::now();
+            }
             self.by_path.get(path)
         } else {
             self.misses += 1;
@@ -77,11 +106,14 @@ impl InodeCache {
     pub fn get_by_ino(&self, ino: u64) -> Option<(&str, &CachedInode)> {
         let path = self.by_ino.get(&ino)?;
         let inode = self.by_path.get(path)?;
+        // Note: doesn't update last_accessed to avoid &mut requirement.
+        // get() is the primary access path and handles timestamps.
         Some((path, inode))
     }
 
     /// Insert or update a cache entry. Assigns an inode number if new.
     pub fn insert(&mut self, path: &str, mut entry: CachedInode) -> u64 {
+        entry.last_accessed = Instant::now();
         self.negative.remove(path);
         if let Some(existing) = self.by_path.get(path) {
             let ino = existing.ino;
@@ -116,6 +148,7 @@ impl InodeCache {
             size,
             symlink_target: None,
             hardlink_target: None,
+            last_accessed: Instant::now(),
         })
     }
 
@@ -147,16 +180,66 @@ impl InodeCache {
 
     /// Record a negative cache entry (path known to not exist).
     pub fn insert_negative(&mut self, path: &str) {
-        self.negative.insert(path.to_string());
+        self.negative.insert(path.to_string(), Instant::now());
     }
 
     /// Check if a path is negatively cached (known miss).
     pub fn is_negative(&mut self, path: &str) -> bool {
-        if self.negative.contains(path) {
+        if let Some(ts) = self.negative.get(path) {
+            // Expire stale negative entries
+            if ts.elapsed() > self.ttl {
+                self.negative.remove(path);
+                return false;
+            }
             self.negative_hits += 1;
             true
         } else {
             false
+        }
+    }
+
+    /// Redis-style probabilistic reap. Samples up to 20 entries, evicts stale ones.
+    /// If >25% of sample was stale, samples again (max 3 rounds, 60 entries total).
+    /// Root inode (ino=1) is never reaped.
+    fn maybe_reap(&mut self) {
+        let now = Instant::now();
+        for _round in 0..3 {
+            let paths: Vec<String> = self.by_path.keys()
+                .take(20)
+                .cloned()
+                .collect();
+
+            if paths.is_empty() { break; }
+
+            let sample_size = paths.len();
+            let mut evicted = 0;
+
+            for path in &paths {
+                if let Some(entry) = self.by_path.get(path) {
+                    if entry.ino == 1 { continue; } // never reap root
+                    if now.duration_since(entry.last_accessed) > self.ttl {
+                        let ino = entry.ino;
+                        self.by_path.remove(path);
+                        self.by_ino.remove(&ino);
+                        evicted += 1;
+                    }
+                }
+            }
+
+            // Also reap stale negative entries
+            let neg_paths: Vec<String> = self.negative.iter()
+                .filter(|(_, ts)| now.duration_since(**ts) > self.ttl)
+                .map(|(p, _)| p.clone())
+                .take(20)
+                .collect();
+            for path in &neg_paths {
+                self.negative.remove(path);
+            }
+
+            // If <25% of sample was stale, stop
+            if evicted * 4 < sample_size {
+                break;
+            }
         }
     }
 

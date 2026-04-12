@@ -27,6 +27,8 @@ VM_S3_ENDPOINT="${VM_S3_ENDPOINT:-http://192.168.88.15:9090}"
 VM_KERNEL="${VM_KERNEL:-dist/vmlinux}"
 VM_INITRD="${VM_INITRD:-dist/initramfs.cpio.gz}"
 VM_MEMORY="${VM_MEMORY:-1024}"
+VM_READ_AHEAD="${VM_READ_AHEAD:-16}"
+VM_CACHE_TTL="${VM_CACHE_TTL:-300}"
 
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
@@ -77,5 +79,5 @@ echo ""
 cd microvm
 export VM_KERNEL="../$VM_KERNEL"
 export VM_INITRD="../$VM_INITRD"
-export VM_NET VM_MEMORY VM_S3_ENDPOINT
+export VM_NET VM_MEMORY VM_S3_ENDPOINT VM_READ_AHEAD VM_CACHE_TTL
 exec cargo run --release
