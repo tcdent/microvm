@@ -1212,7 +1212,14 @@ impl FileSystem for S3Fs {
         _name: &CStr,
         _size: u32,
     ) -> io::Result<fuse_backend_rs::api::filesystem::GetxattrReply> {
-        Err(io::Error::from_raw_os_error(libc::ENODATA))
+        // We don't support xattrs at all (unlike ext4 where specific attrs
+        // may be missing). Return ENOTSUP (aka EOPNOTSUPP) — the POSIX
+        // signal for "filesystem doesn't support this feature".
+        //
+        // Returning ENODATA here (per-attr miss) causes coreutils `ls -la`
+        // to log spurious EIO when probing system.posix_acl_access/default
+        // before rendering permission bits.
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
     }
 
     fn listxattr(
@@ -1221,6 +1228,7 @@ impl FileSystem for S3Fs {
         _inode: Self::Inode,
         _size: u32,
     ) -> io::Result<fuse_backend_rs::api::filesystem::ListxattrReply> {
-        Ok(fuse_backend_rs::api::filesystem::ListxattrReply::Count(0))
+        // Same rationale — ENOTSUP tells callers not to expect xattrs.
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
     }
 }

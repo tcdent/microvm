@@ -22,12 +22,24 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Packages to include in the rootfs beyond minbase.
 # Core system
 PACKAGES="systemd-sysv,procps,less,sudo,locales"
-# Networking
-PACKAGES="$PACKAGES,iproute2,iputils-ping,curl,wget,ca-certificates,bind9-dnsutils,net-tools,systemd-timesyncd,isc-dhcp-client"
+# Networking — drop bind9-dnsutils (use upstream DNS, no need for dig),
+# net-tools (iproute2 covers it), apt-transport-https (apt 2.0+ has TLS)
+PACKAGES="$PACKAGES,iproute2,iputils-ping,curl,wget,ca-certificates,isc-dhcp-client,systemd-timesyncd"
 # Development
 PACKAGES="$PACKAGES,git,python3,build-essential,openssh-client"
-# Benchmarks / tools
-PACKAGES="$PACKAGES,vim-tiny,apt-transport-https,iperf3"
+# Tools
+PACKAGES="$PACKAGES,iperf3"
+
+# Packages we don't want pulled in even as dependencies / recommends.
+# Notes:
+# - systemd-timesyncd: KEPT — without NTP the guest clock stays at the
+#   kernel build date, breaking TLS (certs not yet valid). The ~1MB
+#   isn't worth the breakage. See 09-distro-audit.md.
+# - systemd-resolved: dropped, we use dhclient DNS directly
+# - vim-tiny: agent doesn't need an editor
+# - apt-transport-https: apt 2.0+ has built-in TLS
+# - debconf-i18n: non-English package config translations
+EXCLUDES="systemd-resolved,vim-tiny,apt-transport-https,debconf-i18n"
 
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
@@ -50,7 +62,23 @@ echo "    Bucket: $BUCKET"
 
 CACHE_DIR="${DIR}/.debootstrap-cache"
 mkdir -p "$CACHE_DIR"
-/usr/sbin/debootstrap --variant=minbase --include="$PACKAGES" --cache-dir="$CACHE_DIR" "$SUITE" "$WORK" "$MIRROR"
+/usr/sbin/debootstrap \
+    --variant=minbase \
+    --include="$PACKAGES" \
+    --exclude="$EXCLUDES" \
+    --cache-dir="$CACHE_DIR" \
+    "$SUITE" "$WORK" "$MIRROR"
+
+# ── Purge transitively-pulled packages we don't want ───────────
+# These come in via dependencies. dpkg --purge is safe in chroot.
+# NOTE: libapparmor1 is REQUIRED by systemd binary (linked at compile time).
+#       Removing it causes /sbin/init to fail at "cannot open shared object".
+#       Keep libapparmor1, only remove the userspace apparmor tools+profiles.
+echo "==> Purging unneeded packages..."
+PURGE_PKGS="apparmor libfido2-1 libcbor0.10 sqv gnupg gpgv gnupg-l10n"
+for pkg in $PURGE_PKGS; do
+    chroot "$WORK" dpkg --purge --force-depends "$pkg" 2>/dev/null || true
+done
 
 # ── microVM configuration (applied before upload) ──────────────
 
@@ -121,6 +149,87 @@ echo "microvm" > "$WORK/etc/hostname"
 
 echo "    serial console: ttyS0 (autologin root)"
 echo "    default target: multi-user.target"
+
+# ── Strip bloat (Phase 1 cleanup) ──────────────────────────────
+# Saves ~360MB. Done after debootstrap, before upload.
+
+echo "==> Stripping bloat..."
+
+# apt cache and metadata — we don't apt-install in the running VM
+rm -rf "$WORK/var/cache/apt/archives"/*.deb 2>/dev/null
+rm -rf "$WORK/var/cache/apt/archives/partial" 2>/dev/null
+rm -rf "$WORK/var/lib/apt/lists"/* 2>/dev/null
+rm -rf "$WORK/var/lib/apt/lists/partial" 2>/dev/null
+
+# Documentation — no humans reading docs in an agent VM
+rm -rf "$WORK/usr/share/doc"/* 2>/dev/null
+rm -rf "$WORK/usr/share/man"/* 2>/dev/null
+rm -rf "$WORK/usr/share/info"/* 2>/dev/null
+
+# Locale data — keep en_US only
+find "$WORK/usr/share/locale" -mindepth 1 -maxdepth 1 -type d \
+    ! -name 'en_US' -exec rm -rf {} + 2>/dev/null
+rm -rf "$WORK/usr/share/i18n/locales" 2>/dev/null
+
+# ── Drop broken/unneeded systemd unit files ────────────────────
+# These either fail (no kmod, no udev) or serve no purpose (no console)
+
+echo "==> Removing unneeded systemd units..."
+
+# Stock serial-getty templates wait 90s for udev events that never come
+rm -f "$WORK/lib/systemd/system/serial-getty@.service" 2>/dev/null
+
+# Modprobe units — kernel modules are all built-in, no /sbin/modprobe
+rm -f "$WORK/lib/systemd/system"/modprobe@*.service 2>/dev/null
+
+# ldconfig.service — Phase 2: investigate the FUSE failure first before removing.
+# Keeping it in for now so we can capture the actual error.
+
+# Journal catalog rebuild — we don't use journalctl --catalog
+rm -f "$WORK/lib/systemd/system/systemd-journal-catalog-update.service" 2>/dev/null
+
+# Update-done — writes a stamp file we don't care about
+rm -f "$WORK/lib/systemd/system/systemd-update-done.service" 2>/dev/null
+
+# tty1-tty6 getty — no consoles attached, only hvc0 is real
+# Remove the wants symlinks; the template stays for hvc0 if needed
+rm -f "$WORK/etc/systemd/system/getty.target.wants/getty@tty1.service" 2>/dev/null
+rm -f "$WORK/lib/systemd/system/getty.target.wants/getty@tty1.service" 2>/dev/null
+# The default debian autovt enables tty1 via getty.target.wants — also remove
+rm -f "$WORK/lib/systemd/system/autovt@.service" 2>/dev/null
+
+# ── Phase 2: drop scheduled-maintenance timers and unneeded services ──
+
+# Timers — all waste in an ephemeral VM:
+#   apt-daily, apt-daily-upgrade — package metadata refresh / upgrade
+#   dpkg-db-backup — backup dpkg state (we're stateless)
+#   fstrim — discard unused fs blocks (not applicable to virtiofs/S3)
+# Keep: systemd-tmpfiles-clean (cleans /tmp tmpfs, cheap)
+rm -f "$WORK/etc/systemd/system/timers.target.wants/apt-daily.timer" 2>/dev/null
+rm -f "$WORK/etc/systemd/system/timers.target.wants/apt-daily-upgrade.timer" 2>/dev/null
+rm -f "$WORK/etc/systemd/system/timers.target.wants/dpkg-db-backup.timer" 2>/dev/null
+rm -f "$WORK/etc/systemd/system/timers.target.wants/fstrim.timer" 2>/dev/null
+
+# getty-static.service — explicit "if no dbus, spawn tty2-6" which we hit.
+# Pulled in by getty.target.wants/getty-static.service
+rm -f "$WORK/lib/systemd/system/getty.target.wants/getty-static.service" 2>/dev/null
+rm -f "$WORK/lib/systemd/system/getty-static.service" 2>/dev/null
+
+# systemd-modules-load.service — fails because we removed kmod. We have
+# no loadable modules (everything is =y in our kernel).
+rm -f "$WORK/lib/systemd/system/systemd-modules-load.service" 2>/dev/null
+rm -f "$WORK/lib/systemd/system/sysinit.target.wants/systemd-modules-load.service" 2>/dev/null
+
+# systemd-ask-password-wall.path — no passwords/FDE prompts. Drop.
+rm -f "$WORK/lib/systemd/system/systemd-ask-password-wall.path" 2>/dev/null
+rm -f "$WORK/lib/systemd/system/multi-user.target.wants/systemd-ask-password-wall.path" 2>/dev/null
+rm -f "$WORK/lib/systemd/system/systemd-ask-password-wall.service" 2>/dev/null
+
+# systemd-logind — session manager. Single root login on hvc0, no PAM
+# session needed. If this breaks login, restore.
+rm -f "$WORK/lib/systemd/system/systemd-logind.service" 2>/dev/null
+rm -f "$WORK/lib/systemd/system/multi-user.target.wants/systemd-logind.service" 2>/dev/null
+rm -f "$WORK/lib/systemd/system/dbus-org.freedesktop.login1.service" 2>/dev/null
 
 # ── Upload (single pass) ───────────────────────────────────────
 
