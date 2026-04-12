@@ -1,22 +1,24 @@
-// Virtio-fs device — bridges virtio MMIO transport to fuse-backend-rs.
+// Virtio-fs device — MMIO transport wrapper around the worker in
+// s3-rootfs::worker. Keeps only the setup/teardown ceremony here:
 //
-// Uses ioeventfd so the guest's QueueNotify writes go directly to the
-// worker thread without a vCPU exit. The worker owns the entire data path:
-//   ioeventfd kick → pop descriptors → S3 call → write response →
-//   add_used → atomic interrupt_status → irqfd → KVM delivers interrupt
+//   - virtio MMIO register plumbing (via VirtioMmioDevice)
+//   - ioeventfd registration so QueueNotify writes skip the vCPU exit
+//   - ownership of the Queue and kick EventFd until the worker starts
 //
-// The vCPU only handles MMIO for device setup. Zero exits on the data path.
+// Once the guest writes DRIVER_OK we hand all of that to the worker via
+// `FsSession` and the worker takes over the FUSE data path entirely.
+// See research/11-s3-rootfs-refactor-plan.md for the split.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread;
 
-use fuse_backend_rs::api::server::Server;
-use fuse_backend_rs::api::filesystem::FileSystem;
-use fuse_backend_rs::transport::{Reader, Writer, VirtioFsWriter};
 use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use virtio_queue::{Queue, QueueT};
-use vmm_sys_util::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
+use vmm_sys_util::eventfd::EventFd;
+
+use s3_rootfs::S3Fs;
+use virtio_fs_transport::{FsSession, serve};
 
 use crate::virtio_mmio::VirtioMmioDevice;
 
@@ -27,39 +29,27 @@ const NUM_QUEUES: usize = 2;
 
 const REQUEST_QUEUE: usize = 1;
 
-/// Holds the filesystem server until the worker starts.
-/// Box<dyn Any + Send> would work but we use a trait object to keep the type.
-trait FuseServer: Send + 'static {
-    fn handle(&self, reader: Reader<'static>, writer: Writer<'static>);
-}
-
-struct FuseServerImpl<F: FileSystem + Sync + Send + 'static> {
-    server: Server<F>,
-}
-
-impl<F: FileSystem + Sync + Send + 'static> FuseServer for FuseServerImpl<F> {
-    fn handle(&self, reader: Reader<'static>, writer: Writer<'static>) {
-        let _ = self.server.handle_message(reader, writer, None, None);
-    }
-}
-
+/// Virtio-fs MMIO device.
+///
+/// Owns the `Arc<S3Fs>` until `start_worker` hands it to the worker
+/// thread via `FsSession`. After handoff, the filesystem is shared
+/// between the worker (which services FUSE requests) and any future
+/// orchestrator reference (which can invalidate the cache, etc.).
 pub struct VirtioFs {
     pub mmio: VirtioMmioDevice,
     queue: Option<Queue>,
     tag: String,
     kick_fd: EventFd,
     mmio_base: u64,
-    server: Option<Box<dyn FuseServer>>,
+    /// Filesystem. Held in `Option` because `start_worker` consumes
+    /// this slot — once the worker owns its Arc, the device struct
+    /// no longer needs a reference.
+    fs: Option<Arc<S3Fs>>,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
 impl VirtioFs {
-    pub fn new<F: FileSystem + Sync + Send + 'static>(
-        fs: F,
-        tag: &str,
-        irq: u32,
-        mmio_base: u64,
-    ) -> Self {
+    pub fn new(fs: Arc<S3Fs>, tag: &str, irq: u32, mmio_base: u64) -> Self {
         let mmio = VirtioMmioDevice::new(
             VIRTIO_DEV_FS,
             VENDOR_ID,
@@ -69,6 +59,9 @@ impl VirtioFs {
             QUEUE_SIZE,
         );
 
+        // Blocking eventfd so the worker can park on `read()` with
+        // zero CPU while idle. KVM signals via ioeventfd on every
+        // QueueNotify write by the guest.
         let kick_fd = EventFd::new(0).expect("eventfd");
 
         Self {
@@ -77,11 +70,12 @@ impl VirtioFs {
             tag: tag.to_string(),
             kick_fd,
             mmio_base,
-            server: Some(Box::new(FuseServerImpl { server: Server::new(fs) })),
+            fs: Some(fs),
             _worker: None,
         }
     }
 
+    /// Config space: returns the virtio-fs mount tag (device-specific).
     pub fn config_read(&self, offset: u64) -> u32 {
         let tag_bytes = self.tag.as_bytes();
         match offset {
@@ -123,59 +117,43 @@ impl VirtioFs {
     }
 
     /// Register ioeventfd with KVM and spawn the worker thread.
-    /// After this call, the worker owns the queue and processes FUSE
-    /// requests entirely independently of the vCPU thread.
-    pub fn start_worker(&mut self, vm: &VmFd, memory: GuestMemoryMmap) {
-        // Only start once
-        if self._worker.is_some() || self.queue.is_none() { return; }
+    ///
+    /// After this call, the worker owns the queue, the filesystem
+    /// reference, and the kick/irqfd clones. The vCPU thread should
+    /// never touch the request queue or the FUSE server again —
+    /// everything on the data path runs in the worker.
+    pub fn start_worker(&mut self, vm: &VmFd, memory: Arc<GuestMemoryMmap>) {
+        // Only start once.
+        if self._worker.is_some() || self.queue.is_none() {
+            return;
+        }
 
-        // Register ioeventfd: QueueNotify at offset 0x050
+        // Register ioeventfd: QueueNotify is at offset 0x050 in the
+        // virtio MMIO spec. With this, guest writes to that register
+        // never exit the vCPU — KVM signals kick_fd directly.
         let notify_addr = self.mmio_base + 0x050;
-        vm.register_ioevent(&self.kick_fd, &IoEventAddress::Mmio(notify_addr), NoDatamatch)
-            .expect("register ioeventfd for virtio-fs");
+        vm.register_ioevent(
+            &self.kick_fd,
+            &IoEventAddress::Mmio(notify_addr),
+            NoDatamatch,
+        )
+        .expect("register ioeventfd for virtio-fs");
 
-        let mut queue = self.queue.take().unwrap();
-        let server = self.server.take().expect("server already taken");
-        let kick = self.kick_fd.try_clone().expect("clone kick_fd");
-        let irqfd = self.mmio.irqfd.try_clone().expect("clone irqfd");
-        let interrupt_status = &self.mmio.interrupt_status as *const AtomicU32 as usize;
+        // Build the session. Ownership transfers from the device to
+        // the worker thread: queue, kick_fd clone, irqfd clone, and
+        // the fs Arc all move across. The `interrupt_status` Arc is
+        // cloned (not moved) because the mmio device keeps one to
+        // serve InterruptStatus reads from the vCPU.
+        let session = FsSession {
+            fs: self.fs.take().expect("fs already taken"),
+            memory,
+            queue: self.queue.take().expect("queue already taken"),
+            kick_fd: self.kick_fd.try_clone().expect("clone kick_fd"),
+            irqfd: self.mmio.irqfd.try_clone().expect("clone irqfd"),
+            interrupt_status: self.mmio.interrupt_status.clone(),
+            thread_name: "vm-fuse".into(),
+        };
 
-        self._worker = Some(thread::Builder::new().name("vm-fuse".into()).spawn(move || {
-            loop {
-                // Block until guest writes to QueueNotify
-                kick.read().ok();
-
-                // Process all pending FUSE requests
-                let mut processed = false;
-                while let Some(desc_chain) = queue.pop_descriptor_chain(&memory) {
-                    let head_index = desc_chain.head_index();
-
-                    let reader = match Reader::from_descriptor_chain(&memory, desc_chain.clone()) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    let writer = match VirtioFsWriter::new(&memory, desc_chain) {
-                        Ok(w) => Writer::VirtioFs(w),
-                        Err(_) => continue,
-                    };
-
-                    // SAFETY: guest memory is Arc-wrapped, valid for VM lifetime
-                    let reader: Reader<'static> = unsafe { std::mem::transmute(reader) };
-                    let writer: Writer<'static> = unsafe { std::mem::transmute(writer) };
-
-                    server.handle(reader, writer);
-                    queue.add_used(&memory, head_index, 0).ok();
-                    processed = true;
-                }
-
-                if processed {
-                    unsafe {
-                        let status = &*(interrupt_status as *const AtomicU32);
-                        status.fetch_or(0x01, Ordering::Relaxed);
-                    }
-                    irqfd.write(1).ok();
-                }
-            }
-        }).unwrap());
+        self._worker = Some(serve(session));
     }
 }

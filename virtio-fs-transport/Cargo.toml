@@ -1,0 +1,14 @@
+[package]
+name = "virtio-fs-transport"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR BSD-3-Clause"
+description = "virtio-fs MMIO transport worker — kick-driven drain loop over a FUSE FileSystem"
+
+[dependencies]
+fuse-backend-rs = { version = "0.14", features = ["virtiofs"] }
+# Versions must match whatever the host VMM uses so Queue, GuestMemoryMmap,
+# and EventFd are the same types across the crate boundary.
+virtio-queue = "0.17"
+vm-memory = { version = "0.17", features = ["backend-mmap"] }
+vmm-sys-util = "0.15.0"

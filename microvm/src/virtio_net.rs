@@ -8,7 +8,7 @@
 // to deliver aggregated 60KB+ packets, giving us ~2.4 Gbps throughput.
 
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
@@ -148,7 +148,8 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
         };
 
         let irqfd = self.mmio.irqfd.try_clone().expect("clone irqfd");
-        let interrupt_status = &self.mmio.interrupt_status as *const AtomicU32 as usize;
+        // Clone the Arc for the worker; vCPU keeps its own reference.
+        let interrupt_status = self.mmio.interrupt_status.clone();
         let rx_fd = backend.rx_fd();
 
         self._rx_worker = Some(thread::Builder::new().name("vm-net-rx".into()).spawn(move || {
@@ -222,10 +223,9 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
                 }
 
                 if delivered > 0 {
-                    unsafe {
-                        let status = &*(interrupt_status as *const AtomicU32);
-                        status.fetch_or(0x01, Ordering::Relaxed);
-                    }
+                    // `Arc<AtomicU32>` derefs to `&AtomicU32` — no unsafe
+                    // pointer-to-usize dance needed anymore.
+                    interrupt_status.fetch_or(0x01, Ordering::Relaxed);
                     irqfd.write(1).ok();
                     idle = false; // stay in busy-drain mode
                 } else {

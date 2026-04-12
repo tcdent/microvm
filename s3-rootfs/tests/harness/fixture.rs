@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fuse_backend_rs::abi::fuse_abi::FsOptions;
 use fuse_backend_rs::api::filesystem::FileSystem;
 
+use s3_rootfs::config::FsConfig;
 use s3_rootfs::{S3Fs, S3Client, KeyMeta, encode_key};
 
 use super::s3::test_config;
@@ -27,7 +28,7 @@ impl TestFixture {
         let config = test_config();
         let verify_config = test_config();
 
-        let fs = S3Fs::new(config);
+        let fs = S3Fs::new(FsConfig { s3: config, ..Default::default() });
         fs.init(FsOptions::empty()).expect("S3Fs init failed");
 
         let client = S3Client::new(verify_config);

@@ -1,9 +1,23 @@
+//! microvm: a minimal KVM-based VMM for coding-agent workloads.
+//!
+//! The interesting code lives in `launcher.rs`. This file is just:
+//!   1. set process name / log hook
+//!   2. pull config from env (this binary's config source)
+//!   3. put stdin in raw mode (interactive virtio-console)
+//!   4. hand off to `launcher::run`
+//!   5. restore stdin on exit
+//!
+//! An orchestrator binary would replace steps 2+3 with its own config
+//! source (IPC, JSON, CLI flags) and terminal handling, and reuse
+//! `launcher::run` unchanged.
+
 #[macro_use]
 mod log;
 
 mod cpu;
 mod event_loop;
 mod kernel;
+mod launcher;
 mod memory;
 mod mptable;
 mod serial;
@@ -13,210 +27,81 @@ mod virtio_mmio;
 mod virtio_net;
 mod vm;
 
-use std::sync::Arc;
+use std::time::Duration;
 
-use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
-use vm_memory::GuestMemoryMmap;
-use xdp_net::{MacvtapBackend, NetBackend};
+use launcher::LaunchConfig;
+use s3_rootfs::config::FsConfig;
 
-use s3_rootfs::{S3Fs, S3Config};
+fn main() {
+    // Process name visible in top/htop/ps — otherwise this shows
+    // up as "target/release/microvm" which is unhelpful.
+    let name = std::ffi::CString::new("microvm").unwrap();
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()); }
 
-use event_loop::EventPoll;
-use serial::Serial;
-use virtio_console::VirtioConsole;
-use virtio_fs::VirtioFs;
-use virtio_net::VirtioNet;
+    log::init();
+    s3_rootfs::set_log_fn(|msg| crate::log::write(msg));
 
-// MMIO device addresses
-const VIRTIO_FS_BASE: u64 = 0xD000_0000;
-const VIRTIO_FS_IRQ: u32 = 5;
-const VIRTIO_NET_BASE: u64 = 0xD000_1000;
-const VIRTIO_NET_IRQ: u32 = 6;
-const VIRTIO_CONSOLE_BASE: u64 = 0xD000_2000;
-const VIRTIO_CONSOLE_IRQ: u32 = 7;
+    let cfg = config_from_env();
+    log!(
+        "Config: vm_id={} memory={}MB kernel={} initrd={} net={:?} s3={} read_ahead={}B cache_ttl={}s",
+        cfg.vm_id,
+        cfg.mem_mb,
+        cfg.kernel_path,
+        cfg.initrd_path,
+        cfg.net_ifname,
+        cfg.fs.s3.endpoint,
+        cfg.fs.read_ahead_size,
+        cfg.fs.cache_ttl.as_secs(),
+    );
 
-// Event tokens for epoll
-const EVENT_FUSE_COMPLETION: u64 = 1;
-const EVENT_NET_RX: u64 = 2;
+    let orig_term = setup_raw_terminal();
 
-struct System {
-    vm: Arc<VmFd>,
-    memory: GuestMemoryMmap,
-    vcpu: VcpuFd,
-    serial: Serial,
-    console: VirtioConsole,
-    virtiofs: VirtioFs,
-    virtionet: Option<VirtioNet<MacvtapBackend>>,
-    poll: EventPoll,
-}
-
-impl System {
-    fn new(kernel_path: &str, initrd_path: &str, net_ifname: Option<&str>, mem_mb: usize, s3_endpoint: &str, read_ahead_mb: usize, cache_ttl_secs: u64) -> Result<Self, Box<dyn std::error::Error>> {
-        let (kvm, vm) = vm::create_vm()?;
-        let vm = Arc::new(vm);
-        let memory = memory::setup_guest_memory(&vm, mem_mb)?;
-        mptable::write(&memory)?;
-        let vcpu = cpu::create_vcpu(&kvm, &vm, &memory)?;
-
-        let (kernel_entry, boot_params_addr) = kernel::load(&memory, kernel_path, initrd_path, mem_mb * 1024 * 1024)?;
-        cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
-
-        let serial = serial::create(&vm);
-
-        let console = VirtioConsole::stdio(VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_BASE);
-        vm.register_irqfd(console.mmio.irqfd_fd(), VIRTIO_CONSOLE_IRQ)?;
-
-        let mut s3_config = S3Config::default();
-        s3_config.endpoint = s3_endpoint.to_string();
-        let read_cache_max = 16 * 1024 * 1024; // 16MB — matches s3fs default
-        let cache_ttl = std::time::Duration::from_secs(cache_ttl_secs);
-        let s3fs = S3Fs::with_options(s3_config, read_cache_max, read_ahead_mb * 1024 * 1024, cache_ttl);
-        let virtiofs = VirtioFs::new(s3fs, "rootfs", VIRTIO_FS_IRQ, VIRTIO_FS_BASE);
-        vm.register_irqfd(virtiofs.mmio.irqfd_fd(), VIRTIO_FS_IRQ)?;
-
-        let virtionet = if let Some(ifname) = net_ifname {
-            log!("Creating virtio-net with interface {}", ifname);
-            let backend = MacvtapBackend::new(ifname)?;
-            let mac = [0x06, 0x00, 0xAC, 0x10, 0xFF, 0x01];
-            let net = VirtioNet::new(backend, mac, VIRTIO_NET_IRQ);
-            vm.register_irqfd(net.mmio.irqfd_fd(), VIRTIO_NET_IRQ)?;
-            Some(net)
-        } else {
-            None
-        };
-
-        let poll = EventPoll::new();
-
-        Ok(Self { vm, memory, vcpu, serial, console, virtiofs, virtionet, poll })
+    if let Err(e) = launcher::run(cfg) {
+        eprintln!("Error: {e}");
     }
 
-    fn run(&mut self) {
-        log!("=== microvm started ===");
-        // stdin goes to virtio-console (hvc0), not serial (ttyS0).
-        // Serial is output-only for boot messages.
-        loop {
-            match self.vcpu.run().expect("KVM_RUN failed") {
-                VcpuExit::IoOut(port, data) => {
-                    match port {
-                        0x3F8..=0x3FF => {
-                            let offset = port - 0x3F8;
-                            for &byte in data {
-                                self.serial.write(offset as u8, byte);
-                            }
-                        }
-                        0x64 if data.first() == Some(&0xFE) => {
-                            log!("Guest requested shutdown (i8042 reset)");
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                VcpuExit::IoIn(port, data) => {
-                    match port {
-                        0x3F8..=0x3FF => {
-                            let offset = port - 0x3F8;
-                            data[0] = self.serial.read(offset as u8);
-                        }
-                        _ => data.fill(0),
-                    }
-                }
-                VcpuExit::MmioRead(addr, data) => {
-                    let val = match addr {
-                        VIRTIO_FS_BASE..=0xD000_0FFF => {
-                            let offset = addr - VIRTIO_FS_BASE;
-                            self.virtiofs.mmio.read(offset, |off| self.virtiofs.config_read(off))
-                        }
-                        VIRTIO_NET_BASE..=0xD000_1FFF => {
-                            if let Some(ref net) = self.virtionet {
-                                let offset = addr - VIRTIO_NET_BASE;
-                                net.mmio.read(offset, |off| net.config_read(off))
-                            } else { 0 }
-                        }
-                        VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
-                            let offset = addr - VIRTIO_CONSOLE_BASE;
-                            self.console.mmio.read(offset, |off| self.console.config_read(off))
-                        }
-                        _ => { data.fill(0); continue; }
-                    };
-                    let bytes = val.to_le_bytes();
-                    let len = data.len().min(4);
-                    data[..len].copy_from_slice(&bytes[..len]);
-                }
-                VcpuExit::MmioWrite(addr, data) => {
-                    let val = u32::from_le_bytes(
-                        data[..4.min(data.len())].try_into().unwrap_or([0; 4])
-                    );
-                    match addr {
-                        VIRTIO_FS_BASE..=0xD000_0FFF => {
-                            let offset = addr - VIRTIO_FS_BASE;
-                            self.virtiofs.mmio.write(offset, val, |_, _| {});
-                            if offset == 0x044 && val == 1 {
-                                let qs = self.virtiofs.mmio.queue_sel();
-                                self.virtiofs.activate_queue(qs as usize);
-                                // Start worker when the request queue (1) is activated
-                                if qs == 1 {
-                                    self.virtiofs.start_worker(&self.vm, self.memory.clone());
-                                }
-                            }
-                            // QueueNotify (0x050) is handled by ioeventfd →
-                            // worker thread. No dispatch needed here.
-                        }
-                        VIRTIO_NET_BASE..=0xD000_1FFF => {
-                            if let Some(ref mut net) = self.virtionet {
-                                let offset = addr - VIRTIO_NET_BASE;
-                                let notify = net.mmio.write(offset, val, |_, _| {});
-                                if offset == 0x044 && val == 1 {
-                                    let qs = net.mmio.queue_sel();
-                                    net.activate_queue(qs as usize);
-                                }
-                                if offset == 0x070 && (val & 0x04) != 0 {
-                                    net.start_rx_worker(self.memory.clone());
-                                }
-                                if notify {
-                                    net.process_tx(&self.memory);
-                                    net.mmio.inject_irq();
-                                }
-                            }
-                        }
-                        VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
-                            let offset = addr - VIRTIO_CONSOLE_BASE;
-                            let notify = self.console.mmio.write(offset, val, |_, _| {});
-                            if offset == 0x044 && val == 1 {
-                                let qs = self.console.mmio.queue_sel();
-                                self.console.activate_queue(qs as usize);
-                            }
-                            // Start RX worker on DRIVER_OK
-                            if offset == 0x070 && (val & 0x04) != 0 {
-                                self.console.start_rx_worker(self.memory.clone());
-                            }
-                            if notify {
-                                self.console.process_tx(&self.memory);
-                                self.console.mmio.inject_irq();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                VcpuExit::Hlt => {}
-                VcpuExit::Shutdown => {
-                    log!("Guest shutdown");
-                    break;
-                }
-                VcpuExit::InternalError => {
-                    log!("KVM internal error");
-                    break;
-                }
-                exit => {
-                    log!("Unhandled exit: {:?}", exit);
-                    break;
-                }
-            }
-
-            // RX is handled by the worker thread via irqfd.
-            // TX completions are signaled inline above.
-        }
+    if let Some(ref orig) = orig_term {
+        restore_terminal(orig);
     }
 }
+
+// ── Config: env vars → LaunchConfig ────────────────────────────────────
+//
+// Lives in `main.rs` rather than `launcher.rs` because env-var parsing
+// is *this binary's* config source. An orchestrator binary wouldn't
+// use env vars at all; it'd build LaunchConfig from IPC/JSON/CLI.
+// Keeping the env translation here keeps the library source-agnostic.
+
+fn config_from_env() -> LaunchConfig {
+    let mut fs = FsConfig::default();
+    fs.s3.endpoint = env_or("VM_S3_ENDPOINT", "http://192.168.88.15:9090");
+    fs.read_ahead_size = env_or("VM_READ_AHEAD", "16")
+        .parse::<usize>()
+        .unwrap_or(16)
+        * 1024
+        * 1024;
+    fs.cache_ttl = Duration::from_secs(env_or("VM_CACHE_TTL", "300").parse().unwrap_or(300));
+
+    LaunchConfig {
+        kernel_path: env_or("VM_KERNEL", "dist/vmlinux"),
+        initrd_path: env_or("VM_INITRD", "dist/initramfs.cpio.gz"),
+        net_ifname: std::env::var("VM_NET").ok(),
+        mem_mb: env_or("VM_MEMORY", "1024").parse().unwrap_or(1024),
+        vm_id: env_or("VM_ID", "default"),
+        fs,
+    }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+// ── Terminal handling ──────────────────────────────────────────────────
+//
+// Lives here rather than in launcher.rs because it's a `main`-binary
+// concern: only the interactive `microvm` process touches stdin as a
+// TTY. An orchestrator binary wouldn't run these — it has its own
+// stdio handling.
 
 fn setup_raw_terminal() -> Option<libc::termios> {
     unsafe {
@@ -234,40 +119,5 @@ fn setup_raw_terminal() -> Option<libc::termios> {
 fn restore_terminal(orig: &libc::termios) {
     unsafe {
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
-    }
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn main() {
-    // Set process name so it shows as "microvm" in top/btop/ps
-    let name = std::ffi::CString::new("microvm").unwrap();
-    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()); }
-
-    log::init();
-    s3_rootfs::set_log_fn(|msg| crate::log::write(msg));
-
-    let kernel_path = env_or("VM_KERNEL", "dist/vmlinux");
-    let initrd_path = env_or("VM_INITRD", "dist/initramfs.cpio.gz");
-    let net_ifname = std::env::var("VM_NET").ok();
-    let mem_mb: usize = env_or("VM_MEMORY", "1024").parse().unwrap_or(1024);
-    let s3_endpoint = env_or("VM_S3_ENDPOINT", "http://192.168.88.15:9090");
-    let read_ahead_mb: usize = env_or("VM_READ_AHEAD", "16").parse().unwrap_or(16);
-    let cache_ttl_secs: u64 = env_or("VM_CACHE_TTL", "300").parse().unwrap_or(300);
-
-    log!("Config: memory={}MB kernel={} initrd={} net={:?} s3={} read_ahead={}MB cache_ttl={}s",
-        mem_mb, kernel_path, initrd_path, net_ifname, s3_endpoint, read_ahead_mb, cache_ttl_secs);
-
-    let orig_term = setup_raw_terminal();
-
-    match System::new(&kernel_path, &initrd_path, net_ifname.as_deref(), mem_mb, &s3_endpoint, read_ahead_mb, cache_ttl_secs) {
-        Ok(mut system) => system.run(),
-        Err(e) => eprintln!("Error: {e}"),
-    }
-
-    if let Some(ref orig) = orig_term {
-        restore_terminal(orig);
     }
 }

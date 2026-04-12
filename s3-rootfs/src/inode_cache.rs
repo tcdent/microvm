@@ -5,7 +5,7 @@
 // HashMap; the trait interface allows swapping in LRU, TTL-based,
 // or shared-memory implementations later.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::keys::KeyMeta;

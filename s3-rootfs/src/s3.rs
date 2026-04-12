@@ -12,6 +12,7 @@ use percent_encoding::percent_decode_str;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 
 /// Configuration for the S3 client.
+#[derive(Debug, Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,

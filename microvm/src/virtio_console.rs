@@ -15,7 +15,7 @@
 //     Processed inline on vCPU thread (fast — just a write syscall).
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 
 use virtio_queue::{Queue, QueueT};
@@ -153,7 +153,10 @@ impl VirtioConsole {
         };
 
         let irqfd = self.mmio.irqfd.try_clone().expect("clone irqfd");
-        let interrupt_status = &self.mmio.interrupt_status as *const AtomicU32 as usize;
+        // Clone the Arc to give the worker its own reference; the MMIO
+        // device keeps its original so the vCPU thread can still read/
+        // write the InterruptStatus register.
+        let interrupt_status = self.mmio.interrupt_status.clone();
 
         self._rx_worker = Some(thread::spawn(move || {
             let mut rx_queue = rx_queue;
@@ -205,11 +208,9 @@ impl VirtioConsole {
                     rx_queue.add_used(&memory, head, chunk_written as u32).ok();
                     written += chunk_written;
 
-                    // Interrupt after each descriptor to keep latency low
-                    unsafe {
-                        let status = &*(interrupt_status as *const AtomicU32);
-                        status.fetch_or(0x01, Ordering::Relaxed);
-                    }
+                    // Interrupt after each descriptor to keep latency low.
+                    // `Arc<AtomicU32>` derefs to `&AtomicU32` — no unsafe needed.
+                    interrupt_status.fetch_or(0x01, Ordering::Relaxed);
                     irqfd.write(1).ok();
                 }
             }

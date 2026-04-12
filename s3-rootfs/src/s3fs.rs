@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -19,12 +18,12 @@ use crate::debug;
 use fuse_backend_rs::abi::fuse_abi::{stat64, statvfs64, FsOptions, OpenOptions};
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem};
 
-use crate::cache::{CachedInode, InodeCache};
+use crate::config::FsConfig;
+use crate::inode_cache::{CachedInode, InodeCache};
 use crate::keys::{self, KeyMeta};
-use crate::s3::{S3Client, S3Config};
+use crate::s3::S3Client;
+use crate::storage::{self, ObjectBody};
 use crate::log;
-
-const ROOT_INODE: u64 = 1;
 
 /// Cache statistics for observability and testing.
 pub struct CacheStats {
@@ -38,33 +37,15 @@ const TTL: Duration = Duration::from_secs(1);
 /// Number of S3 keys to fetch per lookup LIST probe.
 /// Includes the target entry + neighbors for cache pre-fill.
 pub const LIST_PROBE_MAX_KEYS: u32 = 12;
-/// Default max file size for whole-file read caching.
-/// Files at or below this size are fetched in a single GET and cached
-/// in the handle for subsequent reads. Larger files use range GETs.
-/// 16MB covers nearly all source code, configs, and build artifacts.
-const DEFAULT_READ_CACHE_MAX: u64 = 16 * 1024 * 1024;
 /// Maximum write buffer per file handle (512MB).
 const WRITE_BUFFER_MAX: usize = 512 * 1024 * 1024;
-/// Read-ahead chunk size for large file reads.
-/// Files larger than read_cache_max use this for sequential read-ahead.
-/// Default read-ahead chunk size for large file sequential reads.
-/// Benchmarked: 4MB=123MB/s, 16MB=176MB/s, 64MB=172MB/s, 128MB=243MB/s.
-const DEFAULT_READ_AHEAD: usize = 16 * 1024 * 1024; // 16MB
-/// Hidden directory for hardlink data objects.
-const HARDLINK_PREFIX: &str = ".hardlinks/";
-/// Body prefix for hardlink references.
-const HARDLINK_REF_PREFIX: &str = "hardlink:";
+// Default read cache / read-ahead sizes live in `FsConfig::default` —
+// 16MB / 16MB. Benchmarks (research/07): 4MB=123MB/s, 16MB=176MB/s,
+// 64MB=172MB/s, 128MB=243MB/s — 16MB is the knee.
+//
+// Hardlink key/body helpers and the UUID generator live in
+// `crate::storage`. This file just calls them.
 
-static HARDLINK_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-fn generate_hardlink_uuid() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let seq = HARDLINK_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}{:016x}", ts, seq)
-}
 /// Reported filesystem size (1TB). S3 is effectively unlimited;
 /// this just needs to be large enough that tools like apt don't
 /// refuse to write.
@@ -126,21 +107,19 @@ impl HandleTable {
 }
 
 impl S3Fs {
-    pub fn new(config: S3Config) -> Self {
-        Self::with_options(config, DEFAULT_READ_CACHE_MAX, DEFAULT_READ_AHEAD, crate::cache::DEFAULT_CACHE_TTL)
-    }
-
-    pub fn with_read_cache(config: S3Config, read_cache_max: u64) -> Self {
-        Self::with_options(config, read_cache_max, DEFAULT_READ_AHEAD, crate::cache::DEFAULT_CACHE_TTL)
-    }
-
-    pub fn with_options(config: S3Config, read_cache_max: u64, read_ahead_size: usize, cache_ttl: Duration) -> Self {
+    /// Construct from an [`FsConfig`].
+    ///
+    /// This is the only constructor. Callers who want defaults use
+    /// `S3Fs::new(FsConfig::default())`; callers who want to tweak a
+    /// single knob use struct-update syntax, e.g.
+    /// `S3Fs::new(FsConfig { read_cache_max: 8 * MB, ..Default::default() })`.
+    pub fn new(cfg: FsConfig) -> Self {
         S3Fs {
-            client: S3Client::new(config),
-            cache: Mutex::new(InodeCache::with_ttl(cache_ttl)),
+            client: S3Client::new(cfg.s3),
+            cache: Mutex::new(InodeCache::with_ttl(cfg.cache_ttl)),
             handles: Mutex::new(HandleTable::new()),
-            read_cache_max,
-            read_ahead_size,
+            read_cache_max: cfg.read_cache_max,
+            read_ahead_size: cfg.read_ahead_size,
         }
     }
 
@@ -181,24 +160,6 @@ impl S3Fs {
         }
     }
 
-    /// Build the S3 key for a hardlink data object.
-    fn hardlink_data_key(uuid: &str, meta: KeyMeta) -> String {
-        let path = format!("{}{}", HARDLINK_PREFIX, uuid);
-        keys::encode(&path, meta)
-    }
-
-    /// Resolve the S3 data key for an inode — follows hardlink redirects.
-    /// Returns the key to use for GET/PUT of actual file data.
-    fn data_key_for(&self, path: &str, meta: KeyMeta) -> String {
-        let cache = self.cache.lock().unwrap();
-        if let Some(entry) = cache.get_by_path(path) {
-            if let Some(ref uuid) = entry.hardlink_target {
-                return Self::hardlink_data_key(uuid, meta);
-            }
-        }
-        keys::encode(path, meta)
-    }
-
     /// Resolve path from parent inode + child name
     fn child_path(&self, parent: u64, name: &str) -> io::Result<String> {
         let cache = self.cache.lock().unwrap();
@@ -209,11 +170,6 @@ impl S3Fs {
         } else {
             Ok(format!("{}/{}", parent_path, name))
         }
-    }
-
-    /// S3 key for a cached inode (path + encoded metadata)
-    fn s3_key_for(&self, path: &str, meta: KeyMeta) -> String {
-        keys::encode(path, meta)
     }
 
     /// Lookup a path via LIST probe, populate cache with results.
@@ -460,7 +416,15 @@ impl FileSystem for S3Fs {
                 io::Error::from_raw_os_error(libc::EIO)
             })?;
 
-        let target = String::from_utf8_lossy(&data).to_string();
+        // By symlink convention the body IS the target path — parse_body
+        // with S_IFLNK encodes that rule in one place. Pattern-matches
+        // only Symlink because our file_type is S_IFLNK; the other
+        // variants aren't reachable here but we handle them defensively
+        // so future changes to parse_body can't silently break us.
+        let target = match storage::parse_body(data, libc::S_IFLNK as u32) {
+            ObjectBody::Symlink(t) => t,
+            _ => return Err(io::Error::from_raw_os_error(libc::EIO)),
+        };
 
         // Cache it
         {
@@ -509,33 +473,52 @@ impl FileSystem for S3Fs {
 
         // Resolve data key — follows hardlink redirect if present
         let key = match hl_uuid {
-            Some(ref uuid) => Self::hardlink_data_key(uuid, meta),
+            Some(ref uuid) => storage::hardlink_key(uuid, meta),
             None => keys::encode(&path, meta),
         };
 
         // For files within the read cache limit, fetch whole and cache in handle
         if self.read_cache_max > 0 && file_size <= self.read_cache_max {
             log!("S3 GET read-cache {} ({} bytes, full file)", path, file_size);
-            let mut data = self.client.get(&key)
+            let raw = self.client.get(&key)
                 .map_err(|e| {
                     log!("S3Fs: read error for {}: {}", path, e);
                     io::Error::from_raw_os_error(libc::EIO)
                 })?;
 
-            // Detect hardlink reference on first read (if not already resolved)
-            if hl_uuid.is_none() {
-                if let Ok(body) = std::str::from_utf8(&data) {
-                    if let Some(uuid) = body.strip_prefix(HARDLINK_REF_PREFIX) {
-                        let uuid = uuid.trim().to_string();
+            // If we already knew this was a hardlink, `key` pointed at the
+            // real data and `raw` IS the file content — no body parsing
+            // needed. If this was a cold read via the visible path, the
+            // body might be a hardlink ref; parse it to find out.
+            let data = if hl_uuid.is_some() {
+                raw
+            } else {
+                match storage::parse_body(raw, libc::S_IFREG as u32) {
+                    ObjectBody::Direct(bytes) => bytes,
+                    ObjectBody::Hardlink(uuid) => {
+                        // First-time hardlink detection: re-fetch from the
+                        // real data object and record the UUID so subsequent
+                        // reads skip this double-hop.
                         log!("  detected hardlink ref: {} -> .hardlinks/{}", path, uuid);
-                        let hl_key = Self::hardlink_data_key(&uuid, meta);
-                        data = self.client.get(&hl_key)
+                        let hl_key = storage::hardlink_key(&uuid, meta);
+                        let actual = self.client.get(&hl_key)
                             .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
                         let mut cache = self.cache.lock().unwrap();
                         cache.set_hardlink_target(&path, uuid);
+                        actual
+                    }
+                    // parse_body only returns Symlink when file_type=S_IFLNK;
+                    // we pass S_IFREG here so this branch is unreachable.
+                    ObjectBody::Symlink(_) => unreachable!("parse_body(_, S_IFREG) returned Symlink"),
+                    // GoldenRef bodies aren't produced by any code path
+                    // today — reserved for research/10. Treat as data
+                    // unavailable if one ever turns up in the wild.
+                    ObjectBody::GoldenRef(_) => {
+                        log!("S3Fs: unexpected GoldenRef body at {} (feature not wired up)", path);
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
                     }
                 }
-            }
+            };
 
             let start = (offset as usize).min(data.len());
             let end = (offset as usize + size as usize).min(data.len());
@@ -619,7 +602,7 @@ impl FileSystem for S3Fs {
 
             if !path.is_empty() {
                 let key = match hl_uuid {
-                    Some(ref uuid) => Self::hardlink_data_key(uuid, meta),
+                    Some(ref uuid) => storage::hardlink_key(uuid, meta),
                     None => keys::encode(&path, meta),
                 };
                 log!("S3 GET open-preload {}", path);
@@ -741,7 +724,7 @@ impl FileSystem for S3Fs {
                         let key = match hl_uuid {
                             Some(ref uuid) => {
                                 log!("S3 PUT release hardlink {} -> .hardlinks/{} ({} bytes)", path, uuid, data.len());
-                                Self::hardlink_data_key(uuid, meta)
+                                storage::hardlink_key(uuid, meta)
                             }
                             None => {
                                 log!("S3 PUT release {} ({} bytes)", path, data.len());
@@ -1059,9 +1042,9 @@ impl FileSystem for S3Fs {
             uuid.clone()
         } else {
             // First hardlink — move data to .hardlinks/<uuid>
-            let uuid = generate_hardlink_uuid();
+            let uuid = storage::new_hardlink_uuid();
             let old_key = keys::encode(&old_path, meta);
-            let hl_key = Self::hardlink_data_key(&uuid, meta);
+            let hl_key = storage::hardlink_key(&uuid, meta);
 
             log!("S3 hardlink: moving data {} -> .hardlinks/{}", old_path, uuid);
             self.client.copy(&old_key, &hl_key)
@@ -1071,8 +1054,7 @@ impl FileSystem for S3Fs {
                 })?;
 
             // Overwrite old path with reference
-            let ref_body = format!("{}{}", HARDLINK_REF_PREFIX, uuid);
-            self.client.put(&old_key, ref_body.as_bytes())
+            self.client.put(&old_key, &storage::encode_hardlink_ref(&uuid))
                 .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
 
             // Update cache for old path
@@ -1085,10 +1067,9 @@ impl FileSystem for S3Fs {
 
         // Create new path as reference
         let new_key = keys::encode(&new_path, meta);
-        let ref_body = format!("{}{}", HARDLINK_REF_PREFIX, uuid);
 
         log!("S3 PUT hardlink ref {} -> .hardlinks/{}", new_path, uuid);
-        self.client.put(&new_key, ref_body.as_bytes())
+        self.client.put(&new_key, &storage::encode_hardlink_ref(&uuid))
             .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
 
         // Cache new path with hardlink UUID

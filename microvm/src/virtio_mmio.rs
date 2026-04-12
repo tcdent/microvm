@@ -2,6 +2,7 @@
 // Implements the virtio-mmio register interface (spec v2) and virtqueue management.
 
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use vmm_sys_util::eventfd::EventFd;
@@ -32,7 +33,13 @@ pub struct VirtioMmioDevice {
     device_features_sel: u32,
     driver_features: u64,
     driver_features_sel: u32,
-    pub interrupt_status: AtomicU32,
+    /// Pending-interrupt bit visible to the guest via the
+    /// InterruptStatus MMIO register (offset 0x060). Shared with
+    /// worker threads (virtio-fs, virtio-net, virtio-console) so
+    /// they can set the bit from their own threads before firing
+    /// irqfd. `Arc<AtomicU32>` replaces the older pattern of
+    /// casting `&AtomicU32` to `usize` to cross thread boundaries.
+    pub interrupt_status: Arc<AtomicU32>,
 
     // Queue configuration (indexed by queue_sel)
     queue_sel: u32,
@@ -76,7 +83,7 @@ impl VirtioMmioDevice {
             device_features_sel: 0,
             driver_features: 0,
             driver_features_sel: 0,
-            interrupt_status: AtomicU32::new(0),
+            interrupt_status: Arc::new(AtomicU32::new(0)),
             queue_sel: 0,
             queues,
         }
