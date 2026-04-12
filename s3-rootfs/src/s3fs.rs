@@ -640,9 +640,54 @@ impl FileSystem for S3Fs {
                     None => keys::encode(&path, meta),
                 };
                 log!("S3 GET open-preload {}", path);
-                if let Ok(data) = self.client.get(&key) {
-                    if let Some(entry) = handles.get_mut(handle) {
-                        entry.data = Some(data);
+                if let Ok(raw) = self.client.get(&key) {
+                    // If we already had hl_uuid in cache, `key` targeted
+                    // the real data object and `raw` is the file content.
+                    // If not, `raw` might be a hardlink ref body — parse
+                    // to find out, mirroring the cold-path detection in
+                    // read(). Without this, release() would write the
+                    // corrupted-ref buffer back to the visible key and
+                    // detach it from the shared data; see
+                    // tests/test_correctness.rs::hardlink_write_through_append.
+                    let data = if hl_uuid.is_some() {
+                        Some(raw)
+                    } else {
+                        match storage::parse_body(raw, libc::S_IFREG as u32) {
+                            ObjectBody::Direct(bytes) => Some(bytes),
+                            ObjectBody::Hardlink(uuid) => {
+                                log!("  open-preload detected hardlink ref: {} -> .hardlinks/{}", path, uuid);
+                                // Record the hint so subsequent ops (this
+                                // release, future reads) route through
+                                // the hardlink_key() path directly.
+                                self.cache.lock().unwrap()
+                                    .set_hardlink_target(&path, uuid.clone());
+                                // Re-fetch the actual data from the shared
+                                // blob. If this fails we leave the handle
+                                // buffer unset — same behavior as the
+                                // outer `if let Ok(raw)` miss: writes
+                                // still work, just without a preload.
+                                let hl_key = storage::hardlink_key(&uuid, meta);
+                                self.client.get(&hl_key).ok()
+                            }
+                            // Symlinks aren't opened for write; parse_body
+                            // only returns Symlink when file_type=S_IFLNK.
+                            ObjectBody::Symlink(_) => {
+                                log!("S3Fs: open-preload unexpected Symlink body at {}", path);
+                                None
+                            }
+                            // GoldenRef isn't wired up anywhere — log and
+                            // skip preload rather than corrupt anything.
+                            ObjectBody::GoldenRef(_) => {
+                                log!("S3Fs: open-preload unexpected GoldenRef body at {}", path);
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(data) = data {
+                        if let Some(entry) = handles.get_mut(handle) {
+                            entry.data = Some(data);
+                        }
                     }
                 }
             }

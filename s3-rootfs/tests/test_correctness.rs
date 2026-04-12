@@ -56,7 +56,6 @@ fn read_via_fuse(fix: &TestFixture, parent_ino: u64, name: &str) -> Vec<u8> {
 /// After the fix, both names must read back the appended content from
 /// a fresh reader.
 #[test]
-#[ignore = "bug: cold open of a hardlinked file corrupts the ref on release — fix pending"]
 fn hardlink_write_through_append() {
     require_s3!();
     let fix = TestFixture::new();
