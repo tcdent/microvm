@@ -60,11 +60,30 @@ impl Default for S3Config {
 }
 
 /// S3 client for filesystem operations.
+///
+/// Each client has a **primary bucket** — the bucket every unqualified
+/// method (`get`, `put`, `list`, …) talks to. That's the bucket the
+/// per-VM `S3Fs` cares about, and keeping it implicit at those call
+/// sites keeps the FUSE path legible.
+///
+/// Bucket-override variants (`get_from`, `put_to`, …) take an
+/// explicit bucket name and are used where multi-bucket awareness
+/// matters (golden loader). Credentials, endpoint, region, and the
+/// `ureq::Agent` are global to the client — per-bucket credentials
+/// aren't supported, by design (one fleet identity).
 pub struct S3Client {
     bucket: Bucket,
     credentials: Credentials,
     agent: ureq::Agent,
     sign_duration: Duration,
+    /// Endpoint URL (unparsed). Stashed so bucket-override methods
+    /// can rebuild a `Bucket` on demand. Re-parsed per override call;
+    /// override methods aren't on any hot path (golden loader runs
+    /// once at orchestrator init), so avoiding a `url` crate dep
+    /// outweighs saving microseconds.
+    endpoint: String,
+    /// Region string. Same rationale as `endpoint`.
+    region: String,
 }
 
 impl S3Client {
@@ -74,8 +93,10 @@ impl S3Client {
         // `with_shared_agent(config, Arc::new(build_agent(&config)))`
         // but without forcing callers to thread Arcs they don't need.
         let agent = Self::build_agent(&config);
+        let endpoint = config.endpoint.clone();
+        let region = config.region.clone();
         let (bucket, credentials, sign_duration) = Self::split_config(config);
-        Self { bucket, credentials, agent, sign_duration }
+        Self { bucket, credentials, agent, sign_duration, endpoint, region }
     }
 
     /// Construct an `S3Client` that shares an externally-owned `ureq::Agent`
@@ -98,8 +119,10 @@ impl S3Client {
         // is internally Arc-based for its pool, so `clone()` is a
         // reference-count bump, not a pool copy.
         let agent = (*agent).clone();
+        let endpoint = config.endpoint.clone();
+        let region = config.region.clone();
         let (bucket, credentials, sign_duration) = Self::split_config(config);
-        Self { bucket, credentials, agent, sign_duration }
+        Self { bucket, credentials, agent, sign_duration, endpoint, region }
     }
 
     /// Build a new `ureq::Agent` sized by this config's pool tuning.
@@ -118,6 +141,18 @@ impl S3Client {
         )
     }
 
+    /// Rebuild a `Bucket` for an arbitrary bucket name, reusing this
+    /// client's endpoint + region. Used by bucket-override methods;
+    /// cheap enough (one URL parse + a few String allocations) to
+    /// construct transiently per call since those calls aren't on any
+    /// hot path. Caller is expected to have already verified the name
+    /// is a valid S3 bucket identifier.
+    fn bucket_for(&self, name: &str) -> Bucket {
+        let endpoint = self.endpoint.parse().expect("invalid S3 endpoint URL");
+        Bucket::new(endpoint, UrlStyle::Path, name.to_string(), self.region.clone())
+            .expect("invalid bucket config")
+    }
+
     /// Helper: split `S3Config` into the per-client state (bucket,
     /// credentials, sign duration). Shared between both constructors
     /// so we can't drift on which fields become client state vs which
@@ -131,7 +166,23 @@ impl S3Client {
     }
 
     pub fn get(&self, key: &str) -> Result<Vec<u8>, S3Error> {
-        let url = self.bucket
+        self.get_with_bucket(&self.bucket, key)
+    }
+
+    /// Bucket-override variant of [`get`]: GET `key` from the named
+    /// bucket rather than this client's primary bucket. Used by the
+    /// golden loader (one client, primary bucket = per-VM bucket,
+    /// golden reads go through here). Credentials, endpoint, region,
+    /// and the connection pool all come from this client — only the
+    /// bucket name changes.
+    pub fn get_from(&self, bucket: &str, key: &str) -> Result<Vec<u8>, S3Error> {
+        self.get_with_bucket(&self.bucket_for(bucket), key)
+    }
+
+    /// Shared body of `get` and `get_from`. Takes a `&Bucket` so the
+    /// two public entrypoints can differ only in how they source it.
+    fn get_with_bucket(&self, bucket: &Bucket, key: &str) -> Result<Vec<u8>, S3Error> {
+        let url = bucket
             .get_object(Some(&self.credentials), key)
             .sign(self.sign_duration);
 

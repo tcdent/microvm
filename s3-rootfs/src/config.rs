@@ -17,7 +17,45 @@
 //! path — the older `with_options` / `with_read_cache` helpers are
 //! gone.
 
+use std::path::PathBuf;
+
 use crate::S3Config;
+
+/// Configuration for the golden filesystem layer (research/12).
+///
+/// Opt-in: the only supported construction is explicit — there's no
+/// `Default` impl, because enabling the golden layer is a deliberate
+/// infrastructure decision, not a sensible silent default. An `S3Fs`
+/// with `golden = None` behaves exactly as it does today: single per-VM
+/// bucket, no shared caches.
+///
+/// Credentials are deliberately **not** a field here. Fleet identity
+/// is one set of credentials per orchestrator, shared across every
+/// bucket it touches (per-VM and golden). Per-bucket credentials are
+/// out of scope — the `S3Client` bucket-override methods (`get_from`)
+/// reuse the caller's global credentials.
+#[derive(Debug, Clone)]
+pub struct GoldenConfig {
+    /// Name of the golden bucket on the same S3 endpoint as the per-VM
+    /// bucket. Separate namespace: content-addressed blobs plus a
+    /// `.manifest` describing the filesystem shape.
+    pub bucket: String,
+
+    /// Where to find the manifest describing the golden rootfs.
+    pub manifest: ManifestSource,
+}
+
+/// Where `GoldenConfig::manifest` can live. `S3Key` is the production
+/// shape (orchestrator reads the manifest from the same bucket it
+/// GETs blobs from); `LocalPath` exists so dev/test/offline scenarios
+/// can work without a running S3 endpoint.
+#[derive(Debug, Clone)]
+pub enum ManifestSource {
+    /// Object key within the golden bucket. Convention: `.manifest`.
+    S3Key(String),
+    /// Absolute or workspace-relative path on the host filesystem.
+    LocalPath(PathBuf),
+}
 
 /// All the knobs for building an `S3Fs`.
 ///

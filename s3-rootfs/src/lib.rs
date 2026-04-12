@@ -23,6 +23,11 @@ mod s3;
 mod s3fs;
 pub mod storage;
 
+pub use blob_cache::{
+    GoldenBlobCache, GoldenEntry, GoldenInodeCache, GoldenManifest, GoldenManifestEntry,
+    GOLDEN_SCHEMA_VERSION, load_golden,
+};
+pub use config::{GoldenConfig, ManifestSource};
 pub use inode_cache::{CachedInode, InodeCache};
 pub use keys::{KeyMeta, encode as encode_key, decode as decode_key, list_prefix};
 pub use s3::{S3Client, S3Config, S3Error, ListResult, ListObject};
