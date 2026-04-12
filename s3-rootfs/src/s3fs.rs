@@ -116,7 +116,7 @@ impl S3Fs {
     pub fn new(cfg: FsConfig) -> Self {
         S3Fs {
             client: S3Client::new(cfg.s3),
-            cache: Mutex::new(InodeCache::with_ttl(cfg.cache_ttl)),
+            cache: Mutex::new(InodeCache::new()),
             handles: Mutex::new(HandleTable::new()),
             read_cache_max: cfg.read_cache_max,
             read_ahead_size: cfg.read_ahead_size,

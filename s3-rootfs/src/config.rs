@@ -2,8 +2,8 @@
 //!
 //! `FsConfig` bundles the tunables a caller might want to set when
 //! constructing an `S3Fs`: where to find S3, how much to cache, how
-//! far to read ahead, how long to hold cache entries before reaping.
-//! Default values are documented alongside each field.
+//! far to read ahead. Default values are documented alongside each
+//! field.
 //!
 //! The struct is plain — no builder, no setters. Construct with
 //! `FsConfig { endpoint: ..., ..Default::default() }` which reads
@@ -17,8 +17,6 @@
 //! path — the older `with_options` / `with_read_cache` helpers are
 //! gone.
 
-use std::time::Duration;
-
 use crate::S3Config;
 
 /// All the knobs for building an `S3Fs`.
@@ -28,9 +26,12 @@ use crate::S3Config;
 ///   and package manifests in one GET each.
 /// - 16 MB read-ahead keeps large sequential reads saturated with
 ///   one in-flight request at a time.
-/// - 5 min cache TTL reaps entries nobody's accessed; the cache is
-///   always correct (single-writer) so this is memory management,
-///   not consistency.
+///
+/// The inode cache has no TTL. S3Fs is the single writer to its
+/// bucket, so cached entries are authoritative by construction; there
+/// is no external writer whose changes we could miss. The memory
+/// footprint (a few MB over a VM's lifetime) is well under any
+/// threshold where reaping would pay for itself.
 #[derive(Debug, Clone)]
 pub struct FsConfig {
     /// S3 endpoint, bucket, credentials, timeouts.
@@ -47,12 +48,6 @@ pub struct FsConfig {
     /// subsequent reads within the window hit memory.
     pub read_ahead_size: usize,
 
-    /// How long an inode cache entry stays resident before becoming
-    /// eligible for reap. The cache is always consistent with S3
-    /// (single-writer), so this is purely memory reclamation — not
-    /// a correctness/staleness control.
-    pub cache_ttl: Duration,
-
     /// Blob-cache (content-addressed, future) configuration. Empty
     /// by default since the feature isn't wired up yet.
     pub blob_cache: BlobCacheConfig,
@@ -64,7 +59,6 @@ impl Default for FsConfig {
             s3: S3Config::default(),
             read_cache_max: 16 * 1024 * 1024,
             read_ahead_size: 16 * 1024 * 1024,
-            cache_ttl: Duration::from_secs(300),
             blob_cache: BlobCacheConfig::default(),
         }
     }
@@ -97,7 +91,6 @@ mod tests {
         let cfg = FsConfig::default();
         assert!(cfg.read_cache_max > 0);
         assert!(cfg.read_ahead_size > 0);
-        assert!(cfg.cache_ttl.as_secs() >= 60);
         assert!(cfg.blob_cache.cache_dir.is_none());
     }
 

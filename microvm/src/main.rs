@@ -27,8 +27,6 @@ mod virtio_mmio;
 mod virtio_net;
 mod vm;
 
-use std::time::Duration;
-
 use launcher::LaunchConfig;
 use s3_rootfs::config::FsConfig;
 
@@ -43,7 +41,7 @@ fn main() {
 
     let cfg = config_from_env();
     log!(
-        "Config: vm_id={} memory={}MB kernel={} initrd={} net={:?} s3={} read_ahead={}B cache_ttl={}s",
+        "Config: vm_id={} memory={}MB kernel={} initrd={} net={:?} s3={} read_ahead={}B",
         cfg.vm_id,
         cfg.mem_mb,
         cfg.kernel_path,
@@ -51,7 +49,6 @@ fn main() {
         cfg.net_ifname,
         cfg.fs.s3.endpoint,
         cfg.fs.read_ahead_size,
-        cfg.fs.cache_ttl.as_secs(),
     );
 
     let orig_term = setup_raw_terminal();
@@ -80,7 +77,6 @@ fn config_from_env() -> LaunchConfig {
         .unwrap_or(16)
         * 1024
         * 1024;
-    fs.cache_ttl = Duration::from_secs(env_or("VM_CACHE_TTL", "300").parse().unwrap_or(300));
 
     LaunchConfig {
         kernel_path: env_or("VM_KERNEL", "dist/vmlinux"),
