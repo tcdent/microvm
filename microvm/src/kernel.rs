@@ -61,13 +61,12 @@ fn load_initrd(
 
 fn load_cmdline(memory: &GuestMemoryMmap) -> Result<Cmdline, Box<dyn std::error::Error>> {
     let mut cmdline = Cmdline::new(512)?;
-    cmdline.insert_str("console=ttyS0 earlyprintk=ttyS0 random.trust_cpu=on pci=off")?;
-    // Register virtio-mmio device: size@base:irq
+    cmdline.insert_str("console=ttyS0 earlyprintk=ttyS0 random.trust_cpu=on pci=off quiet loglevel=3")?;
     // Register virtio-mmio devices: size@base:irq
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0000000:5")?; // virtio-fs
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0001000:6")?; // virtio-net
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0002000:7")?; // virtio-console
-    cmdline.insert_str(" rootfstype=virtiofs root=rootfs rw systemd.unit=multi-user.target systemd.log_level=info systemd.log_target=console")?;
+    cmdline.insert_str(" rootfstype=virtiofs root=rootfs rw systemd.unit=multi-user.target systemd.show_status=no")?;
 
     linux_loader::loader::load_cmdline(memory, GuestAddress(CMDLINE_ADDR), &cmdline)?;
 
