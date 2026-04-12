@@ -123,50 +123,13 @@ impl S3Client {
     }
 
     pub fn put(&self, key: &str, data: &[u8]) -> Result<(), S3Error> {
-        self.put_with_meta(key, data, None, None, None)
-    }
-
-    pub fn put_with_meta(
-        &self,
-        key: &str,
-        data: &[u8],
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-    ) -> Result<(), S3Error> {
-        self.put_with_full_meta(key, data, mode, uid, gid, None)
-    }
-
-    pub fn put_with_full_meta(
-        &self,
-        key: &str,
-        data: &[u8],
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        symlink_target: Option<&str>,
-    ) -> Result<(), S3Error> {
         let url = self.bucket
             .put_object(Some(&self.credentials), key)
             .sign(self.sign_duration);
 
-        let mut req = self.agent.put(url.as_str())
-            .header("Content-Length", &data.len().to_string());
-
-        if let Some(m) = mode {
-            req = req.header("x-amz-meta-mode", &format!("{:o}", m));
-        }
-        if let Some(u) = uid {
-            req = req.header("x-amz-meta-uid", &u.to_string());
-        }
-        if let Some(g) = gid {
-            req = req.header("x-amz-meta-gid", &g.to_string());
-        }
-        if let Some(t) = symlink_target {
-            req = req.header("x-amz-meta-target", t);
-        }
-
-        req.send(data)
+        self.agent.put(url.as_str())
+            .header("Content-Length", &data.len().to_string())
+            .send(data)
             .map_err(|e| S3Error::Http(format!("{e}")))?;
         Ok(())
     }
