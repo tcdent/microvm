@@ -193,23 +193,24 @@ impl S3Client {
             let body = response.into_body().read_to_string()
                 .map_err(|e| S3Error::Http(format!("{e}")))?;
 
-            let page = parse_list_response(&body)?;
+            let page = ListResult::from_xml(&body)?;
             all_objects.extend(page.objects);
             all_prefixes.extend(page.prefixes);
 
-            // Check pagination
-            let is_truncated = extract_tag(&body, "IsTruncated")
-                .map(|v| v == "true")
-                .unwrap_or(false);
-            let next_token = extract_tag(&body, "NextContinuationToken");
-
-            if !is_truncated || next_token.is_none() {
+            if !page.is_truncated || page.next_continuation_token.is_none() {
                 break;
             }
-            continuation_token = next_token;
+            continuation_token = page.next_continuation_token;
         }
 
-        Ok(ListResult { objects: all_objects, prefixes: all_prefixes, is_truncated: false })
+        // We've drained the iterator, so by construction the aggregated
+        // result is not truncated and has no continuation to resume from.
+        Ok(ListResult {
+            objects: all_objects,
+            prefixes: all_prefixes,
+            is_truncated: false,
+            next_continuation_token: None,
+        })
     }
 
     /// Lightweight LIST for lookup — single page, no pagination, small result set.
@@ -233,7 +234,7 @@ impl S3Client {
         let body = response.into_body().read_to_string()
             .map_err(|e| S3Error::Http(format!("{e}")))?;
 
-        parse_list_response(&body)
+        ListResult::from_xml(&body)
     }
 }
 
@@ -241,6 +242,10 @@ pub struct ListResult {
     pub objects: Vec<ListObject>,
     pub prefixes: Vec<String>,
     pub is_truncated: bool,
+    /// Continuation token for the next page when `is_truncated` is true.
+    /// Paginating callers pass this back as `continuation-token`; terminal
+    /// callers ignore it.
+    pub next_continuation_token: Option<String>,
 }
 
 pub struct ListObject {
@@ -248,49 +253,55 @@ pub struct ListObject {
     pub size: u64,
 }
 
-fn parse_list_response(xml: &str) -> Result<ListResult, S3Error> {
-    let mut objects = Vec::new();
-    let mut prefixes = Vec::new();
+impl ListResult {
+    /// Parse an S3 ListObjectsV2 XML response. Single deserialization site
+    /// for everything we pull out of the response — add new fields here, not
+    /// via extra extract_tag calls at the call site.
+    pub fn from_xml(xml: &str) -> Result<Self, S3Error> {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
 
-    let mut i = 0;
+        let mut i = 0;
 
-    while i < xml.len() {
-        if let Some(pos) = xml[i..].find("<Contents>") {
-            let start = i + pos;
-            if let Some(end_pos) = xml[start..].find("</Contents>") {
-                let block = &xml[start..start + end_pos + 11];
-                // URL-decode key — rusty-s3 requests encoding-type=url,
-                // so the server returns URL-encoded keys in the XML
-                let key_raw = extract_tag(block, "Key").unwrap_or_default();
-                let key = percent_decode_str(&key_raw).decode_utf8_lossy().into_owned();
-                let size = extract_tag(block, "Size")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                objects.push(ListObject { key, size });
-                i = start + end_pos + 11;
-                continue;
-            }
-        }
-        if let Some(pos) = xml[i..].find("<CommonPrefixes>") {
-            let start = i + pos;
-            if let Some(end_pos) = xml[start..].find("</CommonPrefixes>") {
-                let block = &xml[start..start + end_pos + 17];
-                if let Some(prefix_raw) = extract_tag(block, "Prefix") {
-                    let prefix = percent_decode_str(&prefix_raw).decode_utf8_lossy().into_owned();
-                    prefixes.push(prefix);
+        while i < xml.len() {
+            if let Some(pos) = xml[i..].find("<Contents>") {
+                let start = i + pos;
+                if let Some(end_pos) = xml[start..].find("</Contents>") {
+                    let block = &xml[start..start + end_pos + 11];
+                    // URL-decode key — rusty-s3 requests encoding-type=url,
+                    // so the server returns URL-encoded keys in the XML
+                    let key_raw = extract_tag(block, "Key").unwrap_or_default();
+                    let key = percent_decode_str(&key_raw).decode_utf8_lossy().into_owned();
+                    let size = extract_tag(block, "Size")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    objects.push(ListObject { key, size });
+                    i = start + end_pos + 11;
+                    continue;
                 }
-                i = start + end_pos + 17;
-                continue;
             }
+            if let Some(pos) = xml[i..].find("<CommonPrefixes>") {
+                let start = i + pos;
+                if let Some(end_pos) = xml[start..].find("</CommonPrefixes>") {
+                    let block = &xml[start..start + end_pos + 17];
+                    if let Some(prefix_raw) = extract_tag(block, "Prefix") {
+                        let prefix = percent_decode_str(&prefix_raw).decode_utf8_lossy().into_owned();
+                        prefixes.push(prefix);
+                    }
+                    i = start + end_pos + 17;
+                    continue;
+                }
+            }
+            i += 1;
         }
-        i += 1;
+
+        let is_truncated = extract_tag(xml, "IsTruncated")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let next_continuation_token = extract_tag(xml, "NextContinuationToken");
+
+        Ok(ListResult { objects, prefixes, is_truncated, next_continuation_token })
     }
-
-    let is_truncated = extract_tag(xml, "IsTruncated")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    Ok(ListResult { objects, prefixes, is_truncated })
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
