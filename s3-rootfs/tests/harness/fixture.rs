@@ -14,6 +14,14 @@ pub struct TestFixture {
     pub fs: S3Fs,
     pub client: S3Client,
     pub prefix: String,
+    /// Whether this fixture is responsible for cleaning up objects under
+    /// `prefix` on drop. True for fixtures created via `new()` (which own
+    /// a unique prefix); false for fixtures created via `attach_to()`
+    /// (which share another fixture's prefix). Without this gate, the
+    /// first fixture to drop would delete objects the surviving one still
+    /// needs, so tests that simulate a cold session via attach_to would
+    /// break intermittently depending on drop order.
+    owns_prefix: bool,
 }
 
 impl TestFixture {
@@ -33,7 +41,34 @@ impl TestFixture {
 
         let client = S3Client::new(verify_config);
 
-        Self { fs, client, prefix }
+        Self { fs, client, prefix, owns_prefix: true }
+    }
+
+    /// Build a second fixture pointing at the same bucket + prefix as an
+    /// existing one, with fresh S3Fs / S3Client instances (empty caches,
+    /// fresh handle table). Simulates a cold session against data written
+    /// by another process — the test analogue of "unmount, remount".
+    ///
+    /// The returned fixture does NOT own the prefix: it will not run the
+    /// cleanup sweep on drop. The original fixture (owns_prefix=true)
+    /// handles cleanup. Keep the original alive at least until the
+    /// attached fixture is done — if the original drops first, the
+    /// attached fixture sees missing data.
+    pub fn attach_to(other: &TestFixture) -> Self {
+        let config = test_config();
+        let verify_config = test_config();
+
+        let fs = S3Fs::new(FsConfig { s3: config, ..Default::default() });
+        fs.init(FsOptions::empty()).expect("S3Fs init failed");
+
+        let client = S3Client::new(verify_config);
+
+        Self {
+            fs,
+            client,
+            prefix: other.prefix.clone(),
+            owns_prefix: false,
+        }
     }
 
     /// Build a full path under this fixture's unique prefix.
@@ -99,6 +134,11 @@ impl TestFixture {
 
 impl Drop for TestFixture {
     fn drop(&mut self) {
+        // Only the owning fixture cleans up — attached fixtures share the
+        // prefix and must not delete out from under the owner.
+        if !self.owns_prefix {
+            return;
+        }
         // Clean up all objects under our prefix
         let prefix = s3_rootfs::list_prefix(&self.prefix);
         if let Ok(result) = self.client.list(&prefix, None) {

@@ -842,6 +842,31 @@ impl FileSystem for S3Fs {
         };
 
         if is_dir {
+            // KNOWN BUG — directory rename is NOT atomic; see
+            // tests/test_correctness.rs for the regression anchor and the
+            // filed issue for the full failure modes. Summary:
+            //
+            // (a) The children-copy/delete loop below has no rollback.
+            //     A network failure mid-loop leaves some children moved
+            //     and others still at the old path, with no record of
+            //     which is which.
+            // (b) The directory marker itself (the zero-byte object at
+            //     `old_path`) is renamed AFTER the children — if the
+            //     marker rename fails, children are at `new_path/` but
+            //     the marker is orphaned at `old_path`, which is worse
+            //     than the reverse failure mode.
+            // (c) Hardlink refs inside the directory happen to work
+            //     because the ref body (`hardlink:<uuid>`) is just bytes
+            //     that get copied verbatim — no special handling needed,
+            //     but also no test coverage of that interaction.
+            //
+            // Known-better design: rename marker FIRST (cheap server-side
+            // copy), then walk children with a tracked rollback list,
+            // then delete the old marker. Deferred until we have
+            // fault-injection test infrastructure to exercise the
+            // partial-failure paths — otherwise a "fix" is just moving
+            // the bug around.
+            //
             // Directory rename: LIST all children, copy+delete each
             let old_prefix = format!("{}/", old_path);
             let result = self.client.list(&old_prefix, None)
