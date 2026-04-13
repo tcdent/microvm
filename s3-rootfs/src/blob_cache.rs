@@ -109,12 +109,26 @@ pub struct GoldenEntry {
 /// Bit set on every golden inode number. Per-VM inodes stay below
 /// this boundary, so `(ino as i64) < 0` cheaply identifies a golden
 /// inode without a side map.
-pub const GOLDEN_INO_BIT: u64 = 1 << 63;
+/// Base value for golden inode numbers. Golden inos are assigned
+/// from [`GOLDEN_INO_BASE`..) while per-VM inos stay below. Per-VM
+/// `InodeCache::next_ino` starts at 2 and tops out in the low
+/// thousands for any realistic workload, so the partition at 2^40
+/// leaves multi-orders-of-magnitude headroom on both sides.
+///
+/// DEBUGGING NOTE: earlier revisions used `1 << 63` as the marker
+/// bit (the "top bit set" check). That turned out to cause early
+/// boot failures — kernel / FUSE paths that treat inode numbers as
+/// i64 saw golden inos as negative, and mount --move of /sysroot/dev
+/// silently failed, leaving devtmpfs unmounted and every
+/// open(/dev/null) returning ENOENT. Partitioning at 2^40 keeps
+/// every assigned inode positive as i64, which the kernel handles
+/// identically to per-VM inos.
+pub const GOLDEN_INO_BASE: u64 = 1 << 40;
 
 /// Is this inode number one that the golden cache owns?
 #[inline]
 pub fn is_golden_ino(ino: u64) -> bool {
-    (ino & GOLDEN_INO_BIT) != 0
+    ino >= GOLDEN_INO_BASE
 }
 
 /// Immutable, lock-free, `Arc`-shareable golden inode cache.
@@ -268,7 +282,7 @@ pub fn load_golden(
     // Step 3: inode cache. Assign stable inos eagerly and build all
     // three indexes (by_path, by_ino, by_parent) in one pass.
     //
-    // Ino assignment: GOLDEN_INO_BIT | (index + 1). The +1 avoids
+    // Ino assignment: GOLDEN_INO_BASE + (index + 1). The +1 avoids
     // colliding with any conceptual "root golden" sentinel and keeps
     // 0 reserved. Index-based so the scheme is reproducible from
     // the manifest alone — tests that stash inos across load cycles
@@ -279,7 +293,7 @@ pub fn load_golden(
     let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
 
     for (idx, e) in manifest.entries.iter().enumerate() {
-        let ino = GOLDEN_INO_BIT | (idx as u64 + 1);
+        let ino = GOLDEN_INO_BASE + (idx as u64 + 1);
 
         // Parent/child split: everything before the last '/' is the
         // parent; everything after is the child name. Paths without
@@ -508,7 +522,7 @@ mod tests {
 
     #[test]
     fn golden_ino_has_top_bit_set() {
-        // Contract: every assigned golden ino has GOLDEN_INO_BIT. This
+        // Contract: every assigned golden ino is ≥ GOLDEN_INO_BASE. This
         // is what downstream per-VM vs golden routing keys off of.
         let tmp = tempfile::tempdir().unwrap();
         let manifest_path = tmp.path().join("m.bin");
@@ -530,8 +544,13 @@ mod tests {
 
         for name in ["a", "b", "c"] {
             let e = inodes.get(name).unwrap();
-            assert!(is_golden_ino(e.ino), "ino {:#x} should have top bit set", e.ino);
-            assert!((e.ino as i64) < 0, "signed-negative invariant");
+            assert!(is_golden_ino(e.ino), "ino {:#x} should be ≥ GOLDEN_INO_BASE", e.ino);
+            // Debug-era note: earlier tests asserted (e.ino as i64) < 0
+            // when the marker was the top bit. Now we explicitly stay
+            // positive-as-i64 because the kernel VFS/FUSE path treats
+            // top-bit-set inos in ways that break mount (see GOLDEN_INO_BASE
+            // comment).
+            assert!((e.ino as i64) > 0, "golden ino must be positive as i64");
         }
     }
 
@@ -539,7 +558,7 @@ mod tests {
     fn empty_cache_sentinel_misses_everything() {
         let inodes = GoldenInodeCache::empty();
         assert!(inodes.get("anything").is_none());
-        assert!(inodes.get_by_ino(GOLDEN_INO_BIT | 1).is_none());
+        assert!(inodes.get_by_ino(GOLDEN_INO_BASE + 1).is_none());
         assert!(inodes.children("any/parent").is_empty());
         assert!(inodes.is_empty());
     }
