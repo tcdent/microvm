@@ -211,7 +211,18 @@ impl S3Client {
     }
 
     pub fn put(&self, key: &str, data: &[u8]) -> Result<(), S3Error> {
-        let url = self.bucket
+        self.put_with_bucket(&self.bucket, key, data)
+    }
+
+    /// Bucket-override variant of [`put`]: PUT into the named bucket
+    /// rather than this client's primary. Used by the golden-upload
+    /// tool to write `golden/<hash>` and `golden/.manifest`.
+    pub fn put_to(&self, bucket: &str, key: &str, data: &[u8]) -> Result<(), S3Error> {
+        self.put_with_bucket(&self.bucket_for(bucket), key, data)
+    }
+
+    fn put_with_bucket(&self, bucket: &Bucket, key: &str, data: &[u8]) -> Result<(), S3Error> {
+        let url = bucket
             .put_object(Some(&self.credentials), key)
             .sign(self.sign_duration);
 
@@ -220,6 +231,21 @@ impl S3Client {
             .send(data)
             .map_err(|e| S3Error::Http(format!("{e}")))?;
         Ok(())
+    }
+
+    /// Existence check against a named bucket via HEAD. `Ok(true)`
+    /// on 200, `Ok(false)` on 404, `Err` on any other HTTP / network
+    /// error. Used by the golden-upload tool for
+    /// HEAD-then-PUT-if-absent dedup on content-addressed blobs —
+    /// avoids re-uploading blobs that already exist.
+    pub fn exists_in(&self, bucket: &str, key: &str) -> Result<bool, S3Error> {
+        let b = self.bucket_for(bucket);
+        let url = b.head_object(Some(&self.credentials), key).sign(self.sign_duration);
+        match self.agent.head(url.as_str()).call() {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::StatusCode(404)) => Ok(false),
+            Err(e) => Err(S3Error::Http(format!("{e}"))),
+        }
     }
 
     /// Server-side copy — no data transferred through the client.

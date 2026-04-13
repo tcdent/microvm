@@ -11,3 +11,5 @@ path = "src/main.rs"
 s3-rootfs = { path = "../../s3-rootfs" }
 rayon = "1"
 libc = "0.2.184"
+blake3 = "1"
+bincode = "1"

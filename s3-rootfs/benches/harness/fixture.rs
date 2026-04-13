@@ -6,7 +6,7 @@ use fuse_backend_rs::api::filesystem::FileSystem;
 use s3_rootfs::config::FsConfig;
 use s3_rootfs::{
     GoldenConfig, GoldenManifest, GoldenManifestEntry, KeyMeta, ManifestSource, S3Client, S3Fs,
-    encode_key, GOLDEN_SCHEMA_VERSION,
+    encode_key,
 };
 
 use super::s3::test_config;
@@ -86,7 +86,6 @@ impl TestFixture {
         let tmp = tempfile::tempdir().expect("tempdir");
         let manifest_path = tmp.path().join("manifest.bin");
         let manifest = GoldenManifest {
-            schema_version: GOLDEN_SCHEMA_VERSION,
             entries,
         };
         std::fs::write(&manifest_path, bincode::serialize(&manifest).unwrap())

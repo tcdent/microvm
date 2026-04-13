@@ -25,7 +25,7 @@ pub mod storage;
 
 pub use blob_cache::{
     GoldenBlobCache, GoldenEntry, GoldenInodeCache, GoldenManifest, GoldenManifestEntry,
-    GOLDEN_SCHEMA_VERSION, load_golden,
+    load_golden,
 };
 pub use config::{GoldenConfig, ManifestSource};
 pub use inode_cache::{CachedInode, InodeCache};

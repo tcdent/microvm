@@ -231,42 +231,27 @@ rm -f "$WORK/lib/systemd/system/systemd-logind.service" 2>/dev/null
 rm -f "$WORK/lib/systemd/system/multi-user.target.wants/systemd-logind.service" 2>/dev/null
 rm -f "$WORK/lib/systemd/system/dbus-org.freedesktop.login1.service" 2>/dev/null
 
-# ── Upload (single pass) ───────────────────────────────────────
+# ── Upload to golden bucket ────────────────────────────────────
+#
+# Under the golden-FS model (research/12) the bootstrap tool
+# populates a content-addressed golden bucket + a .manifest object.
+# Per-VM buckets start empty and accumulate only the VM's deltas;
+# they are NOT populated by this script.
 
 echo "==> Creating S3 bucket $BUCKET ..."
 aws --endpoint-url "$ENDPOINT" s3 mb "s3://$BUCKET" 2>/dev/null || true
 
-echo "==> Uploading rootfs to s3://$BUCKET ..."
+echo "==> Populating golden bucket s3://$BUCKET ..."
 
 UPLOADER="$DIR/golden-upload/target/release/golden-upload"
-echo "    Looking for uploader at: $UPLOADER (exists: $(test -x "$UPLOADER" && echo yes || echo no))"
-if [ -x "$UPLOADER" ]; then
-    "$UPLOADER" "$WORK" "$BUCKET" "$ENDPOINT"
-else
-    echo "    (golden-upload not built — using aws cli, this will be slow)"
-    echo "    Build it: cd dist/golden-upload && cargo build --release"
-    find "$WORK" \( -type f -o -type l -o -type d \) -print0 | while IFS= read -r -d '' entry; do
-        rel="${entry#$WORK/}"
-        [ -z "$rel" ] && continue
-        if [ -d "$entry" ]; then
-            key="${rel}/"
-            aws --endpoint-url "$ENDPOINT" s3api put-object \
-                --bucket "$BUCKET" --key "$key" --content-length 0 \
-                --metadata "mode=$(stat -c '%a' "$entry"),uid=$(stat -c '%u' "$entry"),gid=$(stat -c '%g' "$entry")" \
-                >/dev/null 2>&1 || true
-        elif [ -L "$entry" ]; then
-            aws --endpoint-url "$ENDPOINT" s3api put-object \
-                --bucket "$BUCKET" --key "$rel" --content-length 0 \
-                --metadata "mode=120777,uid=0,gid=0,target=$(readlink "$entry")" \
-                >/dev/null 2>&1 || true
-        elif [ -f "$entry" ]; then
-            aws --endpoint-url "$ENDPOINT" s3api put-object \
-                --bucket "$BUCKET" --key "$rel" --body "$entry" \
-                --metadata "mode=$(stat -c '%a' "$entry"),uid=$(stat -c '%u' "$entry"),gid=$(stat -c '%g' "$entry")" \
-                >/dev/null 2>&1 || true
-        fi
-    done
+if [ ! -x "$UPLOADER" ]; then
+    echo "ERROR: golden-upload binary not found at $UPLOADER"
+    echo "       Build it first: cd dist/golden-upload && cargo build --release"
+    echo "       (The old aws-cli fallback is gone — the golden-FS model"
+    echo "        requires the BLAKE3-hashing + manifest-emitting tool.)"
+    exit 1
 fi
+"$UPLOADER" "$WORK" "$BUCKET" "$ENDPOINT"
 
 # Cleanup
 rm -rf "$WORK"
