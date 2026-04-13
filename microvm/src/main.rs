@@ -78,6 +78,18 @@ fn config_from_env() -> LaunchConfig {
         * 1024
         * 1024;
 
+    // Golden layer: opt-in via VM_GOLDEN_BUCKET. When set, S3Fs::new
+    // loads the manifest + every blob at orchestrator init. Manifest
+    // key defaults to `.manifest` (research/12 convention); override
+    // via VM_GOLDEN_MANIFEST_KEY if some deployment puts it elsewhere.
+    if let Ok(golden_bucket) = std::env::var("VM_GOLDEN_BUCKET") {
+        let manifest_key = env_or("VM_GOLDEN_MANIFEST_KEY", ".manifest");
+        fs.golden = Some(s3_rootfs::GoldenConfig {
+            bucket: golden_bucket,
+            manifest: s3_rootfs::ManifestSource::S3Key(manifest_key),
+        });
+    }
+
     LaunchConfig {
         kernel_path: env_or("VM_KERNEL", "dist/vmlinux"),
         initrd_path: env_or("VM_INITRD", "dist/initramfs.cpio.gz"),

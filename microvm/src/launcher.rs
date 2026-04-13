@@ -83,8 +83,35 @@ pub fn prepare_filesystem(cfg: &LaunchConfig) -> Arc<S3Fs> {
 /// The split between `prepare_filesystem` and `launch_vm` is the seam
 /// the orchestrator will eventually cut along.
 pub fn run(cfg: LaunchConfig) -> Result<(), Box<dyn std::error::Error>> {
+    bench_ts("T0"); // orchestrator-start
     let fs = prepare_filesystem(&cfg);
+    bench_ts("T1"); // golden-loaded
     launch_vm(cfg, fs)
+}
+
+// ── Boot-time bench instrumentation ────────────────────────────────────
+//
+// Three timestamps mark the boot pipeline for `dist/bench-boot.sh`:
+//   T0  orchestrator-start     — top of `run`, before any work.
+//   T1  golden-loaded          — after `prepare_filesystem` returns
+//                                (S3Fs + optional golden caches ready).
+//   T2  vm-started             — vCPU about to run (inside `System::run`).
+//
+// Harness computes:
+//   orchestrator_init = T1 - T0   (excluded from boot number)
+//   boot_time         = t_login - T2   (THE metric; research/12 §10)
+//   total             = t_login - T0
+//
+// Prefix `__BENCH_TN__` chosen to never collide with guest console
+// output or any other microvm log line; the harness greps on it
+// without false positives.
+fn bench_ts(marker: &str) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // stderr so it stays separate from guest console output (stdout).
+    eprintln!("__BENCH_{marker}__ {nanos}");
 }
 
 /// Bring up a VM and run its vCPU loop to completion.
@@ -170,6 +197,7 @@ impl System {
 
     fn run(&mut self) {
         log!("=== microvm started ===");
+        bench_ts("T2"); // vm-started — vCPU about to enter KVM_RUN
         // stdin goes to virtio-console (hvc0), not serial (ttyS0).
         // Serial is output-only for boot messages.
         loop {
