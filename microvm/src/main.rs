@@ -72,6 +72,9 @@ fn main() {
 fn config_from_env() -> LaunchConfig {
     let mut fs = FsConfig::default();
     fs.s3.endpoint = env_or("VM_S3_ENDPOINT", "http://192.168.88.15:9090");
+    if let Ok(bucket) = std::env::var("VM_BUCKET") {
+        fs.s3.bucket = bucket;
+    }
     fs.read_ahead_size = env_or("VM_READ_AHEAD", "16")
         .parse::<usize>()
         .unwrap_or(16)

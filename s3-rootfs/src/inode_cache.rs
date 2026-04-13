@@ -45,10 +45,12 @@ pub struct InodeCache {
     /// `insert()` removes from this set on every positive mutation.
     negative: HashSet<String>,
     next_ino: u64,
-    // Hit/miss counters for observability
+    // Hit/miss counters for observability. Negative-hit counter
+    // intentionally absent: there's no production consumer, and
+    // benches already measure the same property directly if we
+    // ever want it back.
     pub hits: u64,
     pub misses: u64,
-    pub negative_hits: u64,
 }
 
 impl InodeCache {
@@ -60,7 +62,6 @@ impl InodeCache {
             next_ino: 2, // 1 reserved for root
             hits: 0,
             misses: 0,
-            negative_hits: 0,
         };
         // Root directory
         cache.insert("", CachedInode {
@@ -170,13 +171,16 @@ impl InodeCache {
     }
 
     /// Check if a path is negatively cached (known miss).
-    pub fn is_negative(&mut self, path: &str) -> bool {
-        if self.negative.contains(path) {
-            self.negative_hits += 1;
-            true
-        } else {
-            false
-        }
+    ///
+    /// Takes `&self` (not `&mut self`) — the method is a pure
+    /// membership check with no mutation. Previous revisions bumped
+    /// a `negative_hits` counter here, which required `&mut`; that
+    /// counter was removed because no production code read it and
+    /// the `&mut` signature forced callers to hold the write half of
+    /// the surrounding `Mutex`. Restoring `&self` lets future shared-
+    /// read refactors (if any) drop the exclusive-lock requirement.
+    pub fn is_negative(&self, path: &str) -> bool {
+        self.negative.contains(path)
     }
 
     /// Number of cached inodes (excluding root).

@@ -34,7 +34,6 @@ pub struct CacheStats {
     pub negative_count: usize,
     pub hits: u64,
     pub misses: u64,
-    pub negative_hits: u64,
 }
 const TTL: Duration = Duration::from_secs(1);
 /// Number of S3 keys to fetch per lookup LIST probe.
@@ -180,7 +179,6 @@ impl S3Fs {
             negative_count: cache.negative_count(),
             hits: cache.hits,
             misses: cache.misses,
-            negative_hits: cache.negative_hits,
         }
     }
 
@@ -822,13 +820,6 @@ impl FileSystem for S3Fs {
                     // parse_body only returns Symlink when file_type=S_IFLNK;
                     // we pass S_IFREG here so this branch is unreachable.
                     ObjectBody::Symlink(_) => unreachable!("parse_body(_, S_IFREG) returned Symlink"),
-                    // GoldenRef bodies aren't produced by any code path
-                    // today — reserved for research/10. Treat as data
-                    // unavailable if one ever turns up in the wild.
-                    ObjectBody::GoldenRef(_) => {
-                        log!("S3Fs: unexpected GoldenRef body at {} (feature not wired up)", path);
-                        return Err(io::Error::from_raw_os_error(libc::EIO));
-                    }
                 }
             };
 
@@ -991,12 +982,6 @@ impl FileSystem for S3Fs {
                             // only returns Symlink when file_type=S_IFLNK.
                             ObjectBody::Symlink(_) => {
                                 log!("S3Fs: open-preload unexpected Symlink body at {}", path);
-                                None
-                            }
-                            // GoldenRef isn't wired up anywhere — log and
-                            // skip preload rather than corrupt anything.
-                            ObjectBody::GoldenRef(_) => {
-                                log!("S3Fs: open-preload unexpected GoldenRef body at {}", path);
                                 None
                             }
                         }

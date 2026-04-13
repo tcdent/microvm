@@ -15,8 +15,8 @@ const ROOT: u64 = 1;
 fn print_stats(label: &str, s: &CacheStats) {
     let total = s.hits + s.misses;
     let rate = if total > 0 { s.hits as f64 / total as f64 * 100.0 } else { 0.0 };
-    eprintln!("  [{label}] entries={} negative={} hits={} misses={} neg_hits={} hit_rate={:.1}%",
-        s.inode_count, s.negative_count, s.hits, s.misses, s.negative_hits, rate);
+    eprintln!("  [{label}] entries={} negative={} hits={} misses={} hit_rate={:.1}%",
+        s.inode_count, s.negative_count, s.hits, s.misses, rate);
 }
 
 #[test]
@@ -256,8 +256,8 @@ fn hit_rate_realistic_workload() {
     // Report
     let total = final_stats.hits + final_stats.misses;
     let hit_rate = if total > 0 { final_stats.hits as f64 / total as f64 * 100.0 } else { 0.0 };
-    eprintln!("\n  SUMMARY: {}/{} cache hits ({:.1}%), {} negative hits",
-        final_stats.hits, total, hit_rate, final_stats.negative_hits);
+    eprintln!("\n  SUMMARY: {}/{} cache hits ({:.1}%)",
+        final_stats.hits, total, hit_rate);
 }
 
 /// Simulates cold path traversal — kernel resolving an absolute path
@@ -331,7 +331,7 @@ fn hit_rate_cold_execve_path() {
     // Final report
     let total = s6.hits + s6.misses;
     let hit_rate = if total > 0 { s6.hits as f64 / total as f64 * 100.0 } else { 0.0 };
-    eprintln!("\n  SUMMARY: {}/{} cache hits ({:.1}%), {} negative hits",
-        s6.hits, total, hit_rate, s6.negative_hits);
+    eprintln!("\n  SUMMARY: {}/{} cache hits ({:.1}%)",
+        s6.hits, total, hit_rate);
     eprintln!("  S3 LIST calls (approx): {} (one per miss)", s6.misses);
 }

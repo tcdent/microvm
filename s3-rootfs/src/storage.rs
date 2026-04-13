@@ -31,19 +31,11 @@ pub const HARDLINK_PREFIX: &str = ".hardlinks/";
 /// the body is the UUID naming a file under [`HARDLINK_PREFIX`].
 pub const HARDLINK_REF_PREFIX: &str = "hardlink:";
 
-/// Magic prefix for future golden-image references. The rest of the
-/// body is a content hash identifying an object in a shared golden
-/// pool. Unused today; reserved so the byte format is stable.
-#[allow(dead_code)]
-pub const GOLDEN_REF_PREFIX: &str = "ref:";
-
 /// Is `name` a top-level entry reserved by the storage layer and hidden
 /// from guest-visible readdir? Currently just the `.hardlinks` directory
-/// that stores shared hardlink data; extends cleanly to a future
-/// `.golden/` pool (research/10) when that lands.
+/// that stores shared hardlink data.
 pub fn is_reserved_name(name: &str) -> bool {
     name == HARDLINK_PREFIX.trim_end_matches('/')
-    // Future: || name == GOLDEN_PREFIX.trim_end_matches('/')
 }
 
 /// Decoded interpretation of an S3 object body.
@@ -60,11 +52,6 @@ pub enum ObjectBody {
     /// A hardlink reference. The string is the UUID naming the real
     /// data object under `.hardlinks/<uuid>`.
     Hardlink(String),
-
-    /// A future golden-image reference. Body format: `ref:<hash>`.
-    /// Reserved; currently never produced.
-    #[allow(dead_code)]
-    GoldenRef(String),
 
     /// Symlink target path. For `S_IFLNK` objects, the body *is* the
     /// target — no prefix, no framing.
@@ -87,9 +74,6 @@ pub fn parse_body(bytes: Vec<u8>, file_type: u32) -> ObjectBody {
     if let Some(uuid) = strip_prefix_str(&bytes, HARDLINK_REF_PREFIX) {
         return ObjectBody::Hardlink(uuid.trim().to_string());
     }
-    if let Some(hash) = strip_prefix_str(&bytes, GOLDEN_REF_PREFIX) {
-        return ObjectBody::GoldenRef(hash.trim().to_string());
-    }
 
     ObjectBody::Direct(bytes)
 }
@@ -97,13 +81,6 @@ pub fn parse_body(bytes: Vec<u8>, file_type: u32) -> ObjectBody {
 /// Encode a hardlink reference body.
 pub fn encode_hardlink_ref(uuid: &str) -> Vec<u8> {
     format!("{HARDLINK_REF_PREFIX}{uuid}").into_bytes()
-}
-
-/// Encode a golden-image reference body. Stub — reserved for the
-/// content-addressed storage work (research/10).
-#[allow(dead_code)]
-pub fn encode_golden_ref(hash: &str) -> Vec<u8> {
-    format!("{GOLDEN_REF_PREFIX}{hash}").into_bytes()
 }
 
 /// Generate a new hardlink UUID.
@@ -134,14 +111,6 @@ pub fn hardlink_key(uuid: &str, meta: KeyMeta) -> String {
     encode(&path, meta)
 }
 
-/// Build the S3 key for a golden-image object. Stub — reserved for
-/// the content-addressed storage work.
-#[allow(dead_code)]
-pub fn golden_key(_hash: &str) -> String {
-    // TODO(research/10-fs-daemon.md): define the golden pool layout
-    // and key encoding. Likely `.golden/<sha>` with fixed metadata.
-    unimplemented!("golden references not yet implemented")
-}
 
 /// Helper: if `bytes` starts with `prefix` (as UTF-8), return the
 /// suffix as `&str`. Returns `None` if the bytes aren't valid UTF-8
@@ -179,15 +148,6 @@ mod tests {
         match body {
             ObjectBody::Hardlink(uuid) => assert_eq!(uuid, "abc123"),
             _ => panic!("expected Hardlink"),
-        }
-    }
-
-    #[test]
-    fn parse_golden_ref() {
-        let body = parse_body(b"ref:deadbeef".to_vec(), libc::S_IFREG as u32);
-        match body {
-            ObjectBody::GoldenRef(hash) => assert_eq!(hash, "deadbeef"),
-            _ => panic!("expected GoldenRef"),
         }
     }
 
