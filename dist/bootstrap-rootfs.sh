@@ -7,7 +7,7 @@
 #   template-debian-trixie-20260407  — pinned golden image
 #   vm-{instance-id}                 — per-VM, derives from template
 #
-# Requires: debootstrap, s3-upload (Rust binary in dist/s3-upload/)
+# Requires: debootstrap, golden-upload (Rust binary in dist/golden-upload/)
 # Run with: sudo -E (preserves AWS env vars)
 #
 set -e
@@ -238,13 +238,13 @@ aws --endpoint-url "$ENDPOINT" s3 mb "s3://$BUCKET" 2>/dev/null || true
 
 echo "==> Uploading rootfs to s3://$BUCKET ..."
 
-UPLOADER="$DIR/s3-upload/target/release/s3-upload"
+UPLOADER="$DIR/golden-upload/target/release/golden-upload"
 echo "    Looking for uploader at: $UPLOADER (exists: $(test -x "$UPLOADER" && echo yes || echo no))"
 if [ -x "$UPLOADER" ]; then
     "$UPLOADER" "$WORK" "$BUCKET" "$ENDPOINT"
 else
-    echo "    (s3-upload not built — using aws cli, this will be slow)"
-    echo "    Build it: cd dist/s3-upload && cargo build --release"
+    echo "    (golden-upload not built — using aws cli, this will be slow)"
+    echo "    Build it: cd dist/golden-upload && cargo build --release"
     find "$WORK" \( -type f -o -type l -o -type d \) -print0 | while IFS= read -r -d '' entry; do
         rel="${entry#$WORK/}"
         [ -z "$rel" ] && continue

@@ -1,7 +1,11 @@
 [package]
-name = "s3-upload"
+name = "golden-upload"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "golden-upload"
+path = "src/main.rs"
 
 [dependencies]
 s3-rootfs = { path = "../../s3-rootfs" }
