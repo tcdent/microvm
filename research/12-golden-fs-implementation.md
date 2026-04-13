@@ -245,17 +245,18 @@ fn read(ino, offset, size) -> Bytes {
     match storage::parse_body(raw, meta.file_type()) {
         ObjectBody::Direct(bytes) => serve_slice(bytes, offset, size),
         ObjectBody::Hardlink(uuid) => { /* existing logic */ }
-        ObjectBody::GoldenRef(_hash) => {
-            // Not expected under the delta-only model — the per-VM
-            // bucket only holds direct content for files the VM
-            // modified. If a GoldenRef body appears here it's
-            // provenance from an older bootstrap version or a bug.
-            unreachable!("vm-<id> bucket should not contain GoldenRef bodies")
-        }
         ObjectBody::Symlink(_) => unreachable!(),
     }
 }
 ```
+
+Note: earlier drafts of this doc carried an `ObjectBody::GoldenRef`
+variant for "per-VM bucket contains a ref to a golden blob." Under the
+delta-only model that variant has no producer — guest writes are
+always direct content, and golden lives entirely in the shared RAM
+caches. The variant was removed in a post-G2 hygiene pass (see the
+commit series ending in G3). `parse_body` returns three variants today:
+`Direct`, `Hardlink`, `Symlink`.
 
 **Golden serves from RAM, period.** No tier walk, no cache miss, no
 S3 round-trip. The blob is there (because we pinned every golden blob
@@ -397,9 +398,12 @@ cleanly if issues surface.
 | 1 | `S3Client::with_shared_agent` | ✓ landed (2662e9f) | Flat |
 | 3′ | Remove 0b scaffolds (premature abstraction superseded by single flat RAM cache) | ✓ landed (653b55b) | Flat (no callers) |
 | 2 | `GoldenInodeCache` + `GoldenBlobCache` + manifest loader + bulk parallel S3 fetch at init + multi-bucket `S3Client::get_from` | ✓ landed (f921cbf) | Flat (not wired); init-time measured separately |
-| **G1** | **Golden FUSE integration** — `FsConfig::golden` plumbing, S3Fs holds the Arcs, `lookup()` tier-2 check, `read()`/`open()` serve from `GoldenBlobCache`, `unlink()`/`readdir()` filter via negative cache | — | First-read-after-init ≈ memcpy; cold lookup latency on golden paths |
-| **G2** | **Bootstrap pipeline** — BLAKE3 hashing in `dist/s3-upload`, golden PUTs, manifest emission in `bootstrap-rootfs.sh` | — | Offline tool, bench not applicable |
-| **G3** | **End-to-end VM boot on golden rootfs** — test harness against existing in-VM baseline; measure boot time with full golden serving | — | In-VM cold boot time vs pre-golden baseline |
+| **G1** | **Golden FUSE integration** — `FsConfig::golden` plumbing, S3Fs holds the Arcs, `lookup()` tier-2 check, `read()`/`open()` serve from `GoldenBlobCache`, `unlink()`/`readdir()` filter via negative cache | ✓ landed (72c64ba) | golden_lookup 179 ns, golden_read_1mb 44.9 µs (~22 GiB/s), golden_open_materialize 45.2 µs |
+| — | Rename `dist/s3-upload` → `dist/golden-upload` (pure rename) | ✓ landed (67c66a5) | — |
+| **G2** | **Bootstrap pipeline** — BLAKE3 hashing in `golden-upload`, golden PUTs, manifest emission in `bootstrap-rootfs.sh`, schema_version dropped | ✓ landed (7ddf02f) | Offline tool, bench not applicable |
+| — | Ino partition fix (1<<63 → 1<<40; kernel VFS rejected i64-negative inos) | ✓ landed (5661f90) | Boot regression fix surfaced during G3 diagnosis |
+| **G3** | **End-to-end VM boot on golden rootfs** — `bench-boot.sh`, T0/T1/T2 instrumentation, N=5 both modes | ✓ landed (59a50fd) | **nogolden 23.011s, golden 15.759s, -31.5%; variance 2.21s → 0.75s** |
+| — | Post-G2 hygiene — drop `ObjectBody::GoldenRef` variant + `negative_hits` counter, restore `is_negative(&self)`, bootstrap.sh split into golden + per-VM buckets | ✓ landed (88601e3) | Flat (pure code removal + config plumbing) |
 
 ### Phase compression
 
@@ -431,6 +435,28 @@ bench methodology (offline tool).
 - G3's boot-time number is what validates the whole effort. Don't
   stash it, don't apologize for warm-up — just run vs the existing
   in-VM baseline and report the delta.
+
+### Sprint outcome (canonical reference)
+
+G3 delivered **-31.5% boot time** with **3× tighter variance** vs the
+pre-golden baseline, on the same host, same rootfs, same microvm binary
+with only the `VM_GOLDEN_BUCKET` env var differing between the A and B
+arms. Golden-mode boot reaches `login:` in 15.759s (median, N=5, range
+15.440–16.192s); nogolden in 23.011s (range 21.573–23.783s). The
+orchestrator-init cost of loading the 120 MB golden pool into RAM is
+5.72s, excluded from boot_time per methodology and amortized across
+every VM that subsequently boots on the host. Net break-even on the
+first VM already (5.72s init − 7.25s per-VM saved = +1.53s); at 10 VMs
+per orchestrator lifetime, total time saved is ~66.8s.
+
+The per-op wins that compose into boot-time savings (measured via
+criterion `golden_*` microbenches):
+
+| Operation | Golden | Pre-golden S3 | Delta |
+|---|---|---|---|
+| Lookup hit | 179 ns | ~15.7 ms | ~88,000× |
+| 1 MB read (cached) | 44.9 µs (~22 GiB/s) | ~30 ms | ~670× |
+| Open + materialize 1 MB | 45.2 µs | ~30 ms + write prep | — |
 
 ---
 
@@ -543,6 +569,8 @@ Useful answers to questions the fleet will eventually ask:
   tiered cache goals are identical; the implementation approach is
   simpler because we don't need IPC.
 - `research/11`: the refactor that landed the scaffolding for this work
-  (`ObjectBody::GoldenRef` variant, `blob_cache.rs` trait, `storage.rs`
-  helpers, `BlobCacheConfig`). Phase 0/1/2 here plug into those
-  existing extension points.
+  (`blob_cache.rs` trait, `storage.rs` helpers, `BlobCacheConfig`). Some
+  of that scaffolding (the `BlobCache` trait with tiered-cache semantics,
+  `ObjectBody::GoldenRef`, `BlobCacheConfig`) was removed during this
+  sprint once the architecture settled on a single flat RAM-resident
+  cache — see §9 for the full trail.
