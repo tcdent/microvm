@@ -87,8 +87,16 @@ pub const GOLDEN_SCHEMA_VERSION: u32 = 1;
 /// separate so the in-memory shape can diverge from the serialized
 /// one (e.g. add computed fields) without breaking the manifest
 /// format.
+///
+/// Inode numbers are assigned at load time — `ino` is stable across
+/// the orchestrator's lifetime and has bit 63 set to distinguish
+/// golden inodes from per-VM inodes (whose allocator stays in the
+/// lower half of the `u64` space). The kernel's dentry cache can
+/// hold golden inos indefinitely.
 #[derive(Debug, Clone)]
 pub struct GoldenEntry {
+    /// Pre-assigned inode number. Top bit set (`ino as i64 < 0`).
+    pub ino: u64,
     /// Content hash for blob-bearing files; `None` for directories
     /// and symlinks. Symlink targets are served inline from
     /// `symlink_target` — they do NOT need a blob lookup.
@@ -100,16 +108,70 @@ pub struct GoldenEntry {
     pub symlink_target: Option<String>,
 }
 
-/// Immutable, lock-free, `Arc`-shareable path → [`GoldenEntry`] cache.
-/// Populated once at orchestrator init; never mutated after.
+/// Bit set on every golden inode number. Per-VM inodes stay below
+/// this boundary, so `(ino as i64) < 0` cheaply identifies a golden
+/// inode without a side map.
+pub const GOLDEN_INO_BIT: u64 = 1 << 63;
+
+/// Is this inode number one that the golden cache owns?
+#[inline]
+pub fn is_golden_ino(ino: u64) -> bool {
+    (ino & GOLDEN_INO_BIT) != 0
+}
+
+/// Immutable, lock-free, `Arc`-shareable golden inode cache.
+/// Populated once at orchestrator init; never mutated after. All
+/// three maps are built eagerly at load time so every lookup path
+/// is a single `HashMap::get` with no synchronization.
 #[derive(Debug)]
 pub struct GoldenInodeCache {
     by_path: HashMap<String, GoldenEntry>,
+    /// Reverse index: golden inode → path. Lets `getattr` / `read` /
+    /// `open` / `readlink` resolve a FUSE-supplied inode back to its
+    /// path without a second map walk. Stable for orchestrator life.
+    by_ino: HashMap<u64, String>,
+    /// Parent path → child names. Built once at load so `readdir`
+    /// doesn't have to scan `by_path`. Key is the parent directory
+    /// (empty string = root); values are the bare child names (no
+    /// slashes).
+    by_parent: HashMap<String, Vec<String>>,
 }
 
 impl GoldenInodeCache {
+    /// An empty cache — the sentinel used when `FsConfig::golden` is
+    /// `None`. Callers can consult this unconditionally; every lookup
+    /// misses, which reads the same as "golden disabled" but with no
+    /// branch in the hot path.
+    pub fn empty() -> Self {
+        Self {
+            by_path: HashMap::new(),
+            by_ino: HashMap::new(),
+            by_parent: HashMap::new(),
+        }
+    }
+
     pub fn get(&self, path: &str) -> Option<&GoldenEntry> {
         self.by_path.get(path)
+    }
+
+    /// Resolve a golden inode back to (path, entry). Returns `None`
+    /// for per-VM inodes or for golden inos that somehow escaped
+    /// this cache's lifetime (shouldn't happen — golden cache is
+    /// immutable for the orchestrator's life).
+    pub fn get_by_ino(&self, ino: u64) -> Option<(&str, &GoldenEntry)> {
+        let path = self.by_ino.get(&ino)?;
+        let entry = self.by_path.get(path)?;
+        Some((path.as_str(), entry))
+    }
+
+    /// Direct children of `parent_path` (empty string for root).
+    /// Returns names without slashes. Stable slice — safe to iterate
+    /// concurrently with any number of other readers.
+    pub fn children(&self, parent_path: &str) -> &[String] {
+        self.by_parent
+            .get(parent_path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn len(&self) -> usize {
@@ -131,6 +193,11 @@ pub struct GoldenBlobCache {
 }
 
 impl GoldenBlobCache {
+    /// Empty sentinel, matches [`GoldenInodeCache::empty`].
+    pub fn empty() -> Self {
+        Self { blobs: HashMap::new() }
+    }
+
     pub fn fetch(&self, hash: &str) -> Option<Arc<Vec<u8>>> {
         self.blobs.get(hash).map(Arc::clone)
     }
@@ -204,12 +271,41 @@ pub fn load_golden(
         ));
     }
 
-    // Step 3: inode cache. Straight map from manifest entries.
-    let mut by_path: HashMap<String, GoldenEntry> = HashMap::with_capacity(manifest.entries.len());
-    for e in &manifest.entries {
+    // Step 3: inode cache. Assign stable inos eagerly and build all
+    // three indexes (by_path, by_ino, by_parent) in one pass.
+    //
+    // Ino assignment: GOLDEN_INO_BIT | (index + 1). The +1 avoids
+    // colliding with any conceptual "root golden" sentinel and keeps
+    // 0 reserved. Index-based so the scheme is reproducible from
+    // the manifest alone — tests that stash inos across load cycles
+    // get the same values.
+    let mut by_path: HashMap<String, GoldenEntry> =
+        HashMap::with_capacity(manifest.entries.len());
+    let mut by_ino: HashMap<u64, String> = HashMap::with_capacity(manifest.entries.len());
+    let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (idx, e) in manifest.entries.iter().enumerate() {
+        let ino = GOLDEN_INO_BIT | (idx as u64 + 1);
+
+        // Parent/child split: everything before the last '/' is the
+        // parent; everything after is the child name. Paths without
+        // a slash live directly under the root (empty parent string).
+        let (parent, child) = match e.path.rfind('/') {
+            Some(pos) => (&e.path[..pos], &e.path[pos + 1..]),
+            None => ("", e.path.as_str()),
+        };
+        if !child.is_empty() {
+            by_parent
+                .entry(parent.to_string())
+                .or_default()
+                .push(child.to_string());
+        }
+
+        by_ino.insert(ino, e.path.clone());
         by_path.insert(
             e.path.clone(),
             GoldenEntry {
+                ino,
                 hash: e.hash.clone(),
                 mode: e.mode,
                 uid: e.uid,
@@ -219,7 +315,7 @@ pub fn load_golden(
             },
         );
     }
-    let inodes = GoldenInodeCache { by_path };
+    let inodes = GoldenInodeCache { by_path, by_ino, by_parent };
 
     // Step 4: deduplicate hashes first, then par_iter the GETs. The
     // dedup-first shape means no lock contention during the fetch —
@@ -348,23 +444,110 @@ mod tests {
 
     #[test]
     fn inode_cache_get() {
-        let mut by_path = HashMap::new();
-        by_path.insert(
-            "usr/bin/bash".to_string(),
-            GoldenEntry {
-                hash: Some("abc".to_string()),
-                mode: libc::S_IFREG as u32 | 0o755,
-                uid: 0,
-                gid: 0,
-                size: 1000,
-                symlink_target: None,
-            },
-        );
-        let cache = GoldenInodeCache { by_path };
-        let hit = cache.get("usr/bin/bash").unwrap();
-        assert_eq!(hit.hash.as_deref(), Some("abc"));
-        assert_eq!(hit.size, 1000);
-        assert!(cache.get("missing").is_none());
+        // Exercises the loader's by_path / by_ino / by_parent
+        // construction via load_golden end-to-end. Uses hash=None
+        // entries so the bulk-fetch path short-circuits — the S3-
+        // hitting variant is covered by integration tests against
+        // a live minio.
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("m.bin");
+        let m = GoldenManifest {
+            schema_version: GOLDEN_SCHEMA_VERSION,
+            entries: vec![entry(
+                "usr/bin/bash",
+                None,
+                libc::S_IFREG as u32 | 0o755,
+            )],
+        };
+        std::fs::write(&manifest_path, bincode::serialize(&m).unwrap()).unwrap();
+        let cfg = GoldenConfig {
+            bucket: "unused".to_string(),
+            manifest: ManifestSource::LocalPath(manifest_path),
+        };
+        let client = S3Client::new(crate::s3::S3Config::default());
+        let (inodes, _) = load_golden(&cfg, &client).unwrap();
+
+        let hit = inodes.get("usr/bin/bash").unwrap();
+        assert!(is_golden_ino(hit.ino));
+        assert!(inodes.get("missing").is_none());
+
+        // by_ino reverse lookup lands on the same entry.
+        let (path, _entry) = inodes.get_by_ino(hit.ino).unwrap();
+        assert_eq!(path, "usr/bin/bash");
+    }
+
+    #[test]
+    fn inode_cache_children_indexed_by_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("m.bin");
+        let m = GoldenManifest {
+            schema_version: GOLDEN_SCHEMA_VERSION,
+            entries: vec![
+                entry("etc", None, libc::S_IFDIR as u32 | 0o755),
+                entry("etc/hosts", None, libc::S_IFREG as u32 | 0o644),
+                entry("etc/passwd", None, libc::S_IFREG as u32 | 0o644),
+                entry("usr", None, libc::S_IFDIR as u32 | 0o755),
+            ],
+        };
+        std::fs::write(&manifest_path, bincode::serialize(&m).unwrap()).unwrap();
+        let cfg = GoldenConfig {
+            bucket: "unused".to_string(),
+            manifest: ManifestSource::LocalPath(manifest_path),
+        };
+        let client = S3Client::new(crate::s3::S3Config::default());
+        let (inodes, _) = load_golden(&cfg, &client).unwrap();
+
+        // Root children: etc + usr
+        let mut root_children: Vec<&str> = inodes.children("").iter().map(|s| s.as_str()).collect();
+        root_children.sort();
+        assert_eq!(root_children, vec!["etc", "usr"]);
+
+        // etc/ children: hosts + passwd
+        let mut etc_children: Vec<&str> =
+            inodes.children("etc").iter().map(|s| s.as_str()).collect();
+        etc_children.sort();
+        assert_eq!(etc_children, vec!["hosts", "passwd"]);
+
+        // Dir with no children: empty slice.
+        assert!(inodes.children("usr").is_empty());
+    }
+
+    #[test]
+    fn golden_ino_has_top_bit_set() {
+        // Contract: every assigned golden ino has GOLDEN_INO_BIT. This
+        // is what downstream per-VM vs golden routing keys off of.
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("m.bin");
+        let m = GoldenManifest {
+            schema_version: GOLDEN_SCHEMA_VERSION,
+            entries: vec![
+                entry("a", None, libc::S_IFREG as u32),
+                entry("b", None, libc::S_IFREG as u32),
+                entry("c", None, libc::S_IFREG as u32),
+            ],
+        };
+        std::fs::write(&manifest_path, bincode::serialize(&m).unwrap()).unwrap();
+        let cfg = GoldenConfig {
+            bucket: "unused".to_string(),
+            manifest: ManifestSource::LocalPath(manifest_path),
+        };
+        let client = S3Client::new(crate::s3::S3Config::default());
+        let (inodes, _) = load_golden(&cfg, &client).unwrap();
+
+        for name in ["a", "b", "c"] {
+            let e = inodes.get(name).unwrap();
+            assert!(is_golden_ino(e.ino), "ino {:#x} should have top bit set", e.ino);
+            assert!((e.ino as i64) < 0, "signed-negative invariant");
+        }
+    }
+
+    #[test]
+    fn empty_cache_sentinel_misses_everything() {
+        let inodes = GoldenInodeCache::empty();
+        assert!(inodes.get("anything").is_none());
+        assert!(inodes.get_by_ino(GOLDEN_INO_BIT | 1).is_none());
+        assert!(inodes.children("any/parent").is_empty());
+        assert!(inodes.is_empty());
     }
 
     #[test]

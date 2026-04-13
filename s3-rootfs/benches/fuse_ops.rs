@@ -48,9 +48,11 @@ use fuse_backend_rs::abi::fuse_abi::CreateIn;
 use fuse_backend_rs::api::filesystem::{DirEntry, FileSystem};
 
 use harness::context::root_ctx;
-use harness::fixture::TestFixture;
+use harness::fixture::{GoldenSeed, TestFixture};
 use harness::s3::s3_available;
 use harness::zerocopy::{TestReader, TestWriter};
+
+use s3_rootfs::blob_cache::is_golden_ino;
 
 const ROOT: u64 = 1;
 
@@ -382,6 +384,105 @@ fn bench_hit_rate_realistic(c: &mut Criterion) {
     });
 }
 
+// ── golden_lookup ────────────────────────────────────────────────────────
+//
+// Tier-1-miss + tier-2-hit lookup against a seeded golden cache. This is
+// the hot path for any read of a golden-inherited file — every read starts
+// with a lookup that walks per-VM cache, misses, then lands in the golden
+// inode cache. Expected to be well under 5µs (per research/12 §5: "~500ns
+// extra per lookup" vs the tier-1-only path).
+fn bench_golden_lookup(c: &mut Criterion) {
+    if skip_if_no_s3(c, "golden_lookup") { return; }
+    // Fixture built once outside `iter` — golden tier-2 hits don't
+    // mutate per-VM cache state (research/12 §5: no mirroring), so
+    // every iteration is a fresh tier-1-miss + tier-2-hit against
+    // the SAME pre-built fixture. This isolates the property we're
+    // measuring (tier-2 lookup latency) from the fixture-build cost
+    // (~2–5 ms of S3 PUT + manifest serialize + load_golden).
+    let (fix, _tmp) = TestFixture::with_golden(vec![
+        GoldenSeed::file("bash", libc::S_IFREG as u32 | 0o755, vec![0u8; 128]),
+    ]);
+    let name = CString::new("bash").unwrap();
+    c.bench_function("golden_lookup", |b| {
+        b.iter(|| {
+            let bash = fix.fs.lookup(&root_ctx(), ROOT, &name).unwrap();
+            assert!(is_golden_ino(bash.inode));
+        });
+    });
+}
+
+// ── golden_read_1mb ──────────────────────────────────────────────────────
+//
+// Read a 1MB golden-inherited file after lookup. One `GoldenBlobCache::fetch`
+// returns an `Arc<Vec<u8>>`, the read slices into it — memcpy-bound, no S3.
+// Establishes the "RAM-resident blob read" baseline for future phases.
+fn bench_golden_read_1mb(c: &mut Criterion) {
+    if skip_if_no_s3(c, "golden_read_1mb") { return; }
+    // Fixture built once. Each iter issues a fresh read against a
+    // per-iter handle, so measured work = open + read + release; the
+    // read itself is blob_cache.fetch (one HashMap lookup + Arc
+    // clone + slice). For a purer "read-only" number future phases
+    // can split this into open_ro vs read proper.
+    let (fix, _tmp) = TestFixture::with_golden(vec![
+        GoldenSeed::file("big.bin", libc::S_IFREG as u32 | 0o644, vec![0xABu8; 1024 * 1024]),
+    ]);
+    let ino = fix
+        .fs
+        .lookup(&root_ctx(), ROOT, &CString::new("big.bin").unwrap())
+        .unwrap()
+        .inode;
+    assert!(is_golden_ino(ino));
+    c.bench_function("golden_read_1mb", |b| {
+        b.iter(|| {
+            let (handle, _, _) = fix
+                .fs
+                .open(&root_ctx(), ino, libc::O_RDONLY as u32, 0)
+                .unwrap();
+            let handle = handle.unwrap();
+            let mut w = TestWriter::new();
+            let n = fix
+                .fs
+                .read(&root_ctx(), ino, handle, &mut w, 1024 * 1024, 0, None, 0)
+                .unwrap();
+            assert_eq!(n, 1024 * 1024);
+            fix.fs.release(&root_ctx(), ino, 0, handle, false, false, None).ok();
+        });
+    });
+}
+
+// ── golden_open_materialize_1mb ──────────────────────────────────────────
+//
+// Open a 1MB golden file O_RDWR — triggers materialize-on-write, which
+// fetches the blob from GoldenBlobCache and clones it into the handle's
+// write buffer. Establishes the "RAM-bound copy on write-open" baseline.
+fn bench_golden_open_materialize_1mb(c: &mut Criterion) {
+    if skip_if_no_s3(c, "golden_open_materialize_1mb") { return; }
+    // Fixture built once; iter body measures open+release only.
+    // Release is intentionally clean (no write) so the dirty check
+    // skips the S3 PUT — we're measuring the open-preload (blob
+    // fetch + Arc → Vec clone for materialize-on-write), not the
+    // release-side flush.
+    let (fix, _tmp) = TestFixture::with_golden(vec![
+        GoldenSeed::file("mat.bin", libc::S_IFREG as u32 | 0o644, vec![0xCDu8; 1024 * 1024]),
+    ]);
+    let ino = fix
+        .fs
+        .lookup(&root_ctx(), ROOT, &CString::new("mat.bin").unwrap())
+        .unwrap()
+        .inode;
+    assert!(is_golden_ino(ino));
+    c.bench_function("golden_open_materialize_1mb", |b| {
+        b.iter(|| {
+            let (handle, _, _) = fix
+                .fs
+                .open(&root_ctx(), ino, libc::O_RDWR as u32, 0)
+                .unwrap();
+            let handle = handle.unwrap();
+            fix.fs.release(&root_ctx(), ino, 0, handle, false, false, None).ok();
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_lookup_cold,
@@ -391,5 +492,8 @@ criterion_group!(
     bench_read_16mb_cached,
     bench_write_release_1mb,
     bench_hit_rate_realistic,
+    bench_golden_lookup,
+    bench_golden_read_1mb,
+    bench_golden_open_materialize_1mb,
 );
 criterion_main!(benches);

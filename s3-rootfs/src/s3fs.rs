@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::debug;
@@ -18,6 +18,9 @@ use crate::debug;
 use fuse_backend_rs::abi::fuse_abi::{stat64, statvfs64, FsOptions, OpenOptions};
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem};
 
+use crate::blob_cache::{
+    is_golden_ino, load_golden, GoldenBlobCache, GoldenEntry, GoldenInodeCache,
+};
 use crate::config::FsConfig;
 use crate::inode_cache::{CachedInode, InodeCache};
 use crate::keys::{self, KeyMeta};
@@ -51,6 +54,19 @@ const WRITE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 /// refuse to write.
 const FS_TOTAL_BLOCKS: u64 = 1024 * 1024 * 1024; // 1G blocks × 4 KB = 4 TB
 
+/// Where an inode lives after per-VM shadowing is taken into
+/// account. Returned by [`S3Fs::resolve_inode`] and consumed by
+/// every golden-aware FUSE op. Clones out of the cache rather than
+/// holding borrows — the data is small and short-lived.
+enum InodeSource {
+    /// Per-VM inode: either originally assigned by per-VM
+    /// InodeCache, or a golden ino whose path has since been
+    /// materialized (per-VM cache shadows the golden entry).
+    PerVm { path: String, cached: CachedInode },
+    /// Golden inode with no per-VM shadow.
+    Golden { path: String, entry: GoldenEntry },
+}
+
 pub struct S3Fs {
     client: S3Client,
     cache: Mutex<InodeCache>,
@@ -60,6 +76,15 @@ pub struct S3Fs {
     read_cache_max: u64,
     /// Read-ahead chunk size for files larger than read_cache_max.
     read_ahead_size: usize,
+    /// Shared golden inode cache. When the golden layer is disabled,
+    /// this points at [`GoldenInodeCache::empty`] so every lookup
+    /// path can consult it unconditionally without a config branch.
+    /// `Arc` so downstream orchestrator code can share one cache
+    /// across every `S3Fs` on the host (research/12).
+    golden_inodes: Arc<GoldenInodeCache>,
+    /// Shared golden blob cache. Same sentinel pattern as
+    /// `golden_inodes` when the feature is disabled.
+    golden_blobs: Arc<GoldenBlobCache>,
 }
 
 struct HandleTable {
@@ -114,12 +139,36 @@ impl S3Fs {
     /// single knob use struct-update syntax, e.g.
     /// `S3Fs::new(FsConfig { read_cache_max: 8 * MB, ..Default::default() })`.
     pub fn new(cfg: FsConfig) -> Self {
+        let client = S3Client::new(cfg.s3.clone());
+
+        // Load the golden layer synchronously at construction if
+        // enabled. A failure here is an orchestrator-level invariant
+        // violation (manifest missing, bucket unreachable, schema
+        // mismatch) — panicking at init is correct: running with a
+        // partially-loaded golden layer would silently serve stale
+        // data. The sentinel branch for the disabled case is
+        // branchless at every downstream lookup.
+        let (golden_inodes, golden_blobs) = match &cfg.golden {
+            Some(golden_cfg) => load_golden(golden_cfg, &client).unwrap_or_else(|e| {
+                panic!(
+                    "S3Fs::new: failed to load golden layer from {:?}: {e}",
+                    golden_cfg.bucket
+                )
+            }),
+            None => (
+                Arc::new(GoldenInodeCache::empty()),
+                Arc::new(GoldenBlobCache::empty()),
+            ),
+        };
+
         S3Fs {
-            client: S3Client::new(cfg.s3),
+            client,
             cache: Mutex::new(InodeCache::new()),
             handles: Mutex::new(HandleTable::new()),
             read_cache_max: cfg.read_cache_max,
             read_ahead_size: cfg.read_ahead_size,
+            golden_inodes,
+            golden_blobs,
         }
     }
 
@@ -152,6 +201,85 @@ impl S3Fs {
         st
     }
 
+    /// Build a `stat64` from a [`GoldenEntry`]. Parallel to
+    /// [`stat_for`] for per-VM inodes; kept separate because the two
+    /// entry types have different field shapes and a shared helper
+    /// would need dynamic dispatch to pay for.
+    fn stat_for_golden(entry: &GoldenEntry) -> stat64 {
+        // SAFETY: same as `stat_for`.
+        let mut st: stat64 = unsafe { std::mem::zeroed() };
+        st.st_ino = entry.ino;
+        st.st_mode = entry.mode;
+        let is_dir = (entry.mode & libc::S_IFMT as u32) == libc::S_IFDIR as u32;
+        st.st_nlink = if is_dir { 2 } else { 1 };
+        st.st_size = entry.size as i64;
+        st.st_uid = entry.uid;
+        st.st_gid = entry.gid;
+        st.st_blksize = 4096;
+        st.st_blocks = ((entry.size + 511) / 512) as i64;
+        st
+    }
+
+    fn entry_for_golden(entry: &GoldenEntry) -> Entry {
+        Entry {
+            inode: entry.ino,
+            generation: 0,
+            attr: Self::stat_for_golden(entry),
+            attr_flags: 0,
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        }
+    }
+
+    /// Resolve a FUSE-supplied inode back to its source of truth,
+    /// taking per-VM shadowing into account.
+    ///
+    /// Crucial invariant (research/12 G1 pushback 2): if a golden
+    /// inode has been materialized (write + release populated the
+    /// per-VM cache at the same path), subsequent ops on that inode
+    /// must serve per-VM content, not stale golden. The kernel's
+    /// dentry cache may still hold the golden ino long after
+    /// materialization; this function makes that "zombie ino"
+    /// transparently correct — golden path → look in per-VM cache
+    /// first → fall through to golden only if per-VM doesn't shadow.
+    fn resolve_inode(&self, ino: u64) -> Option<InodeSource> {
+        if is_golden_ino(ino) {
+            // Golden ino: resolve to path via the (immutable) golden
+            // cache, then check for per-VM shadow before serving.
+            let path = {
+                let (path, _) = self.golden_inodes.get_by_ino(ino)?;
+                path.to_string()
+            };
+            let cache = self.cache.lock().unwrap();
+            if let Some(shadowed) = cache.get_by_path(&path) {
+                // Per-VM cache has a materialized entry at this path.
+                // The per-VM inode number is different from the golden
+                // one we were handed, but the content source is
+                // per-VM — we serve that and the caller's ino is just
+                // a handle into the shadowed entry.
+                return Some(InodeSource::PerVm {
+                    path,
+                    cached: shadowed.clone(),
+                });
+            }
+            drop(cache);
+            // No shadow — serve from the golden entry. We re-fetch
+            // the entry here rather than holding a reference across
+            // the lock drop above; GoldenEntry is small (no large
+            // owned allocations) and clone is cheap.
+            let gentry = self.golden_inodes.get(&path)?.clone();
+            Some(InodeSource::Golden { path, entry: gentry })
+        } else {
+            // Per-VM ino: existing path.
+            let cache = self.cache.lock().unwrap();
+            let (path, cached) = cache.get_by_ino(ino)?;
+            Some(InodeSource::PerVm {
+                path: path.to_string(),
+                cached: cached.clone(),
+            })
+        }
+    }
+
     /// Build the Entry response for a cached inode
     fn entry_for(ino: u64, cached: &CachedInode) -> Entry {
         Entry {
@@ -166,9 +294,19 @@ impl S3Fs {
 
     /// Resolve path from parent inode + child name
     fn child_path(&self, parent: u64, name: &str) -> io::Result<String> {
-        let cache = self.cache.lock().unwrap();
-        let (parent_path, _) = cache.get_by_ino(parent)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        // Resolve parent → parent_path. Golden-aware: a golden parent
+        // ino (bit 63 set) comes from the golden inode cache; all
+        // other inos come from the per-VM cache as before.
+        let parent_path = if is_golden_ino(parent) {
+            let (p, _) = self.golden_inodes.get_by_ino(parent)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            p.to_string()
+        } else {
+            let cache = self.cache.lock().unwrap();
+            let (p, _) = cache.get_by_ino(parent)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            p.to_string()
+        };
         if parent_path.is_empty() {
             Ok(name.to_string())
         } else {
@@ -202,10 +340,22 @@ impl S3Fs {
     /// target UUID if set. read / open / release need all three to pick
     /// between `keys::encode(path, meta)` and `storage::hardlink_key(uuid, meta)`.
     fn path_meta_hl_for_inode(&self, ino: u64) -> io::Result<(String, KeyMeta, Option<String>)> {
-        let cache = self.cache.lock().unwrap();
-        let (p, e) = cache.get_by_ino(ino)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-        Ok((p.to_string(), e.meta, e.hardlink_target.clone()))
+        // Golden-aware: a golden ino whose path is NOT yet
+        // shadowed resolves through the golden cache; a zombie
+        // golden ino (post-materialize) resolves through per-VM.
+        // Hardlink targets are a per-VM concept — golden entries
+        // never have them, so the Option<String> is always None
+        // on the Golden branch.
+        match self.resolve_inode(ino) {
+            Some(InodeSource::PerVm { path, cached }) => {
+                Ok((path, cached.meta, cached.hardlink_target))
+            }
+            Some(InodeSource::Golden { path, entry }) => {
+                let meta = KeyMeta::new(entry.mode, entry.uid, entry.gid);
+                Ok((path, meta, None))
+            }
+            None => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
     }
 
     /// Insert `(path, meta, size)` into the cache and build the FUSE
@@ -320,10 +470,21 @@ impl FileSystem for S3Fs {
         inode: Self::Inode,
         _handle: Option<Self::Handle>,
     ) -> io::Result<(stat64, Duration)> {
-        let cache = self.cache.lock().unwrap();
-        let (_, entry) = cache.get_by_ino(inode)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-        Ok((Self::stat_for(inode, entry), TTL))
+        match self.resolve_inode(inode) {
+            Some(InodeSource::PerVm { cached, .. }) => {
+                // For a materialized golden path, `inode` is the
+                // original (golden) ino the kernel cached. We still
+                // report the per-VM metadata at that ino — the
+                // FUSE contract doesn't require inode identity to
+                // match st_ino, and preserving the kernel's cached
+                // ino avoids invalidating dentries mid-session.
+                Ok((Self::stat_for(inode, &cached), TTL))
+            }
+            Some(InodeSource::Golden { entry, .. }) => {
+                Ok((Self::stat_for_golden(&entry), TTL))
+            }
+            None => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
     }
 
     fn lookup(
@@ -334,7 +495,11 @@ impl FileSystem for S3Fs {
     ) -> io::Result<Entry> {
         let path = self.resolve_child(parent, name)?;
 
-        // Check cache first — readdir or a previous lookup may have warmed it
+        // Tier 1: per-VM cache. Hits first because single-writer
+        // ownership of vm-<id> means a per-VM entry at a path
+        // shadows any golden entry at the same path. Negative hits
+        // end the lookup — they cover both "probed and missed" and
+        // "unlinked a golden-inherited path" (research/12 §7).
         {
             let mut cache = self.cache.lock().unwrap();
             if let Some(entry) = cache.get(&path) {
@@ -347,7 +512,20 @@ impl FileSystem for S3Fs {
             }
         }
 
-        // Cache miss — probe S3 with LIST, pre-fill neighbors
+        // Tier 2: golden inode cache. Lock-free read into an
+        // Arc<immutable> — empty sentinel when golden is disabled,
+        // so the branch is free in that case. We do NOT insert the
+        // returned entry into the per-VM cache (research/12 §5):
+        // mirroring would grow the per-VM cache unboundedly on
+        // scans like `find /`; walking both tiers on every lookup
+        // costs a second HashMap probe and keeps the delta-only
+        // semantic honest.
+        if let Some(gentry) = self.golden_inodes.get(&path) {
+            debug!("lookup GOLDEN HIT: {} ino={:#x}", path, gentry.ino);
+            return Ok(Self::entry_for_golden(gentry));
+        }
+
+        // Tier 3: S3 LIST probe against the per-VM bucket.
         debug!("lookup CACHE MISS: {}", path);
         let ino = self.probe_and_cache(&path)?;
 
@@ -367,11 +545,14 @@ impl FileSystem for S3Fs {
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
     ) -> io::Result<()> {
-        let parent_path = {
-            let cache = self.cache.lock().unwrap();
-            let (p, _) = cache.get_by_ino(inode)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-            p.to_string()
+        // Resolve parent_path via source-aware helper: per-VM and
+        // golden directories both have readdir children, and both
+        // may have siblings in the other tier (e.g. VM wrote a file
+        // inside a golden-inherited directory).
+        let parent_path = match self.resolve_inode(inode) {
+            Some(InodeSource::PerVm { path, .. }) => path,
+            Some(InodeSource::Golden { path, .. }) => path,
+            None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
         };
 
         // LIST all children: prefix = "parent_path/" (no \x01, just path prefix)
@@ -388,23 +569,26 @@ impl FileSystem for S3Fs {
         debug!("  readdir got {} entries for {}", result.objects.len(), list_prefix);
 
         let mut idx: u64 = 0;
+        // Track which child names we've emitted so golden entries
+        // shadowed by per-VM deltas aren't duplicated in the listing.
+        let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut cache = self.cache.lock().unwrap();
 
+        // Tier 1: per-VM children (existing behavior).
         for obj in &result.objects {
             if let Some((decoded_path, meta)) = keys::decode(&obj.key) {
-                // Only include direct children (one level deep)
                 let child_name = decoded_path.strip_prefix(&list_prefix)
                     .unwrap_or(decoded_path);
                 if child_name.is_empty() || child_name.contains('/') {
                     continue; // skip self or grandchildren
                 }
-                // Hide storage-layer reserved names from guest listings
                 if storage::is_reserved_name(child_name) {
                     continue;
                 }
 
                 // Populate cache
                 let ino = cache.insert_from_key(decoded_path, meta, obj.size);
+                emitted.insert(child_name.to_string());
 
                 if idx >= offset {
                     let d_type = match meta.file_type() {
@@ -428,19 +612,73 @@ impl FileSystem for S3Fs {
             }
         }
 
+        // Tier 2: golden children not shadowed by per-VM delta and
+        // not hidden by a sticky negative. Walk the pre-built
+        // by_parent index — lock-free read from the Arc.
+        for child_name in self.golden_inodes.children(&parent_path) {
+            if emitted.contains(child_name) {
+                continue; // already emitted from per-VM
+            }
+            // Build the full path to consult the negative cache.
+            let full_path = if parent_path.is_empty() {
+                child_name.clone()
+            } else {
+                format!("{}/{}", parent_path, child_name)
+            };
+            if cache.is_negative(&full_path) {
+                continue; // unlinked golden path (research/12 §7)
+            }
+            let gentry = match self.golden_inodes.get(&full_path) {
+                Some(e) => e,
+                None => continue, // by_parent drifted from by_path? skip defensively
+            };
+
+            if idx >= offset {
+                let d_type = match gentry.mode & libc::S_IFMT as u32 {
+                    t if t == libc::S_IFDIR as u32 => libc::DT_DIR,
+                    t if t == libc::S_IFLNK as u32 => libc::DT_LNK,
+                    _ => libc::DT_REG,
+                };
+                match add_entry(DirEntry {
+                    ino: gentry.ino,
+                    offset: idx + 1,
+                    type_: d_type as u32,
+                    name: child_name.as_bytes(),
+                }) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            idx += 1;
+        }
+
         Ok(())
     }
 
     fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
-        // Check cache for symlink target
-        {
-            let cache = self.cache.lock().unwrap();
-            if let Some((path, entry)) = cache.get_by_ino(inode) {
-                if let Some(ref target) = entry.symlink_target {
-                    debug!("readlink CACHE HIT: {} -> {}", path, target);
-                    return Ok(target.as_bytes().to_vec());
-                }
+        // Golden-aware: symlink targets for golden inodes live
+        // inline on the manifest entry, no S3 fetch needed. Per-VM
+        // shadow (if any) takes precedence via resolve_inode.
+        match self.resolve_inode(inode) {
+            Some(InodeSource::Golden { path, entry }) => {
+                return match entry.symlink_target {
+                    Some(target) => {
+                        debug!("readlink GOLDEN: {} -> {}", path, target);
+                        Ok(target.into_bytes())
+                    }
+                    None => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                };
             }
+            Some(InodeSource::PerVm { path, cached }) => {
+                if let Some(target) = cached.symlink_target {
+                    debug!("readlink CACHE HIT: {} -> {}", path, target);
+                    return Ok(target.into_bytes());
+                }
+                // Fall through to the S3 fetch below with the
+                // resolved per-VM (path, meta).
+            }
+            None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
         }
 
         // Cache miss — fetch symlink target from S3 (stored as object body)
@@ -481,7 +719,10 @@ impl FileSystem for S3Fs {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        // Try serving from the handle's read cache
+        // Try serving from the handle's read cache first — this
+        // covers both the per-VM whole-file cache and a golden
+        // materialize-on-write handle whose buffer was preloaded
+        // from GoldenBlobCache in open().
         {
             let handles = self.handles.lock().unwrap();
             if let Some(entry) = handles.by_handle.get(&handle) {
@@ -499,13 +740,50 @@ impl FileSystem for S3Fs {
             }
         }
 
-        let (path, meta, file_size, hl_uuid) = {
-            let cache = self.cache.lock().unwrap();
-            let (p, e) = cache.get_by_ino(inode)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-            // Not using path_meta_hl_for_inode here because we also need
-            // the size, which that helper doesn't expose.
-            (p.to_string(), e.meta, e.size, e.hardlink_target.clone())
+        // Resolve the inode with per-VM-shadow awareness. A golden
+        // ino whose path has been materialized will come back as
+        // PerVm here, so the zombie-ino case is handled implicitly
+        // — the per-VM branch below uses the shadowed entry's data,
+        // not stale golden bytes.
+        let source = self.resolve_inode(inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        // Golden path with no shadow: serve entirely from RAM via
+        // the blob cache. One HashMap lookup + Arc clone + slice
+        // write. No S3, no read-ahead, no read_cache_max branch.
+        let (path, meta, file_size, hl_uuid) = match source {
+            InodeSource::Golden { path, entry: gentry } => {
+                let Some(hash) = gentry.hash.as_ref() else {
+                    // Non-regular golden inode (dir or symlink). POSIX
+                    // doesn't define `read` on these; return 0 bytes
+                    // rather than EIO for robustness against bad
+                    // callers.
+                    debug!("golden read on non-blob inode ino={:#x} path={}", inode, path);
+                    return Ok(0);
+                };
+                let bytes = self.golden_blobs.fetch(hash).ok_or_else(|| {
+                    // Per research/12 §6, a golden-blob miss is an
+                    // invariant violation (manifest out of sync with
+                    // blob pool), not a capacity event. Fail loud.
+                    log!(
+                        "S3Fs: golden blob miss for hash={} path={} — manifest/pool out of sync",
+                        hash,
+                        path
+                    );
+                    io::Error::from_raw_os_error(libc::EIO)
+                })?;
+
+                let start = (offset as usize).min(bytes.len());
+                let end = (offset as usize + size as usize).min(bytes.len());
+                if start >= bytes.len() {
+                    return Ok(0);
+                }
+                return w.write(&bytes[start..end])
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+            }
+            InodeSource::PerVm { path, cached } => {
+                (path, cached.meta, cached.size, cached.hardlink_target.clone())
+            }
         };
 
         // Resolve data key — follows hardlink redirect if present
@@ -625,6 +903,46 @@ impl FileSystem for S3Fs {
         let handle = handles.open(inode, writing);
 
         let truncating = (flags & libc::O_TRUNC as u32) != 0;
+
+        // Materialize-on-write: a golden-inherited file opened for
+        // write needs its current content in the handle buffer
+        // before guest writes can diverge it. We preload from the
+        // shared GoldenBlobCache (one HashMap lookup + Arc clone +
+        // Vec copy — no S3). `release` later writes the buffer to
+        // the per-VM bucket at the visible path; from that moment
+        // on, the per-VM cache shadows the golden entry and
+        // resolve_inode routes subsequent reads per-VM.
+        //
+        // A golden ino whose path is already materialized would
+        // come back from resolve_inode as PerVm and fall through to
+        // the normal per-VM preload path below — same code handles
+        // both zombie golden inos and freshly-opened per-VM inos.
+        if writing && !truncating && is_golden_ino(inode) {
+            if let Some(InodeSource::Golden { path, entry }) = self.resolve_inode(inode) {
+                if let Some(ref hash) = entry.hash {
+                    if let Some(bytes) = self.golden_blobs.fetch(hash) {
+                        log!("golden open-preload {} ({} bytes, materialize-on-write)", path, bytes.len());
+                        // Own a Vec — the handle buffer is writable
+                        // and will diverge from the Arc-shared bytes
+                        // imminently. Cheap one-shot copy.
+                        if let Some(h) = handles.get_mut(handle) {
+                            h.data = Some((*bytes).clone());
+                        }
+                    } else {
+                        log!(
+                            "S3Fs: golden open-preload blob miss hash={} path={} — invariant violation",
+                            hash,
+                            path
+                        );
+                    }
+                }
+                // Golden preload is complete (or deliberately skipped
+                // for non-blob entries); don't fall through to the
+                // per-VM preload path.
+                return Ok((Some(handle), OpenOptions::empty(), None));
+            }
+        }
+
         if writing && !truncating {
             // Missing-inode is tolerated here: if the cache doesn't know
             // this inode (it should, but defensive), we just skip the
@@ -809,6 +1127,30 @@ impl FileSystem for S3Fs {
                         };
                         self.client.put(&key, data)
                             .io_err(&format!("release PUT {}", path))?;
+
+                        // After a successful PUT, insert (or update)
+                        // the per-VM cache entry for this path with
+                        // its new size. Two wins:
+                        //
+                        // (a) Materialize-on-write semantics (golden
+                        //     path → write → release) require per-VM
+                        //     to shadow the golden entry so future
+                        //     lookups / reads see the fresh content.
+                        //     Without this insert, the golden ino
+                        //     stays "live" as far as resolve_inode is
+                        //     concerned and post-release reads return
+                        //     pre-materialize bytes.
+                        //
+                        // (b) Ordinary per-VM writes benefit too: the
+                        //     next lookup hits tier 1 instead of
+                        //     doing a fresh LIST probe to update size.
+                        //
+                        // Hardlink path uses the ref body's size (41
+                        // bytes) — unchanged from pre-G1 behavior.
+                        if hl_uuid.is_none() {
+                            let mut cache = self.cache.lock().unwrap();
+                            cache.insert_from_key(&path, meta, data.len() as u64);
+                        }
                     }
                 }
             }
@@ -845,22 +1187,45 @@ impl FileSystem for S3Fs {
     ) -> io::Result<()> {
         let path = self.resolve_child(parent, name)?;
 
-        // Need the meta to build the S3 key
-        let meta = {
+        // Need the meta to build the S3 key. Also captures whether
+        // per-VM owns this path — if not, we may be unlinking a
+        // golden-inherited path (no S3 DELETE needed).
+        let per_vm_meta = {
             let mut cache = self.cache.lock().unwrap();
             cache.get(&path).map(|e| e.meta)
         };
 
-        if let Some(meta) = meta {
-            let key = keys::encode(&path, meta);
-            log!("S3 DELETE unlink {}", path);
-            self.client.delete(&key)
-                .io_err(&format!("unlink DELETE {}", path))?;
-        }
+        match per_vm_meta {
+            Some(meta) => {
+                // Per-VM owns this path: DELETE from vm-<id>. Also
+                // insert a sticky negative — if the same path also
+                // exists in golden, the negative keeps it hidden on
+                // future lookups. Pure per-VM files pay one extra
+                // HashSet insert; golden-materialized-then-deleted
+                // files are covered.
+                let key = keys::encode(&path, meta);
+                log!("S3 DELETE unlink {}", path);
+                self.client.delete(&key)
+                    .io_err(&format!("unlink DELETE {}", path))?;
 
-        let mut cache = self.cache.lock().unwrap();
-        cache.remove(&path);
-        Ok(())
+                let mut cache = self.cache.lock().unwrap();
+                cache.remove(&path);
+                cache.insert_negative(&path);
+                Ok(())
+            }
+            None if self.golden_inodes.get(&path).is_some() => {
+                // Golden-inherited path with no per-VM shadow: no
+                // S3 DELETE (there's nothing in vm-<id> to remove),
+                // just insert a sticky negative so future lookups
+                // return ENOENT instead of the golden entry. The
+                // negative lives for the VM's lifetime; no TTL.
+                debug!("unlink GOLDEN {} (negative-cache only)", path);
+                let mut cache = self.cache.lock().unwrap();
+                cache.insert_negative(&path);
+                Ok(())
+            }
+            None => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
     }
 
     fn rename(

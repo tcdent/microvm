@@ -4,7 +4,10 @@ use fuse_backend_rs::abi::fuse_abi::FsOptions;
 use fuse_backend_rs::api::filesystem::FileSystem;
 
 use s3_rootfs::config::FsConfig;
-use s3_rootfs::{S3Fs, S3Client, KeyMeta, encode_key};
+use s3_rootfs::{
+    GoldenConfig, GoldenManifest, GoldenManifestEntry, KeyMeta, ManifestSource, S3Client, S3Fs,
+    encode_key, GOLDEN_SCHEMA_VERSION,
+};
 
 use super::s3::test_config;
 
@@ -22,6 +25,45 @@ pub struct TestFixture {
     /// needs, so tests that simulate a cold session via attach_to would
     /// break intermittently depending on drop order.
     owns_prefix: bool,
+}
+
+/// Plain description of one manifest entry, used by `with_golden`.
+/// Mirrors `GoldenManifestEntry` but lets tests construct entries
+/// without depending on the internal hash/ino wiring.
+pub struct GoldenSeed {
+    pub path: String,
+    /// Raw bytes to seed as `golden/<hash>`. Empty slice for dirs
+    /// and symlinks (they don't have blob content).
+    pub content: Vec<u8>,
+    pub mode: u32,
+    pub symlink_target: Option<String>,
+}
+
+impl GoldenSeed {
+    pub fn file(path: &str, mode: u32, content: &[u8]) -> Self {
+        Self {
+            path: path.to_string(),
+            content: content.to_vec(),
+            mode,
+            symlink_target: None,
+        }
+    }
+    pub fn dir(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            content: Vec::new(),
+            mode: libc::S_IFDIR as u32 | 0o755,
+            symlink_target: None,
+        }
+    }
+    pub fn symlink(path: &str, target: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            content: Vec::new(),
+            mode: libc::S_IFLNK as u32 | 0o777,
+            symlink_target: Some(target.to_string()),
+        }
+    }
 }
 
 impl TestFixture {
@@ -42,6 +84,87 @@ impl TestFixture {
         let client = S3Client::new(verify_config);
 
         Self { fs, client, prefix, owns_prefix: true }
+    }
+
+    /// Build a `TestFixture` with the golden layer populated from
+    /// the given seeds. Blobs are stored at per-test-unique keys
+    /// (`<prefix>/golden_blob_<i>`) to avoid cross-test collisions
+    /// within the single shared test bucket; the manifest lives on
+    /// the local filesystem (ManifestSource::LocalPath), which
+    /// sidesteps needing a separate S3 bucket for golden objects.
+    ///
+    /// Returned fixture's inode cache is already populated with the
+    /// golden layer; calling `lookup` on a seed path hits tier 2.
+    pub fn with_golden(seeds: Vec<GoldenSeed>) -> (Self, tempfile::TempDir) {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = format!("t_{}_{}", ts, id);
+
+        let config = test_config();
+        let bucket_name = config.bucket.clone();
+        let client = S3Client::new(config.clone());
+
+        // Seed each file blob at a per-test-unique hash key. The
+        // "hash" we record in the manifest entries is the full S3
+        // key minus the bucket, which `S3Client::get_from` then
+        // fetches verbatim.
+        let mut entries = Vec::new();
+        for (i, seed) in seeds.iter().enumerate() {
+            let hash = if seed.content.is_empty() {
+                None
+            } else {
+                let key = format!("{prefix}/golden_blob_{i}");
+                client
+                    .put(&key, &seed.content)
+                    .expect("seed_golden PUT failed");
+                Some(key)
+            };
+
+            entries.push(GoldenManifestEntry {
+                path: seed.path.clone(),
+                hash,
+                mode: seed.mode,
+                uid: 0,
+                gid: 0,
+                size: seed.content.len() as u64,
+                symlink_target: seed.symlink_target.clone(),
+            });
+        }
+
+        // Serialize the manifest to a tempfile — LocalPath source
+        // so we don't need a separate golden bucket for tests.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("manifest.bin");
+        let manifest = GoldenManifest {
+            schema_version: GOLDEN_SCHEMA_VERSION,
+            entries,
+        };
+        std::fs::write(&manifest_path, bincode::serialize(&manifest).unwrap())
+            .expect("write manifest");
+
+        let golden_cfg = GoldenConfig {
+            bucket: bucket_name,
+            manifest: ManifestSource::LocalPath(manifest_path),
+        };
+
+        let fs = S3Fs::new(FsConfig {
+            s3: config,
+            golden: Some(golden_cfg),
+            ..Default::default()
+        });
+        fs.init(FsOptions::empty()).expect("S3Fs init failed");
+
+        let verify = S3Client::new(test_config());
+        let fixture = Self {
+            fs,
+            client: verify,
+            prefix,
+            owns_prefix: true,
+        };
+        (fixture, tmp)
     }
 
     /// Build a second fixture pointing at the same bucket + prefix as an

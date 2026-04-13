@@ -73,9 +73,7 @@ pub enum ManifestSource {
 ///
 /// There is no `BlobCacheConfig`. The golden blob cache (research/12)
 /// is either populated in full at orchestrator init or not active —
-/// nothing to tune at the per-VM `FsConfig` level. When Phase 2 lands,
-/// `S3Fs::new` will take an optional `Arc<GoldenBlobCache>` alongside
-/// `FsConfig`, not an embedded config struct.
+/// nothing to tune at the per-VM `FsConfig` level.
 #[derive(Debug, Clone)]
 pub struct FsConfig {
     /// S3 endpoint, bucket, credentials, timeouts.
@@ -91,6 +89,14 @@ pub struct FsConfig {
     /// `read_cache_max`. A single GET fetches up to this many bytes;
     /// subsequent reads within the window hit memory.
     pub read_ahead_size: usize,
+
+    /// Golden filesystem layer (research/12). `None` means single-
+    /// bucket behavior: every lookup/read goes through the per-VM
+    /// bucket. `Some` means `S3Fs::new` will load the golden inode
+    /// and blob caches synchronously at construction time (blocking
+    /// until both are populated), and every FUSE op will consult
+    /// them alongside the per-VM state.
+    pub golden: Option<GoldenConfig>,
 }
 
 impl Default for FsConfig {
@@ -99,6 +105,7 @@ impl Default for FsConfig {
             s3: S3Config::default(),
             read_cache_max: 16 * 1024 * 1024,
             read_ahead_size: 16 * 1024 * 1024,
+            golden: None,
         }
     }
 }
