@@ -19,9 +19,11 @@ pub mod blob_cache;
 pub mod config;
 pub mod inode_cache;
 pub mod keys;
+pub mod read_cache;
 mod s3;
 mod s3fs;
 pub mod storage;
+pub mod write_pool;
 
 pub use blob_cache::{
     GoldenBlobCache, GoldenEntry, GoldenInodeCache, GoldenManifest, GoldenManifestEntry,

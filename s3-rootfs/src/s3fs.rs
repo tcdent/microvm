@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::debug;
@@ -24,8 +25,10 @@ use crate::blob_cache::{
 use crate::config::FsConfig;
 use crate::inode_cache::{CachedInode, InodeCache};
 use crate::keys::{self, KeyMeta};
+use crate::read_cache::{self, ReadCache};
 use crate::s3::{S3Client, S3ResultExt};
 use crate::storage::{self, ObjectBody};
+use crate::write_pool::{WritePool, WritePoolConfig};
 use crate::log;
 
 /// Cache statistics for observability and testing.
@@ -53,6 +56,25 @@ const WRITE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 /// refuse to write.
 const FS_TOTAL_BLOCKS: u64 = 1024 * 1024 * 1024; // 1G blocks × 4 KB = 4 TB
 
+/// Write `data[offset..offset+size]` into the FUSE zero-copy
+/// writer, clamping to the buffer length. Shared between every
+/// cache-hit branch of [`S3Fs::resolve_read`] so offset/size math
+/// doesn't get duplicated (or subtly diverged) across four sites.
+fn serve_slice(
+    w: &mut dyn fuse_backend_rs::api::filesystem::ZeroCopyWriter,
+    data: &[u8],
+    offset: u64,
+    size: u32,
+) -> io::Result<usize> {
+    let off = offset as usize;
+    if off >= data.len() {
+        return Ok(0);
+    }
+    let end = off.saturating_add(size as usize).min(data.len());
+    w.write(&data[off..end])
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
 /// Where an inode lives after per-VM shadowing is taken into
 /// account. Returned by [`S3Fs::resolve_inode`] and consumed by
 /// every golden-aware FUSE op. Clones out of the cache rather than
@@ -67,14 +89,28 @@ enum InodeSource {
 }
 
 pub struct S3Fs {
-    client: S3Client,
+    /// Per-VM bucket S3 client. `Arc` so the write worker pool can
+    /// hold its own reference — the client is `Sync` and every worker
+    /// shares the underlying `ureq::Agent` pool.
+    client: Arc<S3Client>,
     cache: Mutex<InodeCache>,
     handles: Mutex<HandleTable>,
-    /// Files at or below this size are fully cached on first read.
-    /// Set to 0 to disable read caching.
-    read_cache_max: u64,
-    /// Read-ahead chunk size for files larger than read_cache_max.
+    /// Cross-handle read cache (research/13 §3). Keyed by visible
+    /// path; holds `Arc<Vec<u8>>` values. Replaces the old per-handle
+    /// `data`/`read_cached` buffer for small/medium files.
+    read_cache: ReadCache,
+    /// Read-ahead chunk size for files above the per-file cache
+    /// threshold. Streaming buffer lives on the handle.
     read_ahead_size: usize,
+    /// Deferred-write queue + worker pool (research/13 §2).
+    /// `release()` enqueues dirty buffers; workers drain to S3 in
+    /// the background. `fsync()` blocks until the named path drains.
+    write_pool: Arc<WritePool>,
+    /// Handles for the spawned worker threads. Kept so `Drop` can
+    /// join them cleanly on shutdown. Wrapped in `Mutex<Option<_>>`
+    /// because `Drop` needs to take them out by value; `Option::take`
+    /// gives us that without making the field itself `mut`.
+    write_threads: Mutex<Option<Vec<JoinHandle<()>>>>,
     /// Shared golden inode cache. When the golden layer is disabled,
     /// this points at [`GoldenInodeCache::empty`] so every lookup
     /// path can consult it unconditionally without a config branch.
@@ -94,10 +130,12 @@ struct HandleTable {
 struct HandleEntry {
     inode: u64,
     dirty: bool,
+    /// Write buffer OR materialize-on-write preload for golden.
+    /// For pure read handles, stays `None` — reads go through the
+    /// cross-handle [`ReadCache`] and inflight map now.
     data: Option<Vec<u8>>,
-    read_cached: bool,
-    /// Read-ahead buffer for large files (> read_cache_max).
-    /// Holds a chunk of file data starting at read_ahead_offset.
+    /// Read-ahead buffer for files above the per-file cache threshold.
+    /// Handle-local streaming buffer; freed when the handle closes.
     read_ahead: Option<Vec<u8>>,
     read_ahead_offset: u64,
 }
@@ -116,7 +154,6 @@ impl HandleTable {
             read_ahead: None,
             read_ahead_offset: 0,
             data: if writing { Some(Vec::new()) } else { None },
-            read_cached: false,
         });
         handle
     }
@@ -138,7 +175,7 @@ impl S3Fs {
     /// single knob use struct-update syntax, e.g.
     /// `S3Fs::new(FsConfig { read_cache_max: 8 * MB, ..Default::default() })`.
     pub fn new(cfg: FsConfig) -> Self {
-        let client = S3Client::new(cfg.s3.clone());
+        let client = Arc::new(S3Client::new(cfg.s3.clone()));
 
         // Load the golden layer synchronously at construction if
         // enabled. A failure here is an orchestrator-level invariant
@@ -160,12 +197,25 @@ impl S3Fs {
             ),
         };
 
+        // Spawn the deferred-write worker pool. Workers hold their
+        // own Arc<S3Client> clones of the one above — same pool,
+        // concurrent PUTs. Must start BEFORE returning so the
+        // `write_threads` field is populated by the time any FUSE
+        // op can call `release`.
+        let (write_pool, write_threads) = WritePool::start(WritePoolConfig {
+            workers: cfg.write_workers,
+            budget_bytes: cfg.write_inflight_budget,
+            client: Arc::clone(&client),
+        });
+
         S3Fs {
             client,
             cache: Mutex::new(InodeCache::new()),
             handles: Mutex::new(HandleTable::new()),
-            read_cache_max: cfg.read_cache_max,
+            read_cache: ReadCache::new(cfg.read_cache_budget),
             read_ahead_size: cfg.read_ahead_size,
+            write_pool,
+            write_threads: Mutex::new(Some(write_threads)),
             golden_inodes,
             golden_blobs,
         }
@@ -181,6 +231,39 @@ impl S3Fs {
             misses: cache.misses,
         }
     }
+
+    /// Block until all deferred writes have drained to S3. Call
+    /// before dropping to avoid data loss on abandoned writes. Also
+    /// usable as a `syncfs()` primitive.
+    pub fn sync_all(&self) {
+        self.write_pool.wait_for_all();
+    }
+}
+
+impl Drop for S3Fs {
+    /// Drain-then-shutdown: wait for every pending write to flush
+    /// to S3 before joining worker threads. This is the clean-exit
+    /// path; callers that need a fast abort (unit tests with broken
+    /// S3, process receiving SIGKILL) don't reach here at all — the
+    /// "process crash = data loss" tradeoff from research/13 §2.4
+    /// applies to those cases.
+    ///
+    /// If S3 is persistently unavailable, `sync_all` blocks until
+    /// either S3 recovers or the process is killed externally.
+    /// That's correct — Drop's contract is "make durable before
+    /// giving up references"; opting out belongs at a higher layer.
+    fn drop(&mut self) {
+        self.write_pool.wait_for_all();
+        self.write_pool.shutdown();
+        if let Some(threads) = self.write_threads.lock().unwrap().take() {
+            for h in threads {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+impl S3Fs {
 
     fn stat_for(ino: u64, entry: &CachedInode) -> stat64 {
         // SAFETY: stat64 is a C struct of integers + padding. Zeroing is
@@ -354,6 +437,183 @@ impl S3Fs {
             }
             None => Err(io::Error::from_raw_os_error(libc::ENOENT)),
         }
+    }
+
+    /// Single source-branching method for reads.
+    ///
+    /// All lookup order for a read lives in one place, so every
+    /// level of the cache stack is visible at one call site:
+    ///
+    /// 1. Handle-local buffer (write-your-writes + golden RDWR
+    ///    materialize-on-write preload).
+    /// 2. Handle-local read-ahead chunk (sequential-read stream
+    ///    buffer, large files only).
+    /// 3. Inflight write map (cross-handle read-your-writes — the
+    ///    guest's `release` buffer still hasn't drained to S3).
+    /// 4. Cross-handle [`ReadCache`] — LRU-promoted on hit.
+    /// 5. [`GoldenInodeCache`]/[`GoldenBlobCache`] for golden inodes.
+    /// 6. S3 GET. Small files populate the cross-handle read cache;
+    ///    large files stream via the handle-local read-ahead buffer.
+    ///
+    /// Returns the byte count written to `w`, FUSE-style. `ENOENT`
+    /// if the inode isn't known to any source.
+    fn resolve_read(
+        &self,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        size: u32,
+        w: &mut dyn fuse_backend_rs::api::filesystem::ZeroCopyWriter,
+    ) -> io::Result<usize> {
+        // ── 1. Handle-local buffer ──────────────────────────────
+        //
+        // Covers (a) read-your-writes within the same handle
+        // (the guest is filling a write buffer and reads it back
+        // before release) and (b) golden RDWR materialize-on-write
+        // preload (`open()` filled `entry.data` with the golden
+        // bytes so subsequent writes can diverge from them).
+        //
+        // ── 2. Handle-local read-ahead ─────────────────────────
+        //
+        // Sequential-read streaming buffer for large files. The
+        // check is `offset` inside the previously-fetched chunk;
+        // satisfies contiguous reads from one GET's worth of bytes.
+        {
+            let handles = self.handles.lock().unwrap();
+            if let Some(entry) = handles.by_handle.get(&handle) {
+                if let Some(ref data) = entry.data {
+                    if !data.is_empty() {
+                        return serve_slice(w, data, offset, size);
+                    }
+                }
+                if let Some(ref ra) = entry.read_ahead {
+                    let ra_start = entry.read_ahead_offset;
+                    let ra_end = ra_start + ra.len() as u64;
+                    if offset >= ra_start && offset + size as u64 <= ra_end {
+                        let buf_offset = (offset - ra_start) as usize;
+                        return serve_slice(w, ra, buf_offset as u64, size);
+                    }
+                }
+            }
+        }
+
+        // Resolve inode (shadow-aware: a golden ino post-
+        // materialize comes back as PerVm).
+        let source = self.resolve_inode(inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        // ── 5. Golden branch ─────────────────────────────────────
+        //
+        // Serve entirely from RAM via the blob cache. One HashMap
+        // lookup + Arc clone + slice. No S3.
+        let (path, meta, file_size, hl_uuid) = match source {
+            InodeSource::Golden { path, entry: gentry } => {
+                let Some(hash) = gentry.hash.as_ref() else {
+                    // Non-regular golden inode (dir / symlink);
+                    // POSIX read on these is undefined — 0 bytes.
+                    debug!("golden read on non-blob inode ino={:#x} path={}", inode, path);
+                    return Ok(0);
+                };
+                let bytes = self.golden_blobs.fetch(hash).ok_or_else(|| {
+                    log!(
+                        "S3Fs: golden blob miss for hash={} path={} — manifest/pool out of sync",
+                        hash, path
+                    );
+                    io::Error::from_raw_os_error(libc::EIO)
+                })?;
+                return serve_slice(w, &bytes, offset, size);
+            }
+            InodeSource::PerVm { path, cached } => {
+                (path, cached.meta, cached.size, cached.hardlink_target.clone())
+            }
+        };
+
+        // ── 3. Inflight write map (cross-handle RYW) ─────────────
+        //
+        // A pending deferred write wins over anything cached or on
+        // S3 — the bytes haven't drained yet, and a naive S3 GET
+        // would return stale data (or ENOENT on fresh creates).
+        if let Some(bytes) = self.write_pool.get(&path) {
+            return serve_slice(w, &bytes, offset, size);
+        }
+
+        // ── 4. Cross-handle read cache ───────────────────────────
+        //
+        // Populated by prior reads of this path. LRU-promoted on hit.
+        if let Some(bytes) = self.read_cache.fetch(&path) {
+            return serve_slice(w, &bytes, offset, size);
+        }
+
+        // ── 6. S3 fetch ──────────────────────────────────────────
+        //
+        // Branch on file size: small enough to cache whole → single
+        // GET + read_cache populate; too large → read-ahead chunk +
+        // per-handle streaming buffer.
+        let key = match hl_uuid {
+            Some(ref uuid) => storage::hardlink_key(uuid, meta),
+            None => keys::encode(&path, meta),
+        };
+        let cache_threshold =
+            read_cache::per_file_threshold(self.read_cache.budget_bytes()) as u64;
+
+        if file_size <= cache_threshold {
+            log!("S3 GET read-cache {} ({} bytes, full file)", path, file_size);
+            let raw = self.client.get(&key)
+                .io_err(&format!("read GET {}", path))?;
+
+            // Hardlink detection on cold reads via the visible key:
+            // if the body starts with "hardlink:<uuid>", refetch
+            // from `.hardlinks/<uuid>` and record the UUID so future
+            // reads skip the double-hop.
+            let data = if hl_uuid.is_some() {
+                raw
+            } else {
+                match storage::parse_body(raw, libc::S_IFREG as u32) {
+                    ObjectBody::Direct(bytes) => bytes,
+                    ObjectBody::Hardlink(uuid) => {
+                        log!("  detected hardlink ref: {} -> .hardlinks/{}", path, uuid);
+                        let hl_key = storage::hardlink_key(&uuid, meta);
+                        let actual = self.client.get(&hl_key)
+                            .io_err(&format!("read GET hardlink data for {}", path))?;
+                        self.cache.lock().unwrap().set_hardlink_target(&path, uuid);
+                        actual
+                    }
+                    ObjectBody::Symlink(_) => {
+                        unreachable!("parse_body(_, S_IFREG) returned Symlink")
+                    }
+                }
+            };
+
+            let shared = Arc::new(data);
+            self.read_cache.insert(&path, Arc::clone(&shared));
+            return serve_slice(w, &shared, offset, size);
+        }
+
+        // Large file: read-ahead chunk. Fetch `read_ahead_size`
+        // bytes starting at the requested offset, serve the
+        // requested slice, stash the chunk on the handle so the
+        // next contiguous read hits step (2).
+        let chunk_start = offset;
+        let chunk_end = std::cmp::min(chunk_start + self.read_ahead_size as u64, file_size);
+        log!(
+            "S3 GET read-ahead {} offset={} size={}",
+            path,
+            chunk_start,
+            chunk_end - chunk_start
+        );
+        let ra_data = self.client.get_range(&key, chunk_start, chunk_end - 1)
+            .io_err(&format!("read-ahead GET {}", path))?;
+
+        let buf_end = std::cmp::min(size as usize, ra_data.len());
+        let result = w.write(&ra_data[..buf_end])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let mut handles = self.handles.lock().unwrap();
+        if let Some(entry) = handles.get_mut(handle) {
+            entry.read_ahead = Some(ra_data);
+            entry.read_ahead_offset = chunk_start;
+        }
+        Ok(result)
     }
 
     /// Insert `(path, meta, size)` into the cache and build the FUSE
@@ -717,169 +977,10 @@ impl FileSystem for S3Fs {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        // Try serving from the handle's read cache first — this
-        // covers both the per-VM whole-file cache and a golden
-        // materialize-on-write handle whose buffer was preloaded
-        // from GoldenBlobCache in open().
-        {
-            let handles = self.handles.lock().unwrap();
-            if let Some(entry) = handles.by_handle.get(&handle) {
-                if entry.read_cached {
-                    if let Some(ref data) = entry.data {
-                        let start = (offset as usize).min(data.len());
-                        let end = (offset as usize + size as usize).min(data.len());
-                        if start >= data.len() {
-                            return Ok(0); // EOF
-                        }
-                        return w.write(&data[start..end])
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
-                    }
-                }
-            }
-        }
-
-        // Resolve the inode with per-VM-shadow awareness. A golden
-        // ino whose path has been materialized will come back as
-        // PerVm here, so the zombie-ino case is handled implicitly
-        // — the per-VM branch below uses the shadowed entry's data,
-        // not stale golden bytes.
-        let source = self.resolve_inode(inode)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-
-        // Golden path with no shadow: serve entirely from RAM via
-        // the blob cache. One HashMap lookup + Arc clone + slice
-        // write. No S3, no read-ahead, no read_cache_max branch.
-        let (path, meta, file_size, hl_uuid) = match source {
-            InodeSource::Golden { path, entry: gentry } => {
-                let Some(hash) = gentry.hash.as_ref() else {
-                    // Non-regular golden inode (dir or symlink). POSIX
-                    // doesn't define `read` on these; return 0 bytes
-                    // rather than EIO for robustness against bad
-                    // callers.
-                    debug!("golden read on non-blob inode ino={:#x} path={}", inode, path);
-                    return Ok(0);
-                };
-                let bytes = self.golden_blobs.fetch(hash).ok_or_else(|| {
-                    // Per research/12 §6, a golden-blob miss is an
-                    // invariant violation (manifest out of sync with
-                    // blob pool), not a capacity event. Fail loud.
-                    log!(
-                        "S3Fs: golden blob miss for hash={} path={} — manifest/pool out of sync",
-                        hash,
-                        path
-                    );
-                    io::Error::from_raw_os_error(libc::EIO)
-                })?;
-
-                let start = (offset as usize).min(bytes.len());
-                let end = (offset as usize + size as usize).min(bytes.len());
-                if start >= bytes.len() {
-                    return Ok(0);
-                }
-                return w.write(&bytes[start..end])
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
-            }
-            InodeSource::PerVm { path, cached } => {
-                (path, cached.meta, cached.size, cached.hardlink_target.clone())
-            }
-        };
-
-        // Resolve data key — follows hardlink redirect if present
-        let key = match hl_uuid {
-            Some(ref uuid) => storage::hardlink_key(uuid, meta),
-            None => keys::encode(&path, meta),
-        };
-
-        // For files within the read cache limit, fetch whole and cache in handle
-        if self.read_cache_max > 0 && file_size <= self.read_cache_max {
-            log!("S3 GET read-cache {} ({} bytes, full file)", path, file_size);
-            let raw = self.client.get(&key)
-                .io_err(&format!("read GET {}", path))?;
-
-            // If we already knew this was a hardlink, `key` pointed at the
-            // real data and `raw` IS the file content — no body parsing
-            // needed. If this was a cold read via the visible path, the
-            // body might be a hardlink ref; parse it to find out.
-            let data = if hl_uuid.is_some() {
-                raw
-            } else {
-                match storage::parse_body(raw, libc::S_IFREG as u32) {
-                    ObjectBody::Direct(bytes) => bytes,
-                    ObjectBody::Hardlink(uuid) => {
-                        // First-time hardlink detection: re-fetch from the
-                        // real data object and record the UUID so subsequent
-                        // reads skip this double-hop.
-                        log!("  detected hardlink ref: {} -> .hardlinks/{}", path, uuid);
-                        let hl_key = storage::hardlink_key(&uuid, meta);
-                        let actual = self.client.get(&hl_key)
-                            .io_err(&format!("read GET hardlink data for {}", path))?;
-                        let mut cache = self.cache.lock().unwrap();
-                        cache.set_hardlink_target(&path, uuid);
-                        actual
-                    }
-                    // parse_body only returns Symlink when file_type=S_IFLNK;
-                    // we pass S_IFREG here so this branch is unreachable.
-                    ObjectBody::Symlink(_) => unreachable!("parse_body(_, S_IFREG) returned Symlink"),
-                }
-            };
-
-            let start = (offset as usize).min(data.len());
-            let end = (offset as usize + size as usize).min(data.len());
-            let result = if start < data.len() {
-                w.write(&data[start..end])
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            } else {
-                0
-            };
-
-            // Stash in handle for subsequent reads
-            let mut handles = self.handles.lock().unwrap();
-            if let Some(entry) = handles.get_mut(handle) {
-                entry.data = Some(data);
-                entry.read_cached = true;
-            }
-
-            return Ok(result);
-        }
-
-        // Large file — read-ahead: fetch self.read_ahead_size chunk, serve from buffer
-        {
-            let handles = self.handles.lock().unwrap();
-            if let Some(entry) = handles.by_handle.get(&handle) {
-                if let Some(ref ra) = entry.read_ahead {
-                    let ra_start = entry.read_ahead_offset;
-                    let ra_end = ra_start + ra.len() as u64;
-                    if offset >= ra_start && offset + size as u64 <= ra_end {
-                        // Cache hit — serve from read-ahead buffer
-                        let buf_offset = (offset - ra_start) as usize;
-                        let buf_end = buf_offset + size as usize;
-                        return w.write(&ra[buf_offset..buf_end.min(ra.len())])
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
-                    }
-                }
-            }
-        }
-
-        // Read-ahead miss — fetch a large chunk
-        let chunk_start = offset;
-        let chunk_end = std::cmp::min(chunk_start + self.read_ahead_size as u64, file_size);
-        log!("S3 GET read-ahead {} offset={} size={}", path, chunk_start, chunk_end - chunk_start);
-        let ra_data = self.client.get_range(&key, chunk_start, chunk_end - 1)
-            .io_err(&format!("read-ahead GET {}", path))?;
-
-        // Serve the requested slice from the fetched chunk
-        let buf_end = std::cmp::min(size as usize, ra_data.len());
-        let result = w.write(&ra_data[..buf_end])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        // Stash the read-ahead buffer for subsequent reads
-        let mut handles = self.handles.lock().unwrap();
-        if let Some(entry) = handles.get_mut(handle) {
-            entry.read_ahead = Some(ra_data);
-            entry.read_ahead_offset = chunk_start;
-        }
-
-        Ok(result)
+        // Thin wrapper — all source branching lives in `resolve_read`
+        // so every lookup order (handle buffer → inflight → read_cache
+        // → golden → S3) is visible at one call site.
+        self.resolve_read(inode, handle, offset, size, w)
     }
 
     fn open(
@@ -1089,57 +1190,84 @@ impl FileSystem for S3Fs {
             handles.remove(handle)
         };
 
-        if let Some(entry) = entry {
-            if entry.dirty {
-                if let Some(data) = &entry.data {
-                    // Missing-inode tolerated — if cache has lost the
-                    // mapping (shouldn't happen) we silently skip the PUT.
-                    let (path, meta, hl_uuid) = self.path_meta_hl_for_inode(entry.inode)
-                        .ok()
-                        .unwrap_or_default();
-
-                    if !path.is_empty() {
-                        // Write to hardlink data object if this is a hardlink reference
-                        let key = match hl_uuid {
-                            Some(ref uuid) => {
-                                log!("S3 PUT release hardlink {} -> .hardlinks/{} ({} bytes)", path, uuid, data.len());
-                                storage::hardlink_key(uuid, meta)
-                            }
-                            None => {
-                                log!("S3 PUT release {} ({} bytes)", path, data.len());
-                                keys::encode(&path, meta)
-                            }
-                        };
-                        self.client.put(&key, data)
-                            .io_err(&format!("release PUT {}", path))?;
-
-                        // After a successful PUT, insert (or update)
-                        // the per-VM cache entry for this path with
-                        // its new size. Two wins:
-                        //
-                        // (a) Materialize-on-write semantics (golden
-                        //     path → write → release) require per-VM
-                        //     to shadow the golden entry so future
-                        //     lookups / reads see the fresh content.
-                        //     Without this insert, the golden ino
-                        //     stays "live" as far as resolve_inode is
-                        //     concerned and post-release reads return
-                        //     pre-materialize bytes.
-                        //
-                        // (b) Ordinary per-VM writes benefit too: the
-                        //     next lookup hits tier 1 instead of
-                        //     doing a fresh LIST probe to update size.
-                        //
-                        // Hardlink path uses the ref body's size (41
-                        // bytes) — unchanged from pre-G1 behavior.
-                        if hl_uuid.is_none() {
-                            let mut cache = self.cache.lock().unwrap();
-                            cache.insert_from_key(&path, meta, data.len() as u64);
-                        }
-                    }
-                }
-            }
+        let Some(mut entry) = entry else { return Ok(()); };
+        if !entry.dirty {
+            return Ok(());
         }
+        // Move the buffer out of the handle entry — we'll hand it to
+        // the write pool (or PUT sync) and don't need it here after.
+        let Some(data) = entry.data.take() else { return Ok(()); };
+
+        // Missing-inode tolerated — if cache has lost the mapping
+        // (shouldn't happen) we silently skip the PUT.
+        let (path, meta, hl_uuid) = self
+            .path_meta_hl_for_inode(entry.inode)
+            .ok()
+            .unwrap_or_default();
+        if path.is_empty() {
+            return Ok(());
+        }
+
+        // Hardlink writes go to the shared data object at
+        // `.hardlinks/<uuid>`, not the visible key. The deferred-
+        // write path doesn't special-case hardlinks — the inflight
+        // map is keyed by visible PATH but carries whatever S3 key
+        // the worker should PUT to.
+        let key = match hl_uuid {
+            Some(ref uuid) => storage::hardlink_key(uuid, meta),
+            None => keys::encode(&path, meta),
+        };
+        let data_len = data.len() as u64;
+        let shared = Arc::new(data);
+
+        // Try to enqueue for deferred PUT. If the inflight budget
+        // would be exceeded, fall back to a synchronous inline PUT
+        // — the caller waits, the queue doesn't grow. This is the
+        // backpressure path.
+        let deferred = self.write_pool.enqueue(
+            path.clone(),
+            key.clone(),
+            Arc::clone(&shared),
+        )?;
+
+        if deferred {
+            debug!(
+                "release DEFERRED {} ({} bytes, inflight total={}B)",
+                path,
+                data_len,
+                self.write_pool.current_bytes()
+            );
+        } else {
+            log!(
+                "release SYNC-FALLBACK {} ({} bytes, inflight budget full)",
+                path,
+                data_len
+            );
+            self.client
+                .put(&key, &shared)
+                .io_err(&format!("release sync PUT {}", path))?;
+        }
+
+        // Per-VM inode cache is updated immediately, whether the
+        // write deferred or went sync. Future lookups see the new
+        // size without a fresh LIST probe, and materialize-on-write
+        // semantics (golden → per-VM shadow) remain correct.
+        // Hardlink path uses the ref body's size, unchanged from
+        // pre-G1 behavior.
+        if hl_uuid.is_none() {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert_from_key(&path, meta, data_len);
+        }
+
+        // Populate the read cache with the just-written bytes. The
+        // freshly-written bytes are likely to be read next
+        // (research/13 §3.2); sharing the Arc between inflight and
+        // read cache costs nothing. Large files auto-skip per the
+        // per-file threshold inside `insert`.
+        if hl_uuid.is_none() {
+            self.read_cache.insert(&path, shared);
+        }
+
         Ok(())
     }
 
@@ -1179,6 +1307,11 @@ impl FileSystem for S3Fs {
             let mut cache = self.cache.lock().unwrap();
             cache.get(&path).map(|e| e.meta)
         };
+
+        // Invalidate any cached read bytes for this path. Concurrent
+        // readers that still hold the Arc keep seeing the old data
+        // until their refcount drops — standard Rust lifetime.
+        self.read_cache.remove(&path);
 
         match per_vm_meta {
             Some(meta) => {
@@ -1296,6 +1429,11 @@ impl FileSystem for S3Fs {
             .io_err(&format!("rename COPY {} -> {}", old_path, new_path))?;
         self.client.delete(&old_key)
             .io_err(&format!("rename DELETE {}", old_path))?;
+
+        // Read-cache invalidation: drop the old-path entry if any.
+        // new_path won't hit the cache until someone reads it, at
+        // which point we'll fetch from S3 fresh.
+        self.read_cache.remove(&old_path);
 
         // Update cache
         let mut cache = self.cache.lock().unwrap();
@@ -1476,7 +1614,14 @@ impl FileSystem for S3Fs {
             // Already a hardlink — reuse the same UUID
             uuid.clone()
         } else {
-            // First hardlink — move data to .hardlinks/<uuid>
+            // First hardlink — move data to .hardlinks/<uuid>.
+            // Drain any pending deferred write for this path first:
+            // otherwise client.copy() below reads stale S3 bytes and
+            // the subsequent deferred PUT would race against the
+            // hardlink ref we write at line `client.put(&old_key, ...)`.
+            // See tests/test_correctness.rs::hardlink_write_through_append.
+            self.write_pool.wait_for_path(&old_path);
+
             let uuid = storage::new_hardlink_uuid();
             let old_key = keys::encode(&old_path, meta);
             let hl_key = storage::hardlink_key(&uuid, meta);
@@ -1534,30 +1679,57 @@ impl FileSystem for S3Fs {
         handle: Self::Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        // Flush dirty handle to S3 (same as release but keeps the handle open)
-        let (path, meta, data) = {
+        // Flush = push dirty buffer into the write queue (like
+        // `release`, but the handle stays open). Doesn't block on the
+        // PUT — that's `fsync`'s job. If the handle has no dirty
+        // buffer, this is a no-op.
+        //
+        // We do NOT consume entry.data — the guest's next `read`
+        // through this same handle would otherwise see an empty
+        // buffer instead of its own writes. Leave the data in the
+        // handle; release/subsequent-flush still send the latest
+        // version to the inflight queue, which replaces whatever was
+        // there.
+        let snapshot: Option<(String, KeyMeta, Option<String>, Arc<Vec<u8>>)> = {
             let handles = self.handles.lock().unwrap();
             match handles.by_handle.get(&handle) {
                 Some(entry) if entry.dirty => {
                     if let Some(ref data) = entry.data {
-                        let cache = self.cache.lock().unwrap();
-                        match cache.get_by_ino(entry.inode) {
-                            Some((p, e)) => (p.to_string(), e.meta, data.clone()),
-                            None => return Ok(()),
+                        let (path, meta, hl_uuid) = self
+                            .path_meta_hl_for_inode(entry.inode)
+                            .ok()
+                            .unwrap_or_default();
+                        if path.is_empty() {
+                            None
+                        } else {
+                            Some((path, meta, hl_uuid, Arc::new(data.clone())))
                         }
                     } else {
-                        return Ok(());
+                        None
                     }
                 }
-                _ => return Ok(()),
+                _ => None,
             }
         };
 
-        if !path.is_empty() {
-            let key = keys::encode(&path, meta);
-            log!("S3 PUT flush {} ({} bytes)", path, data.len());
-            self.client.put(&key, &data)
-                .io_err(&format!("flush PUT {}", path))?;
+        let Some((path, meta, hl_uuid, shared)) = snapshot else { return Ok(()); };
+        let key = match hl_uuid {
+            Some(ref uuid) => storage::hardlink_key(uuid, meta),
+            None => keys::encode(&path, meta),
+        };
+
+        // Same deferred-or-sync path as release. flush is typically
+        // called for explicit guest-requested partial writes (e.g.
+        // before fsync); we still respect the inflight budget.
+        let deferred = self.write_pool.enqueue(
+            path.clone(),
+            key.clone(),
+            Arc::clone(&shared),
+        )?;
+        if !deferred {
+            self.client
+                .put(&key, &shared)
+                .io_err(&format!("flush sync PUT {}", path))?;
         }
         Ok(())
     }
@@ -1565,12 +1737,35 @@ impl FileSystem for S3Fs {
     fn fsync(
         &self,
         _ctx: &Context,
-        inode: Self::Inode,
+        _inode: Self::Inode,
         _datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        // Same as flush — write dirty data to S3
-        self.flush(_ctx, inode, handle, 0)
+        // fsync = "make this handle's writes durable before returning."
+        // With deferred writes: (1) flush pushes the dirty buffer
+        // into the inflight queue, (2) wait for the path to drain.
+        //
+        // The wait is unbounded. In practice the worker's
+        // exponential-backoff retry loop (research/13 §2.4) will
+        // keep trying against a sustained S3 outage; a fsync caller
+        // under that condition will block indefinitely. That's the
+        // correct behavior — fsync is the durability opt-in.
+
+        // Resolve path while the handle is still open so we can
+        // wait by path.
+        let inode = {
+            let handles = self.handles.lock().unwrap();
+            handles.by_handle.get(&handle).map(|e| e.inode)
+        };
+        self.flush(_ctx, 0, handle, 0)?;
+        if let Some(inode) = inode {
+            if let Ok((path, _, _)) = self.path_meta_hl_for_inode(inode) {
+                if !path.is_empty() {
+                    self.write_pool.wait_for_path(&path);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn mknod(

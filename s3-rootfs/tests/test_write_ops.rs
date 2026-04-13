@@ -73,8 +73,11 @@ fn create_and_write() {
                          data.len() as u32, 0, None, false, 0, 0).unwrap();
     assert_eq!(n, data.len());
 
-    // Release flushes to S3
+    // Release enqueues into the deferred-write pool — the FUSE
+    // handler returns fast. Wait for the worker to drain before
+    // checking S3 directly (research/13 §2: deferred writes).
     fix.fs.release(&root_ctx(), entry.inode, 0, handle, true, false, None).unwrap();
+    fix.fs.sync_all();
 
     // Verify via direct S3 GET — reconstruct the key
     let path = fix.path("written.txt");
@@ -109,6 +112,7 @@ fn write_at_offset() {
     fix.fs.write(&root_ctx(), entry.inode, handle, &mut r2, 5, 10, None, false, 0, 0).unwrap();
 
     fix.fs.release(&root_ctx(), entry.inode, 0, handle, true, false, None).unwrap();
+    fix.fs.sync_all();
 
     // Verify via S3
     let path = fix.path("offset.bin");

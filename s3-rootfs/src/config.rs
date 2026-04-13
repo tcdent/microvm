@@ -60,10 +60,15 @@ pub enum ManifestSource {
 /// All the knobs for building an `S3Fs`.
 ///
 /// Defaults are chosen for the coding-agent microVM workload:
-/// - 16 MB read cache fits nearly all source files, build artifacts,
-///   and package manifests in one GET each.
-/// - 16 MB read-ahead keeps large sequential reads saturated with
-///   one in-flight request at a time.
+/// - 100 MB cross-handle read cache. Re-opens of the same file hit
+///   memory instead of S3. Per-file threshold (budget / 4) keeps a
+///   single huge read from evicting everything else.
+/// - 16 MB read-ahead. Used for files above the per-file cache
+///   threshold — single GET per chunk, streamed.
+/// - 100 MB inflight write budget. `release()` enqueues the buffer
+///   and returns fast; a worker pool drains to S3 in the background.
+///   Over budget, release falls back to synchronous PUT (backpressure).
+/// - 8 background write workers. Shared `ureq::Agent` pool.
 ///
 /// The inode cache has no TTL. S3Fs is the single writer to its
 /// bucket, so cached entries are authoritative by construction; there
@@ -79,16 +84,29 @@ pub struct FsConfig {
     /// S3 endpoint, bucket, credentials, timeouts.
     pub s3: S3Config,
 
-    /// File-size threshold for whole-file caching in the handle.
-    /// Reads of files at or below this size fetch everything in one
-    /// GET and cache it in the `FileHandle`. Above this, we range-GET
-    /// via the read-ahead window.
-    pub read_cache_max: u64,
+    /// Total RAM budget for the cross-handle read cache
+    /// (`read_cache.rs`). Files ≤ budget / 4 are cached whole on
+    /// first read; larger files bypass the cache and use
+    /// `read_ahead_size` streaming. Set to 0 to disable caching
+    /// entirely (every read hits S3).
+    pub read_cache_budget: usize,
 
-    /// Window size for sequential read-ahead on files above
-    /// `read_cache_max`. A single GET fetches up to this many bytes;
-    /// subsequent reads within the window hit memory.
+    /// Window size for sequential read-ahead on files larger than
+    /// the per-file cache threshold. A single GET fetches up to this
+    /// many bytes; subsequent reads within the window hit memory
+    /// (handle-local, freed on close).
     pub read_ahead_size: usize,
+
+    /// Total RAM budget for deferred writes. When `release()` would
+    /// push the sum of pending-PUT bytes past this, the release
+    /// falls back to a synchronous inline PUT (backpressure).
+    /// Set to 0 to disable deferred writes entirely.
+    pub write_inflight_budget: usize,
+
+    /// Number of background PUT worker threads. Typical: 8. Each
+    /// worker holds a reference to the shared `Arc<ureq::Agent>`;
+    /// they drain the inflight queue in parallel against S3.
+    pub write_workers: usize,
 
     /// Golden filesystem layer (research/12). `None` means single-
     /// bucket behavior: every lookup/read goes through the per-VM
@@ -103,8 +121,10 @@ impl Default for FsConfig {
     fn default() -> Self {
         Self {
             s3: S3Config::default(),
-            read_cache_max: 16 * 1024 * 1024,
+            read_cache_budget: 100 * 1024 * 1024,
             read_ahead_size: 16 * 1024 * 1024,
+            write_inflight_budget: 100 * 1024 * 1024,
+            write_workers: 8,
             golden: None,
         }
     }
@@ -117,17 +137,19 @@ mod tests {
     #[test]
     fn default_is_sane() {
         let cfg = FsConfig::default();
-        assert!(cfg.read_cache_max > 0);
+        assert!(cfg.read_cache_budget > 0);
         assert!(cfg.read_ahead_size > 0);
+        assert!(cfg.write_inflight_budget > 0);
+        assert!(cfg.write_workers > 0);
     }
 
     #[test]
     fn struct_update_works() {
         let cfg = FsConfig {
-            read_cache_max: 32 * 1024 * 1024,
+            read_cache_budget: 32 * 1024 * 1024,
             ..Default::default()
         };
-        assert_eq!(cfg.read_cache_max, 32 * 1024 * 1024);
+        assert_eq!(cfg.read_cache_budget, 32 * 1024 * 1024);
         // Other fields keep defaults.
         assert_eq!(cfg.read_ahead_size, FsConfig::default().read_ahead_size);
     }
