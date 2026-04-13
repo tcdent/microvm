@@ -307,6 +307,15 @@ Doesn't exist today.
   comment). npm installs do many renames; the current non-atomic
   implementation is a correctness concern under failure. Needs
   fault-injection test infrastructure to gate the fix.
+  - **Observed symptom** (vm:2.5 2026-04-13, post-12df82d): in-VM
+    `git clone` of nvm reliably fails with "invalid config file
+    /root/.nvm/.git/config, fatal: could not set core.bare to false".
+    Strong smell of the rename gap: git writes `.git/config.lock`
+    and atomically renames to `.git/config`; if the rename observes
+    a half-written body, git's config parser trips on the partial
+    content. Workload exposed by the bench run, not introduced by
+    deferred writes (rename was already non-atomic). Route to the
+    fault-injection track, not a deferred-writes fix.
 - **Convention-based staging.** Research/10 §4 suggested per-path
   dispatch where caches live in RAM-only and never persist to S3 (e.g.,
   `~/.npm/_cacache`, `~/.cache/pip`). Big win for npm/pip if the guest
