@@ -518,6 +518,16 @@ Useful answers to questions the fleet will eventually ask:
   optional credentials override; when fleet identity matters, this
   becomes per-host or per-VM STS-issued scoped creds. Design hook is
   already there.
+- **Host-wide orchestrator config for S3 tuning knobs.** `S3Config`
+  currently exposes `max_idle_connections`, `max_idle_connections_per_host`,
+  `max_idle_age`, `timeout_global`, `timeout_connect`, `tcp_nodelay` as
+  public fields. These values are empirically tuned defaults; no caller
+  overrides them today. When the orchestrator grows a real config
+  surface (likely a filesystem-based config file at
+  `/etc/microvm-orchestrator.toml` or similar), these tuning knobs
+  migrate there — one host-wide set, not per-S3Config. Keeping them
+  exposed until that lands so a one-off bench discovery can tune
+  without a code change.
 
 ---
 
