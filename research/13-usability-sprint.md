@@ -303,10 +303,13 @@ Doesn't exist today.
   fix, not a usability-sprint scope item per se, but interacts with
   small-file write performance (chmod during install becomes a key-
   rewrite which is currently silent-no-op).
-- **Rename non-atomicity.** Still filed (research/12 §9 + s3fs.rs inline
-  comment). npm installs do many renames; the current non-atomic
-  implementation is a correctness concern under failure. Needs
-  fault-injection test infrastructure to gate the fix.
+- **Rename non-atomicity + throughput.** Still filed (research/12 §9 +
+  s3fs.rs inline comment). Now also a **throughput bottleneck**: nvm
+  install does heavy dir-renames (staged dirs → final locations); each
+  is a recursive copy+delete = O(n) S3 ops per dir (observed live by
+  vm:2.5 on HEAD, 2026-04-17). Correctness concern under failure +
+  throughput concern under normal operation. Needs S3-native rename
+  approach + fault-injection test infrastructure.
   - **Observed symptom** (vm:2.5 2026-04-13, post-12df82d): in-VM
     `git clone` of nvm reliably fails with "invalid config file
     /root/.nvm/.git/config, fatal: could not set core.bare to false".
@@ -316,6 +319,21 @@ Doesn't exist today.
     content. Workload exposed by the bench run, not introduced by
     deferred writes (rename was already non-atomic). Route to the
     fault-injection track, not a deferred-writes fix.
+- **Large-file read-cache bypass** (reported by vm:2.5 2026-04-13
+  post-bench on `nvm install 20`): default `read_cache_budget=100 MB`
+  with `per_file_threshold = budget/4 = 25 MB` means binaries like
+  node (99 MB), python, cargo, etc. skip the whole-file cache and
+  fall through to the read-ahead path (16 MB chunks, no retention).
+  Observed: 234 read-ahead GETs against a freshly-PUT 99 MB node
+  binary during install's post-extract verification / execve phase
+  (~3.7 GB re-fetched for a 99 MB file we just wrote). Two angles:
+  - Raise / configure `per_file_threshold` so common binaries fit.
+  - On PUT completion, promote the inflight Arc into `read_cache`
+    even if `len > threshold`, with a bounded retention window.
+    Keeps the 'write then execve' pattern hot without unbounded
+    cache growth.
+- **Stale doc comment in config.rs:15** references the pre-sprint
+  `read_cache_max: 8 << 20` field name. Housekeeping cleanup.
 - **Convention-based staging.** Research/10 §4 suggested per-path
   dispatch where caches live in RAM-only and never persist to S3 (e.g.,
   `~/.npm/_cacache`, `~/.cache/pip`). Big win for npm/pip if the guest
@@ -325,6 +343,71 @@ Doesn't exist today.
   on FUSE-served newly-written binaries. Strace-driven diagnosis.
 - **Baseline rootfs package audit.** §1.4 — revisit PACKAGES list with
   fresh eyes on what agents actually need.
+- **Bootstrap rootfs quality cluster** (reported by vm:2.5 2026-04-13
+  while benching against baf2076):
+  - DNS: macvlan same-host isolation. DHCP hands 192.168.88.11 as
+    the nameserver; .11 IS a working resolver from the host, but the
+    VM's macvtap on enp97s0f0 can't reach other macvlans on the same
+    NIC (classic macvlan peer-isolation). External IPs route through
+    the switch and work fine. Fix: pin `/etc/resolv.conf` in
+    `dist/bootstrap-rootfs.sh` to `1.1.1.1` (+ `9.9.9.9` for
+    redundancy), AND configure dhclient to not overwrite resolv.conf
+    on lease (dhclient.conf `supersede` or a dhclient-enter-hook).
+    Bundle with the sources.list/gpgv/sqv cluster — same file.
+  - `/etc/apt/sources.list` present but EMPTY post-bootstrap. `apt-get
+    update` silently succeeds with nothing to fetch. Either
+    `dist/bootstrap-rootfs.sh` strips it or the upload doesn't
+    preserve content. Debootstrap normally writes this.
+  - `gpgv` purged by `$PURGE_PKGS` breaks apt signature verification
+    ("Cannot find gpgv" → "repository is not signed"). Keep gpgv
+    (~1 MB) — the alternative is every apt call running with
+    `[trusted=yes]`, which is worse.
+  - `sqv`, `libfido2-1`, `libcbor0.10` in `$PURGE_PKGS` breaks apt's
+    solver 3.0 dep graph on trixie: "apt : Depends: sqv (>= 1.3.0)
+    but it is not going to be installed". EVERY apt install fails
+    with "Unmet dependencies" regardless of target package. Purge
+    list needs to be updated for trixie's hardened apt.
+  Priority: these three (sources.list, gpgv, sqv/fido2/cbor) are one
+  coherent fix to `dist/bootstrap-rootfs.sh` — bundle them. DNS is a
+  separate thread.
+- **Write-then-read visibility window** — RESOLVED in 90b92ec
+  (TTL → Duration::ZERO). Root cause was kernel FUSE attr/entry
+  cache TTL=1s serving stale size=0 after write+release. Our inflight
+  map + resolve_read were always correct; the kernel just never
+  asked us within the 1s window. Fix: TTL=0 (virtio-fs FUSE
+  round-trip is ~µs shared-memory, cost is negligible vs the
+  correctness gap). Also in 90b92ec: rename cache-size fix
+  (wait_for_all() + obj.size from LIST, not stale cached size),
+  which was the actual rename-corruption root cause — not rename
+  atomicity per se. Two confirmed manifestations pre-fix:
+  1. `/etc/resolv.conf`: `echo nameserver 1.1.1.1 > /etc/resolv.conf`
+     then immediate `cat` returns empty (0 bytes). Adding `sync`
+     between write and read restores visibility. Could not reproduce
+     deterministically on second attempt — possibly raced with
+     dhclient also rewriting the file at boot. Filed as P0
+     correctness by vm:2.8; vm:2.6's regression tests pass
+     (create+write+release+read), so the gap may be kernel page
+     cache (stale clean pages served without calling into FUSE)
+     rather than our inflight map. vm:2.8's hypothesis: check
+     FsOptions AUTO_INVAL_DATA / direct I/O on write paths.
+  2. `npm` broken immediately after `nvm install`: `nvm install 22`
+     extracts node tarball (including npm's bundled node_modules);
+     npm runs immediately and fails with
+     `require('graceful-fs').gracefulify is not a function`. The
+     module file EXISTS and loads correctly when tested after writes
+     settle (~seconds later). Same class: write buffer not visible
+     to subsequent reads in the post-extract window. Retry after
+     settling works. Strongest real-world signal — this is the
+     "install a tool then use it" pattern that every agent hits.
+  Root cause TBD: either kernel page cache serving stale pages
+  (fix = FsOptions), or inflight map not consulted by read/getattr
+  (fix = read-path coupling). Distinguish by checking whether a
+  failing `cat` produces an `S3Fs::read` log line (no line = kernel
+  cache; yes line = our bug).
+- **Missing `/usr/bin/xxd`** in baseline rootfs (hexdump works, minor).
+- **`poweroff` broken** from guest shell ("Failed to connect to system
+  scope bus") because logind was purged. Expected given our minimal
+  stance; dev convention is to kill the microvm process from host.
 
 ---
 
