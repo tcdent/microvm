@@ -166,10 +166,12 @@ and is fetched in 1–2 GETs, not 234.
 These items carried over from research/13 §5 and are sprint-scope:
 
 - **Rename non-atomicity + throughput.** Dir-rename as recursive
-  copy+delete is O(n) S3 ops. Observed live blocking nvm install
-  (2026-04-17). S3-native rename approach + fault-injection test
-  infrastructure. Promoted from "correctness concern" to
-  "throughput bottleneck" this sprint.
+  copy+delete is O(n) S3 ops. PARTIALLY addressed in 90b92ec
+  (wait_for_all + obj.size from LIST fixed the cache-size corruption
+  that was masquerading as an atomicity bug). The O(n) per-child
+  COPY cost remains. S3-native rename approach + fault-injection
+  test infrastructure still needed for the throughput angle and
+  partial-failure correctness under concurrent writes.
 - **Bootstrap rootfs cluster.** sources.list empty, gpgv purged,
   sqv/fido2/cbor purged (breaks apt solver 3.0 on trixie), DNS
   dhclient race with resolv.conf. One coherent fix to
@@ -177,6 +179,29 @@ These items carried over from research/13 §5 and are sprint-scope:
 - **setattr persistence.** research/07 §10c, still broken. chmod
   during install silently no-ops. Separate fix, interacts with write
   performance if batched.
+- **`/etc/apt/sources.list` 0-bytes post-bootstrap** (vm:2.5
+  2026-04-18). File exists in `/etc/apt/` but is empty. Not a symlink
+  issue, not `sources.list.d/` shadowing. Something in the debootstrap
+  invocation or the s3-rootfs upload pipeline is truncating it.
+  Adds color to the bootstrap cluster above; may need its own
+  investigation depending on where the truncation happens.
+- **Duplicate VM launch on same macvtap** (vm:2.5 2026-04-18).
+  Operational footgun: if `bootstrap.sh` is launched twice against
+  the same macvtap (e.g. via `&` + tmux send-keys), two microvm
+  processes share `/dev/tap<N>` and both fail silently at network
+  level — DHCP yields no IPv4, pings return "Network is unreachable".
+  Fix direction: detect tap ownership collision at launcher startup
+  and refuse to start, OR document as "one VM per macvtap". Detection
+  is cheap (flock on `/dev/tap<N>` or check `ip link`'s bound state)
+  and prevents a confusing silent-failure mode.
+- **Git+SSH dependency auth** (vm:2.5 2026-04-18). npm/cargo/pip
+  packages with SSH git URLs (observed: openclaw's libsignal-node
+  using `ssh://git@github.com/...`) fail inside the VM without SSH
+  known_hosts + auth strategy. Not our bug, but relevant to "agents
+  can install anything" ambitions. Directions: ship minimal SSH
+  known_hosts (github.com, gitlab.com) in the rootfs + document a
+  host-side credential-injection path (e.g. via a mounted auth
+  socket or short-lived token). Research thread, not code work.
 
 ---
 
