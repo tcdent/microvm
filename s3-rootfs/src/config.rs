@@ -63,8 +63,9 @@ pub enum ManifestSource {
 /// - 100 MB cross-handle read cache. Re-opens of the same file hit
 ///   memory instead of S3. Per-file threshold (budget / 4) keeps a
 ///   single huge read from evicting everything else.
-/// - 16 MB read-ahead. Used for files above the per-file cache
-///   threshold — single GET per chunk, streamed.
+/// - 128 MB read-ahead. Used for files above the per-file cache
+///   threshold — single GET per chunk, streamed. Sized so a 99 MB
+///   node binary is fetched in 1 GET instead of ~7 at 16 MB.
 /// - 100 MB inflight write budget. `release()` enqueues the buffer
 ///   and returns fast; a worker pool drains to S3 in the background.
 ///   Over budget, release falls back to synchronous PUT (backpressure).
@@ -122,7 +123,7 @@ impl Default for FsConfig {
         Self {
             s3: S3Config::default(),
             read_cache_budget: 100 * 1024 * 1024,
-            read_ahead_size: 16 * 1024 * 1024,
+            read_ahead_size: 128 * 1024 * 1024,
             write_inflight_budget: 100 * 1024 * 1024,
             write_workers: 8,
             golden: None,

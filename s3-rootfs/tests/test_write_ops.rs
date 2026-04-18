@@ -233,10 +233,14 @@ fn read_your_writes_without_sync() {
 
     // DELIBERATELY NO sync_all() — this is the whole point.
 
-    // Fresh open for read on the same path. getattr should see the
-    // new size, read should see the new bytes.
+    // Fresh lookup + explicit getattr on the same path. The kernel
+    // calls getattr (not lookup) for stat(), so both must agree.
     let found = fix.lookup(dir.inode, "ryw.txt").unwrap();
     assert_eq!(found.attr.st_size, data.len() as i64,
+        "lookup must reflect inflight write size without sync");
+
+    let (stat, _ttl) = fix.fs.getattr(&root_ctx(), found.inode, None).unwrap();
+    assert_eq!(stat.st_size, data.len() as i64,
         "getattr must reflect inflight write size without sync");
 
     let (rh, _, _) = fix.fs.open(&root_ctx(), found.inode, libc::O_RDONLY as u32, 0).unwrap();
@@ -334,4 +338,256 @@ fn read_your_writes_golden_with_prior_read_cache() {
     let n = fix.fs.read(&root_ctx(), golden_ino, rh.unwrap(), &mut w, 4096, 0, None, 0).unwrap();
     assert_eq!(&w.buf[..n], data,
         "got {:?}", String::from_utf8_lossy(&w.buf[..n]));
+}
+
+#[test]
+fn rename_dir_preserves_deferred_write_content() {
+    // Reproduce nvm install pattern: extract many files into staging
+    // dir, close them all (deferred writes enqueued), then rename
+    // the staging dir to the final location. Content must survive.
+    require_s3!();
+    let fix = TestFixture::new();
+    fix.seed_root();
+
+    let root_dir = fix.lookup(ROOT, &fix.prefix).unwrap();
+
+    // Create staging dir
+    fix.fs.mkdir(&root_ctx(), root_dir.inode, &cname("staging"), 0o755, 0).unwrap();
+    let staging = fix.lookup(root_dir.inode, "staging").unwrap();
+
+    // Create 20 files with distinct content, close each
+    let file_count = 20;
+    for i in 0..file_count {
+        let name = format!("file_{:03}.js", i);
+        let content = format!("// module {} content here\nexport default {{}}\n", i);
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, handle, _, _) = fix.fs.create(&root_ctx(), staging.inode, &cname(&name), args).unwrap();
+        let wh = handle.unwrap();
+        let mut reader = TestReader::new(content.as_bytes().to_vec());
+        fix.fs.write(&root_ctx(), entry.inode, wh, &mut reader,
+                     content.len() as u32, 0, None, false, 0, 0).unwrap();
+        // Flush (synchronous, like kernel does before close returns)
+        fix.fs.flush(&root_ctx(), entry.inode, wh, 0).unwrap();
+        // Release (async in real kernel, but we call it here)
+        fix.fs.release(&root_ctx(), entry.inode, 0, wh, true, false, None).unwrap();
+    }
+
+    // NO sync — rename should drain internally
+    // Create destination dir
+    fix.fs.mkdir(&root_ctx(), root_dir.inode, &cname("final"), 0o755, 0).unwrap();
+
+    // Rename staging -> final (this is what nvm does)
+    fix.fs.rename(&root_ctx(), root_dir.inode, &cname("staging"),
+                  root_dir.inode, &cname("final"), 0).unwrap();
+
+    // Read back every file from the new location
+    let final_dir = fix.lookup(root_dir.inode, "final").unwrap();
+    for i in 0..file_count {
+        let name = format!("file_{:03}.js", i);
+        let expected = format!("// module {} content here\nexport default {{}}\n", i);
+        let entry = fix.lookup(final_dir.inode, &name)
+            .unwrap_or_else(|_| panic!("file {} missing after rename", name));
+        let (rh, _, _) = fix.fs.open(&root_ctx(), entry.inode, libc::O_RDONLY as u32, 0).unwrap();
+        let mut w = TestWriter::new();
+        let n = fix.fs.read(&root_ctx(), entry.inode, rh.unwrap(), &mut w, 4096, 0, None, 0).unwrap();
+        assert_eq!(&w.buf[..n], expected.as_bytes(),
+            "file_{:03}.js: expected {:?}, got {:?}", i,
+            expected, String::from_utf8_lossy(&w.buf[..n]));
+    }
+}
+
+#[test]
+fn rename_dir_with_pending_release() {
+    // Simulates async FUSE_RELEASE: flush is sync (kernel waits),
+    // release is fire-and-forget (may not arrive before rename).
+    // Rename must still preserve content from flush-enqueued data.
+    require_s3!();
+    let fix = TestFixture::new();
+    fix.seed_root();
+
+    let root_dir = fix.lookup(ROOT, &fix.prefix).unwrap();
+
+    fix.fs.mkdir(&root_ctx(), root_dir.inode, &cname("staging"), 0o755, 0).unwrap();
+    let staging = fix.lookup(root_dir.inode, "staging").unwrap();
+
+    // Create files, flush (sync), but DO NOT release (simulating
+    // kernel's async release that hasn't arrived yet)
+    let mut open_handles: Vec<(u64, u64)> = Vec::new(); // (inode, handle)
+    let file_count = 10;
+    for i in 0..file_count {
+        let name = format!("mod_{}.js", i);
+        let content = format!("exports.val = {};\n", i);
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, handle, _, _) = fix.fs.create(&root_ctx(), staging.inode, &cname(&name), args).unwrap();
+        let wh = handle.unwrap();
+        let mut reader = TestReader::new(content.as_bytes().to_vec());
+        fix.fs.write(&root_ctx(), entry.inode, wh, &mut reader,
+                     content.len() as u32, 0, None, false, 0, 0).unwrap();
+        fix.fs.flush(&root_ctx(), entry.inode, wh, 0).unwrap();
+        open_handles.push((entry.inode, wh));
+        // NO release — simulates kernel's async release delay
+    }
+
+    // Rename fires BEFORE release arrives
+    fix.fs.rename(&root_ctx(), root_dir.inode, &cname("staging"),
+                  root_dir.inode, &cname("final"), 0).unwrap();
+
+    // Now releases arrive (async, after rename)
+    for (ino, wh) in &open_handles {
+        fix.fs.release(&root_ctx(), *ino, 0, *wh, true, false, None).unwrap();
+    }
+    fix.fs.sync_all();
+
+    // Read back
+    let final_dir = fix.lookup(root_dir.inode, "final").unwrap();
+    for i in 0..file_count {
+        let name = format!("mod_{}.js", i);
+        let expected = format!("exports.val = {};\n", i);
+        let entry = fix.lookup(final_dir.inode, &name)
+            .unwrap_or_else(|_| panic!("{} missing after rename", name));
+        let (rh, _, _) = fix.fs.open(&root_ctx(), entry.inode, libc::O_RDONLY as u32, 0).unwrap();
+        let mut w = TestWriter::new();
+        let n = fix.fs.read(&root_ctx(), entry.inode, rh.unwrap(), &mut w, 4096, 0, None, 0).unwrap();
+        assert_eq!(&w.buf[..n], expected.as_bytes(),
+            "mod_{}.js: expected {:?}, got {:?}", i,
+            expected, String::from_utf8_lossy(&w.buf[..n]));
+    }
+}
+
+#[test]
+fn s3_copy_preserves_content_with_metadata_keys() {
+    // Verify RustFS CopyObject works correctly with our
+    // \x01-separated metadata keys. If this fails, the rename
+    // corruption is a backend bug, not an FS-layer bug.
+    require_s3!();
+    let fix = TestFixture::new();
+    let meta = s3_rootfs::KeyMeta::new(libc::S_IFREG as u32 | 0o755, 0, 0);
+
+    // PUT 50 files with distinct content via our key encoding
+    let count = 50;
+    for i in 0..count {
+        let path = fix.path(&format!("copytest/file_{:03}.js", i));
+        let key = s3_rootfs::encode_key(&path, meta);
+        let content = format!("// content for file {}\nexport default {{}}\n", i);
+        fix.client.put(&key, content.as_bytes()).unwrap();
+    }
+
+    // COPY each to a new prefix using the same method as rename
+    for i in 0..count {
+        let old_path = fix.path(&format!("copytest/file_{:03}.js", i));
+        let new_path = fix.path(&format!("copied/file_{:03}.js", i));
+        let old_key = s3_rootfs::encode_key(&old_path, meta);
+        let new_key = s3_rootfs::encode_key(&new_path, meta);
+        fix.client.copy(&old_key, &new_key).unwrap();
+    }
+
+    // Verify each copied file has correct content
+    for i in 0..count {
+        let new_path = fix.path(&format!("copied/file_{:03}.js", i));
+        let new_key = s3_rootfs::encode_key(&new_path, meta);
+        let expected = format!("// content for file {}\nexport default {{}}\n", i);
+        let data = fix.client.get(&new_key).unwrap();
+        assert_eq!(data, expected.as_bytes(),
+            "file_{:03}.js copy mismatch: got {:?}", i,
+            String::from_utf8_lossy(&data));
+    }
+}
+
+#[test]
+fn rename_dir_at_scale() {
+    // npm's bundled node_modules has ~1000+ files.
+    // Test at scale to catch races that don't appear with 20 files.
+    require_s3!();
+    let fix = TestFixture::new();
+    fix.seed_root();
+
+    let root_dir = fix.lookup(ROOT, &fix.prefix).unwrap();
+
+    fix.fs.mkdir(&root_ctx(), root_dir.inode, &cname("staging"), 0o755, 0).unwrap();
+    let staging = fix.lookup(root_dir.inode, "staging").unwrap();
+
+    // Nest dirs 3 levels deep with files at each level
+    let mut dirs = vec![staging.inode];
+    for d in 0..5 {
+        let dname = format!("dir_{}", d);
+        let de = fix.fs.mkdir(&root_ctx(), staging.inode, &cname(&dname), 0o755, 0).unwrap();
+        dirs.push(de.attr.st_ino);
+        for sd in 0..3 {
+            let sdname = format!("sub_{}", sd);
+            let sde = fix.fs.mkdir(&root_ctx(), de.attr.st_ino, &cname(&sdname), 0o755, 0).unwrap();
+            dirs.push(sde.attr.st_ino);
+        }
+    }
+
+    // Create 500 files spread across dirs
+    let file_count = 500;
+    let mut expected: Vec<(String, String)> = Vec::new();
+    for i in 0..file_count {
+        let parent_ino = dirs[i % dirs.len()];
+        let name = format!("f_{:04}.json", i);
+        let content = format!("{{\"id\":{},\"name\":\"pkg_{}\"}}", i, i);
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, handle, _, _) = fix.fs.create(&root_ctx(), parent_ino, &cname(&name), args).unwrap();
+        let wh = handle.unwrap();
+        let mut reader = TestReader::new(content.as_bytes().to_vec());
+        fix.fs.write(&root_ctx(), entry.inode, wh, &mut reader,
+                     content.len() as u32, 0, None, false, 0, 0).unwrap();
+        fix.fs.flush(&root_ctx(), entry.inode, wh, 0).unwrap();
+        fix.fs.release(&root_ctx(), entry.inode, 0, wh, true, false, None).unwrap();
+        expected.push((name, content));
+    }
+
+    // Rename staging -> final
+    fix.fs.rename(&root_ctx(), root_dir.inode, &cname("staging"),
+                  root_dir.inode, &cname("final"), 0).unwrap();
+
+    // Cold reader — fresh caches, reads from S3 only
+    let cold = TestFixture::attach_to(&fix);
+    let cold_root = cold.lookup(ROOT, &cold.prefix).unwrap();
+    let final_dir = cold.lookup(cold_root.inode, "final").unwrap();
+
+    // Verify a sample — check 50 files spread across dirs
+    for i in (0..file_count).step_by(10) {
+        let parent_idx = i % dirs.len();
+        let parent_name = if parent_idx == 0 {
+            "final".to_string()
+        } else {
+            let d = (parent_idx - 1) / 4;
+            let sd = (parent_idx - 1) % 4;
+            if sd == 0 {
+                format!("final/dir_{}", d)
+            } else {
+                format!("final/dir_{}/sub_{}", d, sd - 1)
+            }
+        };
+        // Walk to the parent
+        let mut parent_ino = cold_root.inode;
+        for seg in parent_name.split('/') {
+            parent_ino = cold.lookup(parent_ino, seg).unwrap().inode;
+        }
+        let (name, exp_content) = &expected[i];
+        let entry = cold.lookup(parent_ino, name)
+            .unwrap_or_else(|_| panic!("file {} missing in {}", name, parent_name));
+        let (rh, _, _) = cold.fs.open(&root_ctx(), entry.inode, libc::O_RDONLY as u32, 0).unwrap();
+        let mut w = TestWriter::new();
+        let n = cold.fs.read(&root_ctx(), entry.inode, rh.unwrap(), &mut w, 4096, 0, None, 0).unwrap();
+        assert_eq!(&w.buf[..n], exp_content.as_bytes(),
+            "{}/{}: expected {:?}, got {:?} ({} bytes)", parent_name, name,
+            exp_content, String::from_utf8_lossy(&w.buf[..n]), n);
+    }
 }

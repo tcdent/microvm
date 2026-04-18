@@ -72,7 +72,7 @@ fn setattr_returns_current_attrs_without_error() {
 
     assert_eq!(st.st_ino, entry.inode);
     assert_eq!(st.st_size, 4);
-    assert!(ttl.as_secs() > 0);
+    let _ = ttl; // TTL=0 is correct (research/13 §5)
 }
 
 #[test]

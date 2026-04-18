@@ -75,9 +75,9 @@ fn config_from_env() -> LaunchConfig {
     if let Ok(bucket) = std::env::var("VM_BUCKET") {
         fs.s3.bucket = bucket;
     }
-    fs.read_ahead_size = env_or("VM_READ_AHEAD", "16")
+    fs.read_ahead_size = env_or("VM_READ_AHEAD", "128")
         .parse::<usize>()
-        .unwrap_or(16)
+        .unwrap_or(128)
         * 1024
         * 1024;
 

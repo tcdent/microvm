@@ -38,7 +38,20 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
 }
-const TTL: Duration = Duration::from_secs(1);
+/// Kernel FUSE attribute + entry cache TTL.
+///
+/// Zero: the kernel must revalidate every lookup and stat by calling
+/// back into us. With our own caching layers (inode cache, read cache,
+/// inflight map, golden blob cache) a HashMap lookup is cheaper than
+/// a stale-window correctness bug. A nonzero TTL (even 1s) breaks
+/// write-then-read visibility: release() updates our caches but the
+/// kernel serves the old size/attrs from its own cache until TTL
+/// expires, so `echo data > file; cat file` returns empty if the
+/// sequence completes within the window.
+///
+/// Cost of TTL=0 on virtio-fs is negligible — the FUSE round-trip is
+/// a shared-memory virtqueue dispatch (~µs), not a wire protocol hop.
+const TTL: Duration = Duration::ZERO;
 /// Number of S3 keys to fetch per lookup LIST probe.
 /// Includes the target entry + neighbors for cache pre-fill.
 pub const LIST_PROBE_MAX_KEYS: u32 = 12;
@@ -1395,6 +1408,17 @@ impl FileSystem for S3Fs {
             // partial-failure paths — otherwise a "fix" is just moving
             // the bug around.
             //
+            // Drain all pending deferred writes before the copy loop.
+            // server-side COPY reads whatever S3 has; if a child file
+            // was just released and its PUT is still inflight, COPY
+            // gets stale (empty) content while the real data sits in
+            // the write pool. The deferred PUT then fires against the
+            // OLD key, which gets deleted — data loss. wait_for_all
+            // is broader than needed (drains ALL inflight, not just
+            // children under old_prefix) but rename is already O(n)
+            // S3 ops so the marginal cost is acceptable.
+            self.write_pool.wait_for_all();
+
             // Directory rename: LIST all children, copy+delete each
             let old_prefix = format!("{}/", old_path);
             let result = self.client.list(&old_prefix, None)
@@ -1412,13 +1436,41 @@ impl FileSystem for S3Fs {
                     self.client.delete(&old_key)
                         .io_err(&format!("rename child DELETE {}", decoded_path))?;
 
+                    // Invalidate read cache for the old child path —
+                    // stale entries waste memory and could serve wrong
+                    // content if the old path is re-created later.
+                    self.read_cache.remove(decoded_path);
+
+                    // Migrate cache entry to the new path. Use the
+                    // REAL size from S3 LIST (obj.size), not whatever
+                    // the cache had — the cached size can be stale if
+                    // a deferred write landed in S3 but the cache
+                    // wasn't updated (e.g., async FUSE_RELEASE timing).
                     let mut cache = self.cache.lock().unwrap();
-                    if let Some(entry) = cache.get(decoded_path).cloned() {
+                    if let Some(mut entry) = cache.get(decoded_path).cloned() {
+                        entry.size = obj.size;
                         cache.remove(decoded_path);
                         cache.insert(&new_child_path, entry);
+                    } else {
+                        // No cache entry at old path — file exists in
+                        // S3 but was never looked up (deep tree, cold
+                        // cache). Create a fresh entry so subsequent
+                        // lookups at the new path hit tier-1 cache
+                        // instead of probing S3.
+                        cache.insert_from_key(
+                            &new_child_path,
+                            child_meta,
+                            obj.size,
+                        );
                     }
                 }
             }
+        } else {
+            // Single-file rename: drain any pending deferred write for
+            // this specific path before the server-side COPY. Same
+            // race as the dir case — COPY reads stale S3 content if
+            // the PUT hasn't drained.
+            self.write_pool.wait_for_path(&old_path);
         }
 
         // Rename the entry itself — server-side copy, no data through client
