@@ -183,6 +183,17 @@ impl InodeCache {
         self.negative.contains(path)
     }
 
+    /// All cached entries whose path starts with `prefix`.
+    /// Used by ephemeral dir rename to migrate cache entries
+    /// without an S3 LIST.
+    pub fn paths_with_prefix(&self, prefix: &str) -> Vec<(String, CachedInode)> {
+        self.by_path
+            .iter()
+            .filter(|(p, _)| p.starts_with(prefix))
+            .map(|(p, e)| (p.clone(), e.clone()))
+            .collect()
+    }
+
     /// Number of cached inodes (excluding root).
     pub fn inode_count(&self) -> usize {
         self.by_path.len()

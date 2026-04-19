@@ -1550,6 +1550,35 @@ impl FileSystem for S3Fs {
             // is broader than needed (drains ALL inflight, not just
             // children under old_prefix) but rename is already O(n)
             // S3 ops so the marginal cost is acceptable.
+            // Check source durability to decide S3 vs local-disk rename.
+            let dir_durability = self.ruleset.resolve(&old_path).durability;
+
+            if dir_durability == Durability::Ephemeral {
+                // Ephemeral dir: children live on local disk, not S3.
+                // Rename the entire subtree on disk in one shot.
+                if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+                    let old_disk = eph_dir.join(&old_path);
+                    let new_disk = eph_dir.join(&new_path);
+                    if old_disk.exists() {
+                        if let Some(parent) = new_disk.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::rename(&old_disk, &new_disk)?;
+                    }
+                }
+                // Update cache for all children under the old prefix.
+                let old_prefix = format!("{}/", old_path);
+                let mut cache = self.cache.lock().unwrap();
+                let children: Vec<(String, CachedInode)> = cache.paths_with_prefix(&old_prefix);
+                for (child_path, entry) in children {
+                    let suffix = &child_path[old_prefix.len()..];
+                    let new_child = format!("{}/{}", new_path, suffix);
+                    cache.remove(&child_path);
+                    cache.insert(&new_child, entry);
+                }
+                drop(cache);
+            } else {
+            // Durable dir: children are in S3.
             self.write_pool.wait_for_all();
 
             // Directory rename: LIST all children, copy+delete each
@@ -1640,6 +1669,7 @@ impl FileSystem for S3Fs {
                     );
                 }
             }
+            } // end durable dir rename
         } else {
             // Single-file rename: drain any pending deferred write for
             // this specific path before the server-side COPY. Same
