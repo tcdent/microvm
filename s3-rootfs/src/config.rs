@@ -116,6 +116,12 @@ pub struct FsConfig {
     /// until both are populated), and every FUSE op will consult
     /// them alongside the per-VM state.
     pub golden: Option<GoldenConfig>,
+
+    /// Path to a TOML ruleset file (research/14 §1). `None` means
+    /// every path gets default rules (`Durable`, `Auto` read-ahead,
+    /// no coalesce). `Some` loads and compiles the file at
+    /// construction time; errors are fatal.
+    pub ruleset_path: Option<PathBuf>,
 }
 
 impl Default for FsConfig {
@@ -127,6 +133,7 @@ impl Default for FsConfig {
             write_inflight_budget: 100 * 1024 * 1024,
             write_workers: 8,
             golden: None,
+            ruleset_path: None,
         }
     }
 }

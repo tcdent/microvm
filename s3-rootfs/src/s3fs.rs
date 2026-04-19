@@ -26,6 +26,7 @@ use crate::config::FsConfig;
 use crate::inode_cache::{CachedInode, InodeCache};
 use crate::keys::{self, KeyMeta};
 use crate::read_cache::{self, ReadCache};
+use crate::ruleset::{HandleRules, Ruleset};
 use crate::s3::{S3Client, S3ResultExt};
 use crate::storage::{self, ObjectBody};
 use crate::write_pool::{WritePool, WritePoolConfig};
@@ -133,6 +134,10 @@ pub struct S3Fs {
     /// Shared golden blob cache. Same sentinel pattern as
     /// `golden_inodes` when the feature is disabled.
     golden_blobs: Arc<GoldenBlobCache>,
+    /// Compiled per-workload ruleset (research/14 §1). Resolved
+    /// once per `open()`/`create()` and cached on the handle.
+    /// Empty ruleset when `FsConfig::ruleset_path` is `None`.
+    ruleset: Ruleset,
 }
 
 struct HandleTable {
@@ -151,6 +156,10 @@ struct HandleEntry {
     /// Handle-local streaming buffer; freed when the handle closes.
     read_ahead: Option<Vec<u8>>,
     read_ahead_offset: u64,
+    /// Per-handle rules resolved from the compiled ruleset at
+    /// `open()`/`create()` time (research/14 §1). Consulted by
+    /// read/write/release without further glob matching.
+    rules: HandleRules,
 }
 
 impl HandleTable {
@@ -158,7 +167,7 @@ impl HandleTable {
         Self { by_handle: HashMap::new(), next_handle: 1 }
     }
 
-    fn open(&mut self, inode: u64, writing: bool) -> u64 {
+    fn open(&mut self, inode: u64, writing: bool, rules: HandleRules) -> u64 {
         let handle = self.next_handle;
         self.next_handle += 1;
         self.by_handle.insert(handle, HandleEntry {
@@ -166,6 +175,7 @@ impl HandleTable {
             dirty: false,
             read_ahead: None,
             read_ahead_offset: 0,
+            rules,
             data: if writing { Some(Vec::new()) } else { None },
         });
         handle
@@ -221,6 +231,18 @@ impl S3Fs {
             client: Arc::clone(&client),
         });
 
+        // Load the workload ruleset (research/14 §1). Empty ruleset
+        // when no path is configured — every path gets defaults.
+        let ruleset = match &cfg.ruleset_path {
+            Some(path) => Ruleset::from_toml(path).unwrap_or_else(|e| {
+                panic!("S3Fs::new: failed to load ruleset from {}: {e}", path.display())
+            }),
+            None => Ruleset::empty(),
+        };
+        if !ruleset.is_empty() {
+            crate::log!("S3Fs: loaded {} ruleset rules", ruleset.len());
+        }
+
         S3Fs {
             client,
             cache: Mutex::new(InodeCache::new()),
@@ -231,6 +253,7 @@ impl S3Fs {
             write_threads: Mutex::new(Some(write_threads)),
             golden_inodes,
             golden_blobs,
+            ruleset,
         }
     }
 
@@ -1004,8 +1027,17 @@ impl FileSystem for S3Fs {
         _fuse_flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
         let writing = (flags & libc::O_ACCMODE as u32) != libc::O_RDONLY as u32;
+
+        // Resolve per-path rules from the compiled ruleset (once
+        // per open, cached on the handle for the lifetime of the FD).
+        let rules = match self.resolve_inode(inode) {
+            Some(InodeSource::PerVm { ref path, .. }) |
+            Some(InodeSource::Golden { ref path, .. }) => self.ruleset.resolve(path),
+            None => HandleRules::default(),
+        };
+
         let mut handles = self.handles.lock().unwrap();
-        let handle = handles.open(inode, writing);
+        let handle = handles.open(inode, writing, rules);
 
         let truncating = (flags & libc::O_TRUNC as u32) != 0;
 
@@ -1133,8 +1165,9 @@ impl FileSystem for S3Fs {
             Self::insert_and_entry(&mut cache, &path, meta, 0)
         };
 
+        let rules = self.ruleset.resolve(&path);
         let mut handles = self.handles.lock().unwrap();
-        let handle = handles.open(ino, true);
+        let handle = handles.open(ino, true, rules);
 
         Ok((fuse_entry, Some(handle), OpenOptions::empty(), None))
     }

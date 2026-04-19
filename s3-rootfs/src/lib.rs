@@ -20,6 +20,7 @@ pub mod config;
 pub mod inode_cache;
 pub mod keys;
 pub mod read_cache;
+pub mod ruleset;
 mod s3;
 mod s3fs;
 pub mod storage;
