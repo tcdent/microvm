@@ -591,3 +591,66 @@ fn rename_dir_at_scale() {
             exp_content, String::from_utf8_lossy(&w.buf[..n]), n);
     }
 }
+
+#[test]
+fn ruleset_loads_and_routes_ephemeral() {
+    // End-to-end integration test: S3Fs::new loads a real TOML file,
+    // creates a file at an ephemeral path, writes, releases, and
+    // verifies the data is NOT in S3 (ephemeral skips PUT).
+    require_s3!();
+
+    // Write a minimal ruleset TOML to a tempfile
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), r#"
+[[rule]]
+glob = "**/.npm/_cacache/**"
+durability = "ephemeral"
+"#).unwrap();
+
+    let fix = TestFixture::with_config(|cfg| {
+        cfg.ruleset_path = Some(tmp.path().to_path_buf());
+    });
+    fix.seed_root();
+
+    let dir = fix.lookup(ROOT, &fix.prefix).unwrap();
+
+    // Create a nested path that matches the ephemeral rule
+    fix.fs.mkdir(&root_ctx(), dir.inode, &cname(".npm"), 0o755, 0).unwrap();
+    let npm_dir = fix.lookup(dir.inode, ".npm").unwrap();
+    fix.fs.mkdir(&root_ctx(), npm_dir.inode, &cname("_cacache"), 0o755, 0).unwrap();
+    let cache_dir = fix.lookup(npm_dir.inode, "_cacache").unwrap();
+
+    // Create + write + release a file under _cacache
+    let args = CreateIn {
+        flags: libc::O_WRONLY as u32,
+        mode: 0o644,
+        umask: 0,
+        fuse_flags: 0,
+    };
+    let (entry, handle, _, _) = fix.fs.create(&root_ctx(), cache_dir.inode, &cname("sha256-abc"), args).unwrap();
+    let wh = handle.unwrap();
+    let data = b"cached package content";
+    let mut reader = TestReader::new(data.to_vec());
+    fix.fs.write(&root_ctx(), entry.inode, wh, &mut reader,
+                 data.len() as u32, 0, None, false, 0, 0).unwrap();
+    fix.fs.release(&root_ctx(), entry.inode, 0, wh, true, false, None).unwrap();
+
+    // Drain any durable writes (should be none for this path)
+    fix.fs.sync_all();
+
+    // The file should be readable via FUSE (inflight map)
+    let found = fix.lookup(cache_dir.inode, "sha256-abc").unwrap();
+    let (rh, _, _) = fix.fs.open(&root_ctx(), found.inode, libc::O_RDONLY as u32, 0).unwrap();
+    let mut w = TestWriter::new();
+    let n = fix.fs.read(&root_ctx(), found.inode, rh.unwrap(), &mut w, 4096, 0, None, 0).unwrap();
+    assert_eq!(&w.buf[..n], data, "ephemeral file must be readable via inflight map");
+
+    // But S3 should only have the EMPTY bytes from create() — the
+    // deferred PUT was skipped for ephemeral.
+    let path = fix.path(".npm/_cacache/sha256-abc");
+    let meta = s3_rootfs::KeyMeta::new(libc::S_IFREG as u32 | 0o755, 0, 0);
+    let key = s3_rootfs::encode_key(&path, meta);
+    let stored = fix.client.get(&key).unwrap();
+    assert_eq!(stored.len(), 0,
+        "ephemeral file must NOT have been PUT to S3 — got {} bytes", stored.len());
+}

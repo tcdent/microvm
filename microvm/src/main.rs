@@ -81,6 +81,16 @@ fn config_from_env() -> LaunchConfig {
         * 1024
         * 1024;
 
+    // Workload ruleset (research/14 §1). Default: coding-agent.toml
+    // shipped alongside the binary. Override via VM_RULESET env var.
+    // Absent file is tolerated — empty ruleset, all paths get defaults.
+    let ruleset_path = std::path::PathBuf::from(
+        env_or("VM_RULESET", "rulesets/coding-agent.toml"),
+    );
+    if ruleset_path.exists() {
+        fs.ruleset_path = Some(ruleset_path);
+    }
+
     // Golden layer: opt-in via VM_GOLDEN_BUCKET. When set, S3Fs::new
     // loads the manifest + every blob at orchestrator init. Manifest
     // key defaults to `.manifest` (research/12 convention); override

@@ -86,6 +86,29 @@ impl TestFixture {
         Self { fs, client, prefix, owns_prefix: true }
     }
 
+    /// Build a `TestFixture` with a custom `FsConfig`. Used by tests
+    /// that need to set non-default options (e.g. `ruleset_path`).
+    pub fn with_config(cfg_fn: impl FnOnce(&mut FsConfig)) -> Self {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = format!("t_{}_{}", ts, id);
+
+        let config = test_config();
+        let verify_config = test_config();
+
+        let mut fs_cfg = FsConfig { s3: config, ..Default::default() };
+        cfg_fn(&mut fs_cfg);
+        let fs = S3Fs::new(fs_cfg);
+        fs.init(FsOptions::empty()).expect("S3Fs init failed");
+
+        let client = S3Client::new(verify_config);
+
+        Self { fs, client, prefix, owns_prefix: true }
+    }
+
     /// Build a `TestFixture` with the golden layer populated from
     /// the given seeds. Blobs are stored at per-test-unique keys
     /// (`<prefix>/golden_blob_<i>`) to avoid cross-test collisions

@@ -1,0 +1,67 @@
+# Default ruleset for coding-agent workloads (research/14 §2).
+#
+# Marks package-manager caches and build-tool scratch as Ephemeral:
+# writes stay in the inflight map (visible to reads) but never PUT
+# to S3. These paths are rebuilt on demand by the tools that own
+# them — persisting to S3 is pure waste.
+#
+# Paths are glob-matched against S3 key paths (no leading slash).
+# Last-match-wins for overlapping patterns.
+
+# ── npm / node ────────────────────────────────────────────────────
+
+[[rule]]
+glob = "**/.npm/_cacache/**"
+durability = "ephemeral"
+
+[[rule]]
+glob = "**/node_modules/.cache/**"
+durability = "ephemeral"
+
+# ── pip / Python ──────────────────────────────────────────────────
+
+[[rule]]
+glob = "**/.cache/pip/**"
+durability = "ephemeral"
+
+[[rule]]
+glob = "**/__pycache__/**"
+durability = "ephemeral"
+
+[[rule]]
+glob = "**/.pytest_cache/**"
+durability = "ephemeral"
+
+[[rule]]
+glob = "**/.mypy_cache/**"
+durability = "ephemeral"
+
+# ── Rust / cargo ──────────────────────────────────────────────────
+
+[[rule]]
+glob = "**/target/debug/incremental/**"
+durability = "ephemeral"
+
+[[rule]]
+glob = "**/target/release/incremental/**"
+durability = "ephemeral"
+
+[[rule]]
+glob = "**/target/debug/.fingerprint/**"
+durability = "ephemeral"
+
+[[rule]]
+glob = "**/target/release/.fingerprint/**"
+durability = "ephemeral"
+
+# ── Go ────────────────────────────────────────────────────────────
+
+[[rule]]
+glob = "**/.cache/go-build/**"
+durability = "ephemeral"
+
+# ── Gradle / JVM ──────────────────────────────────────────────────
+
+[[rule]]
+glob = "**/.gradle/caches/**"
+durability = "ephemeral"
