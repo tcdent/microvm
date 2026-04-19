@@ -383,7 +383,10 @@ impl WritePool {
     /// Rejects paths containing `..` to prevent writes outside
     /// the ephemeral directory.
     fn ephemeral_path(dir: &std::path::Path, path: &str) -> io::Result<std::path::PathBuf> {
-        if path.split('/').any(|c| c == "..") {
+        // Reject '..' components and absolute paths. Rust's
+        // PathBuf::join replaces the base on absolute paths,
+        // which would escape the ephemeral directory.
+        if path.starts_with('/') || path.split('/').any(|c| c == "..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("path traversal rejected: {}", path),
