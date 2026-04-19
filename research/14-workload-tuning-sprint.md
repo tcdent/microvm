@@ -205,6 +205,22 @@ These items carried over from research/13 §5 and are sprint-scope:
   oldest-per-path first?). Not a correctness bug for any workload
   we've seen, but a host-stability bug waiting for the wrong
   workload. First-class follow-up, size unknown.
+- **Ephemeral VM isolation (docs-only)** (2026-04-19, eae6934).
+  `VM_EPHEMERAL_DIR` used as-is; commit documents per-VM-subdir
+  convention but doesn't enforce it. `microvm/main.rs` already parses
+  `VM_ID` — appending it to ephemeral_dir would prevent "user sets
+  VM_ID expecting isolation, collision still happens". Latent
+  footgun for orchestrator-hoist; not a correctness bug today.
+  Two-line fix when orchestrator work starts.
+- **Hardlink on ephemeral paths** (2026-04-19, deferred in 835f710).
+  link() issues an S3 COPY to a `.hardlinks/<uuid>` ref body from
+  the source key — which, for ephemeral paths, was never PUT, so
+  COPY 404s. nvm/npm don't hardlink into their cache paths so this
+  doesn't block any current workload. Fix when a workload needs it:
+  for ephemeral sources, read the local disk file and write a
+  `.hardlinks/<uuid>` file on local disk (or keep in inflight map
+  as a special entry), same semantic as the durable hardlink ref
+  but routed to the ephemeral storage tier.
 - **Git+SSH dependency auth** (vm:2.5 2026-04-18). npm/cargo/pip
   packages with SSH git URLs (observed: openclaw's libsignal-node
   using `ssh://git@github.com/...`) fail inside the VM without SSH
@@ -273,17 +289,48 @@ commit time per change.
 
 ---
 
-## 8. Success criteria
+## 8. Outcomes (sprint closed 2026-04-19)
 
-- **`npm install` wall clock** on a medium project: further reduction
-  vs research/13 baseline (which was already -19.6% vs pre-sprint).
-- **PUT volume** on the same workload: substantial reduction from
-  ephemeral path filtering.
-- **`cargo build` first-build wall clock**: measure and establish
-  baseline if not already captured.
-- **`git clone` + operations** inside VM: no longer broken by rename
-  non-atomicity on real-world repos.
-- **apt install** inside a running VM: works end-to-end without manual
-  sources.list / gpgv workarounds.
+Final bench at HEAD (835f710), workload = `nvm install 22 + npm install
+-g typescript` (bounded, completable, ephemeral-write-heavy):
 
-Details TBD once §1+§2 land and we see concrete numbers.
+| Metric | Baseline (pre-sprint) | HEAD | Delta |
+|---|---|---|---|
+| PUT volume | 6478 | 579 | **-91%** |
+| GET volume | 836 | 10 | **-99%** |
+| Wall clock (typescript workload) | 4m 13s | 3m 33s | **-16%** |
+| Wall clock (nvm binary alone) | 3m 39s | 1m 47s | **-51%** |
+
+Correctness milestone: `nvm install 22 + npm install -g openclaw`
+(previously could not complete under any configuration) now runs
+through the entire nvm + npm dep tree until it hits openclaw's own
+`ssh://git@github.com/...` dependency — a 3rd-party repo-auth issue,
+not our filesystem. Every FS correctness bug that previously gated
+this workload is resolved.
+
+Items from §5 resolved this sprint:
+
+- Setattr persistence (research/07 §10c) — fixed in 40b5e3c,
+  corrected in 2db774b. test_permissions 4/5 → 5/5 after 4 sprints.
+- Rename throughput — parallel COPY+DELETE (b7b9e5e) 17s → 9.5s on
+  500-file test. S3-native batch approach still open for larger wins.
+- Bootstrap rootfs cluster (cb0e301) — apt update + install + external
+  curl work end-to-end.
+- Duplicate VM launch on same macvtap — tap flock detection (e70cb56).
+- Ephemeral RAM eviction — obsoleted by disk migration (5b952f6):
+  ephemeral writes now go to local disk (`VM_EPHEMERAL_DIR`), no RAM
+  ceiling, no eviction, no data loss under budget pressure.
+- Large-file read-cache bypass — solved by §4 dynamic read-ahead
+  (6f1069e); window grows naturally on sequential reads.
+- Write-then-read visibility — resolved during sprint-13 close by
+  TTL=0 (90b92ec); confirmed not a regression in sprint-14.
+- Sources.list 0-bytes — folded into bootstrap cluster fix.
+
+Items remaining in §5 for a follow-up sprint:
+
+- S3-native dir-rename batch (true O(1) instead of parallelized O(n)).
+- Git+SSH dependency auth (host-side credential injection).
+- VM_ID-based ephemeral_dir enforcement (two-line fix when
+  orchestrator hoists to host scope).
+- Hardlink on ephemeral paths (no current workload exercises it).
+- IPv6 link-local without gateway (curl -4 workaround).
