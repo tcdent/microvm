@@ -66,6 +66,14 @@ else
     echo "macvtap $VM_NET already exists"
 fi
 
+# --- Check for duplicate VM on the same tap ---
+TAPIDX=${TAPIDX:-$(cat /sys/class/net/"$VM_NET"/ifindex 2>/dev/null)}
+if [ -n "$TAPIDX" ] && fuser /dev/tap"$TAPIDX" >/dev/null 2>&1; then
+    echo "ERROR: /dev/tap$TAPIDX already in use by pid $(fuser /dev/tap"$TAPIDX" 2>/dev/null)"
+    echo "Another VM is running on $VM_NET. One VM per macvtap."
+    exit 1
+fi
+
 # --- Golden bucket: build or reuse ---
 if [ "$REBUILD" -eq 1 ]; then
     echo "Rebuilding golden bucket $VM_GOLDEN_BUCKET (--rebuild)..."
