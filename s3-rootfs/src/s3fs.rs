@@ -1525,14 +1525,23 @@ impl FileSystem for S3Fs {
             self.write_pool.wait_for_path(&old_path);
         }
 
-        // Rename the entry itself — server-side copy, no data through client
+        // Rename the entry itself.
         let old_key = keys::encode(&old_path, meta);
         let new_key = keys::encode(&new_path, meta);
 
-        self.client.copy(&old_key, &new_key)
-            .io_err(&format!("rename COPY {} -> {}", old_path, new_path))?;
-        self.client.delete(&old_key)
-            .io_err(&format!("rename DELETE {}", old_path))?;
+        if self.write_pool.is_ephemeral(&old_path) {
+            // Ephemeral source: the old key was never PUT to S3.
+            // Move the inflight entry (which IS the data) to the new
+            // path+key. No S3 ops needed.
+            log!("rename EPHEMERAL {} -> {}", old_path, new_path);
+            self.write_pool.rename_path(&old_path, &new_path, new_key);
+        } else {
+            // Durable source: server-side S3 copy, no data through client.
+            self.client.copy(&old_key, &new_key)
+                .io_err(&format!("rename COPY {} -> {}", old_path, new_path))?;
+            self.client.delete(&old_key)
+                .io_err(&format!("rename DELETE {}", old_path))?;
+        }
 
         // Read-cache invalidation: drop the old-path entry if any.
         // new_path won't hit the cache until someone reads it, at

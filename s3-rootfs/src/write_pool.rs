@@ -181,6 +181,34 @@ impl WritePool {
         self.inflight.lock().unwrap().len()
     }
 
+    /// Check if a path has an ephemeral inflight entry.
+    pub fn is_ephemeral(&self, path: &str) -> bool {
+        self.inflight
+            .lock()
+            .unwrap()
+            .get(path)
+            .is_some_and(|e| e.ephemeral)
+    }
+
+    /// Move an inflight entry from old_path to new_path with a new
+    /// S3 key. Used by rename() for ephemeral files that were never
+    /// PUT to S3 — the inflight map IS their storage, so the entry
+    /// must follow the rename. No-op if old_path has no inflight entry.
+    pub fn rename_path(&self, old_path: &str, new_path: &str, new_key: String) {
+        let mut inflight = self.inflight.lock().unwrap();
+        if let Some(mut entry) = inflight.remove(old_path) {
+            entry.key = new_key;
+            inflight.insert(new_path.to_string(), entry);
+        }
+        // Also update any pending coalesce timer.
+        let mut cs = self.coalesce.lock().unwrap();
+        if let Some(expiry) = cs.by_path.remove(old_path) {
+            cs.by_time.remove(&(expiry, old_path.to_string()));
+            cs.by_path.insert(new_path.to_string(), expiry);
+            cs.by_time.insert((expiry, new_path.to_string()), ());
+        }
+    }
+
     /// Look up a pending write by visible path. Used by
     /// `read()` for read-your-writes. Returns the `Arc<Vec<u8>>`
     /// so the caller can slice without holding the lock.
