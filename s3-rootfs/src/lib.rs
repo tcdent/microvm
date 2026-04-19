@@ -19,6 +19,7 @@ pub mod blob_cache;
 pub mod config;
 pub mod inode_cache;
 pub mod keys;
+pub mod read_ahead;
 pub mod read_cache;
 pub mod ruleset;
 mod s3;

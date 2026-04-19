@@ -25,6 +25,7 @@ use crate::blob_cache::{
 use crate::config::FsConfig;
 use crate::inode_cache::{CachedInode, InodeCache};
 use crate::keys::{self, KeyMeta};
+use crate::read_ahead::ReadAheadState;
 use crate::read_cache::{self, ReadCache};
 use crate::ruleset::{Durability, HandleRules, Ruleset};
 use crate::s3::{S3Client, S3ResultExt};
@@ -152,10 +153,10 @@ struct HandleEntry {
     /// For pure read handles, stays `None` — reads go through the
     /// cross-handle [`ReadCache`] and inflight map now.
     data: Option<Vec<u8>>,
-    /// Read-ahead buffer for files above the per-file cache threshold.
-    /// Handle-local streaming buffer; freed when the handle closes.
-    read_ahead: Option<Vec<u8>>,
-    read_ahead_offset: u64,
+    /// Dynamic read-ahead state (research/14 §4). Per-fd streak
+    /// detection + prefetch chunk. Replaces the static read_ahead +
+    /// read_ahead_offset fields.
+    ra: ReadAheadState,
     /// Per-handle rules resolved from the compiled ruleset at
     /// `open()`/`create()` time (research/14 §1). Consulted by
     /// read/write/release without further glob matching.
@@ -173,8 +174,7 @@ impl HandleTable {
         self.by_handle.insert(handle, HandleEntry {
             inode,
             dirty: false,
-            read_ahead: None,
-            read_ahead_offset: 0,
+            ra: ReadAheadState::new(rules.readahead),
             rules,
             data: if writing { Some(Vec::new()) } else { None },
         });
@@ -515,20 +515,19 @@ impl S3Fs {
         // check is `offset` inside the previously-fetched chunk;
         // satisfies contiguous reads from one GET's worth of bytes.
         {
-            let handles = self.handles.lock().unwrap();
-            if let Some(entry) = handles.by_handle.get(&handle) {
+            let mut handles = self.handles.lock().unwrap();
+            if let Some(entry) = handles.by_handle.get_mut(&handle) {
                 if let Some(ref data) = entry.data {
                     if !data.is_empty() {
                         return serve_slice(w, data, offset, size);
                     }
                 }
-                if let Some(ref ra) = entry.read_ahead {
-                    let ra_start = entry.read_ahead_offset;
-                    let ra_end = ra_start + ra.len() as u64;
-                    if offset >= ra_start && offset + size as u64 <= ra_end {
-                        let buf_offset = (offset - ra_start) as usize;
-                        return serve_slice(w, ra, buf_offset as u64, size);
-                    }
+                // Step 2: dynamic read-ahead chunk (research/14 §4).
+                if let Some(slice) = entry.ra.try_serve(offset, size) {
+                    let result = w.write(slice)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    entry.ra.observe(offset, size);
+                    return Ok(result);
                 }
             }
         }
@@ -625,17 +624,27 @@ impl S3Fs {
             return serve_slice(w, &shared, offset, size);
         }
 
-        // Large file: read-ahead chunk. Fetch `read_ahead_size`
-        // bytes starting at the requested offset, serve the
-        // requested slice, stash the chunk on the handle so the
-        // next contiguous read hits step (2).
+        // Large file: dynamic read-ahead (research/14 §4). Fetch
+        // current_window() bytes starting at the requested offset,
+        // serve the requested slice, stash the chunk on the handle's
+        // ReadAheadState so the next contiguous read hits step (2).
+        let window = {
+            let handles = self.handles.lock().unwrap();
+            handles.by_handle.get(&handle)
+                .map(|e| e.ra.current_window())
+                .unwrap_or(self.read_ahead_size)
+        };
+        // ReadAhead::Off produces window=0 — skip prefetch entirely,
+        // fetch only the exact requested range.
+        let fetch_size = if window > 0 { window } else { size as usize };
         let chunk_start = offset;
-        let chunk_end = std::cmp::min(chunk_start + self.read_ahead_size as u64, file_size);
+        let chunk_end = std::cmp::min(chunk_start + fetch_size as u64, file_size);
         log!(
-            "S3 GET read-ahead {} offset={} size={}",
+            "S3 GET read-ahead {} offset={} size={} window={}",
             path,
             chunk_start,
-            chunk_end - chunk_start
+            chunk_end - chunk_start,
+            window
         );
         let ra_data = self.client.get_range(&key, chunk_start, chunk_end - 1)
             .io_err(&format!("read-ahead GET {}", path))?;
@@ -646,8 +655,9 @@ impl S3Fs {
 
         let mut handles = self.handles.lock().unwrap();
         if let Some(entry) = handles.get_mut(handle) {
-            entry.read_ahead = Some(ra_data);
-            entry.read_ahead_offset = chunk_start;
+            entry.ra.observe(offset, size);
+            entry.ra.chunk = Some(ra_data);
+            entry.ra.chunk_offset = chunk_start;
         }
         Ok(result)
     }
