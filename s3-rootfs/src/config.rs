@@ -100,6 +100,12 @@ pub struct FsConfig {
     /// they drain the inflight queue in parallel against S3.
     pub write_workers: usize,
 
+    /// RAM budget for ephemeral writes (research/14 §2). Ephemeral
+    /// entries never drain to S3 — this cap prevents a runaway
+    /// package-manager cache from exhausting host RAM. When exceeded,
+    /// oldest ephemeral entries are evicted by submission time.
+    pub ephemeral_budget: usize,
+
     /// Golden filesystem layer (research/12). `None` means single-
     /// bucket behavior: every lookup/read goes through the per-VM
     /// bucket. `Some` means `S3Fs::new` will load the golden inode
@@ -122,6 +128,7 @@ impl Default for FsConfig {
             read_cache_budget: 100 * 1024 * 1024,
             write_inflight_budget: 100 * 1024 * 1024,
             write_workers: 8,
+            ephemeral_budget: 200 * 1024 * 1024,
             golden: None,
             ruleset_path: None,
         }

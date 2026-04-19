@@ -80,11 +80,23 @@ pub struct WritePool {
     /// locking the inflight mutex.
     current_inflight_bytes: AtomicUsize,
 
-    /// Upper cap on aggregate inflight bytes. When a new write
-    /// would push past this, release falls back to a synchronous
-    /// PUT inline. Prevents unbounded memory growth under burst
-    /// write load.
+    /// Upper cap on aggregate durable inflight bytes. When a new
+    /// durable write would push past this, release falls back to a
+    /// synchronous PUT inline. Prevents unbounded memory growth
+    /// under burst write load.
     budget_bytes: usize,
+
+    /// Sum of `bytes.len()` across EPHEMERAL inflight entries only.
+    /// Separate from `current_inflight_bytes` which tracks durable
+    /// transit. Ephemeral entries never drain to S3 — this counter
+    /// only decreases when entries are evicted or replaced.
+    current_ephemeral_bytes: AtomicUsize,
+
+    /// Upper cap on aggregate ephemeral bytes. When exceeded, the
+    /// oldest ephemeral entries (by `submitted_at`) are evicted
+    /// until the total drops below budget. Prevents a runaway
+    /// package-manager cache from exhausting host RAM.
+    ephemeral_budget_bytes: usize,
 
     /// Workers check this on every loop iteration. `Drop` sets it
     /// true, notifies all waiters, and joins.
@@ -119,6 +131,10 @@ struct CoalesceState {
 pub struct WritePoolConfig {
     pub workers: usize,
     pub budget_bytes: usize,
+    /// RAM budget for ephemeral entries (never drain to S3).
+    /// Default: 200 MB. When exceeded, oldest ephemeral entries
+    /// are evicted by `submitted_at`.
+    pub ephemeral_budget_bytes: usize,
     pub client: Arc<S3Client>,
 }
 
@@ -136,6 +152,8 @@ impl WritePool {
             inflight_cvar: Condvar::new(),
             current_inflight_bytes: AtomicUsize::new(0),
             budget_bytes: cfg.budget_bytes,
+            current_ephemeral_bytes: AtomicUsize::new(0),
+            ephemeral_budget_bytes: cfg.ephemeral_budget_bytes,
             shutdown: AtomicBool::new(false),
             client: cfg.client,
             coalesce: Mutex::new(CoalesceState {
@@ -257,12 +275,16 @@ impl WritePool {
             }
         }
 
-        // Insert (or replace) in inflight map, adjust counter.
+        // Insert (or replace) in inflight map, adjust counters.
         {
             let mut inflight = self.inflight.lock().unwrap();
             if let Some(old) = inflight.remove(&path) {
                 self.current_inflight_bytes
                     .fetch_sub(old.bytes.len(), Ordering::Relaxed);
+                if old.ephemeral {
+                    self.current_ephemeral_bytes
+                        .fetch_sub(old.bytes.len(), Ordering::Relaxed);
+                }
             }
             inflight.insert(
                 path.clone(),
@@ -275,6 +297,16 @@ impl WritePool {
             );
             self.current_inflight_bytes
                 .fetch_add(size, Ordering::Relaxed);
+            if ephemeral {
+                self.current_ephemeral_bytes
+                    .fetch_add(size, Ordering::Relaxed);
+
+                // Evict oldest ephemeral entries if over budget.
+                let eph_total = self.current_ephemeral_bytes.load(Ordering::Relaxed);
+                if eph_total > self.ephemeral_budget_bytes {
+                    self.evict_ephemeral(&mut inflight, eph_total);
+                }
+            }
         }
 
         // Ephemeral entries stay in the inflight map for reads but
@@ -337,6 +369,33 @@ impl WritePool {
         let mut inflight = self.inflight.lock().unwrap();
         while inflight.values().any(|e| !e.ephemeral) {
             inflight = self.inflight_cvar.wait(inflight).unwrap();
+        }
+    }
+
+    /// Evict the oldest ephemeral entries until ephemeral bytes
+    /// drop below budget. Called under the inflight lock.
+    fn evict_ephemeral(
+        &self,
+        inflight: &mut HashMap<String, InflightWrite>,
+        mut eph_total: usize,
+    ) {
+        // Collect ephemeral entries sorted by submitted_at (oldest first).
+        let mut candidates: Vec<(Instant, String, usize)> = inflight
+            .iter()
+            .filter(|(_, e)| e.ephemeral)
+            .map(|(p, e)| (e.submitted_at, p.clone(), e.bytes.len()))
+            .collect();
+        candidates.sort_by_key(|(t, _, _)| *t);
+
+        for (_, path, size) in candidates {
+            if eph_total <= self.ephemeral_budget_bytes {
+                break;
+            }
+            inflight.remove(&path);
+            self.current_inflight_bytes.fetch_sub(size, Ordering::Relaxed);
+            self.current_ephemeral_bytes.fetch_sub(size, Ordering::Relaxed);
+            eph_total -= size;
+            log!("evict EPHEMERAL {} ({} bytes)", path, size);
         }
     }
 
@@ -523,6 +582,7 @@ mod tests {
         WritePool::start(WritePoolConfig {
             workers,
             budget_bytes: budget,
+            ephemeral_budget_bytes: 10_000_000,
             client,
         })
     }
