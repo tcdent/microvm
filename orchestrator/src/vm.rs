@@ -6,6 +6,7 @@
 //! doesn't take the orchestrator down.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use microvm::launcher::LaunchConfig;
@@ -73,7 +74,8 @@ pub fn spawn(
         });
     }
 
-    // 7. Build LaunchConfig.
+    // 7. Build LaunchConfig with shared shutdown flag.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let cfg = LaunchConfig {
         kernel_path: spec.kernel.as_ref()
             .unwrap_or(&shared.config.default_kernel)
@@ -87,6 +89,7 @@ pub fn spawn(
         mem_mb: spec.mem_mb as usize,
         vm_id: name_hash.clone(),
         fs,
+        shutdown: Some(Arc::clone(&shutdown_flag)),
     };
 
     // 8. Insert into registry as Starting.
@@ -96,6 +99,7 @@ pub fn spawn(
         state: VmState::Starting,
         started_at: Instant::now(),
         thread: None,
+        shutdown_flag,
     };
     registry.insert(entry)?;
 

@@ -5,7 +5,8 @@
 //! here; the registry is the source of truth for "what's running".
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::ipc::proto::{VmInfo, VmSpec, VmState};
@@ -20,7 +21,9 @@ pub struct VmEntry {
     pub state: VmState,
     pub started_at: Instant,
     pub thread: Option<std::thread::JoinHandle<()>>,
-    // TODO phase 5: shutdown channel, log file handle, etc.
+    /// Shared with the VM's vcpu loop. Setting this to true causes
+    /// the vcpu loop to exit at the next iteration.
+    pub shutdown_flag: Arc<AtomicBool>,
 }
 
 impl VmRegistry {
@@ -75,12 +78,25 @@ impl VmRegistry {
         }
     }
 
-    /// Store the thread handle on an existing entry. Called after
-    /// spawn returns — the entry was inserted as Starting before
-    /// the thread launched.
+    /// Store the thread handle on an existing entry.
     pub fn set_thread(&self, name_hash: &str, handle: std::thread::JoinHandle<()>) {
         if let Some(entry) = self.entries.lock().unwrap().get_mut(name_hash) {
             entry.thread = Some(handle);
         }
+    }
+
+    /// Get the shutdown flag for a VM. Returns None if not found.
+    pub fn shutdown_flag(&self, name_hash: &str) -> Option<Arc<AtomicBool>> {
+        self.entries.lock().unwrap()
+            .get(name_hash)
+            .map(|e| Arc::clone(&e.shutdown_flag))
+    }
+
+    /// Take the thread handle out for joining. Returns None if
+    /// already taken or not found.
+    pub fn take_thread(&self, name_hash: &str) -> Option<std::thread::JoinHandle<()>> {
+        self.entries.lock().unwrap()
+            .get_mut(name_hash)
+            .and_then(|e| e.thread.take())
     }
 }

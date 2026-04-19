@@ -57,7 +57,37 @@ impl Orchestrator {
     /// Graceful shutdown: drain writes, stop vcpu, join thread.
     /// Preserves the bucket (bucket deletion is a separate op).
     pub fn stop_vm(&self, name: &str) -> Result<(), Error> {
-        todo!("phase 7 — stop path")
+        let hash = registry::VmRegistry::name_hash(name);
+
+        // Check current state.
+        let info = self.registry.inspect(name).ok_or(Error::NotFound)?;
+        match info.state {
+            VmState::Stopped | VmState::Crashed => return Ok(()),
+            VmState::Stopping => {
+                // Already stopping — just wait for the thread.
+                if let Some(handle) = self.registry.take_thread(&hash) {
+                    let _ = handle.join();
+                }
+                return Ok(());
+            }
+            VmState::Starting | VmState::Running => {}
+        }
+
+        // Signal the VM to shut down.
+        self.registry.transition_state(&hash, VmState::Stopping);
+        if let Some(flag) = self.registry.shutdown_flag(&hash) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Join the thread (blocks until vcpu loop exits).
+        if let Some(handle) = self.registry.take_thread(&hash) {
+            let _ = handle.join();
+        }
+
+        // Thread's own cleanup transitions to Stopped/Crashed.
+        // If it didn't (e.g. join returned before transition), force it.
+        self.registry.transition_state(&hash, VmState::Stopped);
+        Ok(())
     }
 
     /// Snapshot of every registered VM.

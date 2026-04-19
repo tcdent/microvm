@@ -98,6 +98,7 @@ fn config_from_env() -> LaunchConfig {
         mem_mb: env_or("VM_MEMORY", "1024").parse().unwrap_or(1024),
         vm_id: env_or("VM_ID", "default"),
         fs,
+        shutdown: None,
     }
 }
 

@@ -16,6 +16,7 @@
 //! anything across a socket.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use vm_memory::GuestMemoryMmap;
@@ -62,6 +63,12 @@ pub struct LaunchConfig {
     pub vm_id: String,
     /// Filesystem configuration (bucket, caching, TTLs).
     pub fs: s3_rootfs::config::FsConfig,
+    /// Host-side shutdown flag. When set to true, the vcpu loop
+    /// exits at the next iteration. The orchestrator's stop_vm
+    /// sets this, then signals the vcpu thread to break out of
+    /// KVM_RUN. `None` means no external shutdown control (the
+    /// standalone binary doesn't use this).
+    pub shutdown: Option<Arc<AtomicBool>>,
 }
 
 // ── Filesystem bring-up ────────────────────────────────────────────────
@@ -127,6 +134,10 @@ pub fn launch_vm(cfg: LaunchConfig, fs: Arc<S3Fs>) -> Result<(), Box<dyn std::er
 
 // ── VM instance ────────────────────────────────────────────────────────
 
+/// Thread ID of the vcpu thread, stored after spawn for signal-based
+/// KVM_RUN interruption. The orchestrator sends SIGUSR1 to kick the
+/// vcpu out of a blocking KVM_RUN when the shutdown flag is set.
+///
 /// In-memory representation of a running VM: KVM handles, guest RAM,
 /// vCPU, and the virtio devices wired into MMIO space.
 ///
@@ -148,6 +159,8 @@ struct System {
     // TODO: wire into launch_vm when that consolidation lands.
     #[allow(dead_code)]
     poll: EventPoll,
+    /// Host-side shutdown control. Checked between KVM_RUN iterations.
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl System {
@@ -192,7 +205,7 @@ impl System {
 
         let poll = EventPoll::new();
 
-        Ok(Self { vm, memory, vcpu, serial, console, virtiofs, virtionet, poll })
+        Ok(Self { vm, memory, vcpu, serial, console, virtiofs, virtionet, poll, shutdown: cfg.shutdown })
     }
 
     fn run(&mut self) {
@@ -201,7 +214,21 @@ impl System {
         // stdin goes to virtio-console (hvc0), not serial (ttyS0).
         // Serial is output-only for boot messages.
         loop {
-            match self.vcpu.run().expect("KVM_RUN failed") {
+            // Host-side shutdown check.
+            if let Some(ref flag) = self.shutdown {
+                if flag.load(Ordering::Relaxed) {
+                    log!("Host requested shutdown");
+                    break;
+                }
+            }
+            let exit = match self.vcpu.run() {
+                Ok(exit) => exit,
+                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
+                    continue; // interrupted by signal (shutdown kick)
+                }
+                Err(e) => panic!("KVM_RUN failed: {e}"),
+            };
+            match exit {
                 VcpuExit::IoOut(port, data) => match port {
                     0x3F8..=0x3FF => {
                         let offset = port - 0x3F8;
