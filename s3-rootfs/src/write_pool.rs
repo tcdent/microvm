@@ -86,17 +86,12 @@ pub struct WritePool {
     /// under burst write load.
     budget_bytes: usize,
 
-    /// Sum of `bytes.len()` across EPHEMERAL inflight entries only.
-    /// Separate from `current_inflight_bytes` which tracks durable
-    /// transit. Ephemeral entries never drain to S3 — this counter
-    /// only decreases when entries are evicted or replaced.
-    current_ephemeral_bytes: AtomicUsize,
-
-    /// Upper cap on aggregate ephemeral bytes. When exceeded, the
-    /// oldest ephemeral entries (by `submitted_at`) are evicted
-    /// until the total drops below budget. Prevents a runaway
-    /// package-manager cache from exhausting host RAM.
-    ephemeral_budget_bytes: usize,
+    /// Local directory for ephemeral writes. When set, ephemeral
+    /// files are written to disk here instead of held in the inflight
+    /// map. Reads serve from the local file. No RAM pressure, no
+    /// eviction — disk is effectively unbounded. Cleaned up on Drop.
+    /// `None` means ephemeral falls back to durable behavior.
+    ephemeral_dir: Option<std::path::PathBuf>,
 
     /// Workers check this on every loop iteration. `Drop` sets it
     /// true, notifies all waiters, and joins.
@@ -131,10 +126,9 @@ struct CoalesceState {
 pub struct WritePoolConfig {
     pub workers: usize,
     pub budget_bytes: usize,
-    /// RAM budget for ephemeral entries (never drain to S3).
-    /// Default: 200 MB. When exceeded, oldest ephemeral entries
-    /// are evicted by `submitted_at`.
-    pub ephemeral_budget_bytes: usize,
+    /// Local directory for ephemeral writes. `None` means ephemeral
+    /// falls back to durable (no silent data loss).
+    pub ephemeral_dir: Option<std::path::PathBuf>,
     pub client: Arc<S3Client>,
 }
 
@@ -152,8 +146,7 @@ impl WritePool {
             inflight_cvar: Condvar::new(),
             current_inflight_bytes: AtomicUsize::new(0),
             budget_bytes: cfg.budget_bytes,
-            current_ephemeral_bytes: AtomicUsize::new(0),
-            ephemeral_budget_bytes: cfg.ephemeral_budget_bytes,
+            ephemeral_dir: cfg.ephemeral_dir,
             shutdown: AtomicBool::new(false),
             client: cfg.client,
             coalesce: Mutex::new(CoalesceState {
@@ -204,6 +197,7 @@ impl WritePool {
     /// PUT to S3 — the inflight map IS their storage, so the entry
     /// must follow the rename. No-op if old_path has no inflight entry.
     pub fn rename_path(&self, old_path: &str, new_path: &str, new_key: String) {
+        // Move inflight entry if present.
         let mut inflight = self.inflight.lock().unwrap();
         if let Some(mut entry) = inflight.remove(old_path) {
             entry.key = new_key;
@@ -216,17 +210,37 @@ impl WritePool {
             cs.by_path.insert(new_path.to_string(), expiry);
             cs.by_time.insert((expiry, new_path.to_string()), ());
         }
+        // Move ephemeral file on disk if present.
+        if let Some(ref dir) = self.ephemeral_dir {
+            let old_file = dir.join(old_path);
+            if old_file.exists() {
+                let new_file = dir.join(new_path);
+                if let Some(parent) = new_file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&old_file, &new_file);
+            }
+        }
     }
 
     /// Look up a pending write by visible path. Used by
-    /// `read()` for read-your-writes. Returns the `Arc<Vec<u8>>`
-    /// so the caller can slice without holding the lock.
+    /// `read()` for read-your-writes. Checks the inflight map first,
+    /// then the ephemeral disk directory (if configured).
     pub fn get(&self, path: &str) -> Option<Arc<Vec<u8>>> {
-        self.inflight
+        // Check inflight map (durable writes in transit).
+        let inflight_hit = self.inflight
             .lock()
             .unwrap()
             .get(path)
-            .map(|entry| Arc::clone(&entry.bytes))
+            .map(|entry| Arc::clone(&entry.bytes));
+        if inflight_hit.is_some() {
+            return inflight_hit;
+        }
+        // Check ephemeral disk.
+        if let Some(ref dir) = self.ephemeral_dir {
+            return self.read_ephemeral_file(dir, path);
+        }
+        None
     }
 
     /// Try to enqueue a write for deferred PUT. Returns `Ok(true)`
@@ -266,16 +280,23 @@ impl WritePool {
             }
         }
 
-        // Insert (or replace) in inflight map, adjust counters.
+        // Ephemeral: write to local disk, not the inflight map.
+        // No RAM pressure, no eviction — disk handles the storage.
+        // If no ephemeral_dir is configured, fall through to durable.
+        if ephemeral {
+            if let Some(ref dir) = self.ephemeral_dir {
+                self.write_ephemeral_file(dir, &path, &bytes)?;
+                return Ok(true);
+            }
+            // No ephemeral_dir → fall through to durable behavior.
+        }
+
+        // Insert (or replace) in inflight map, adjust counter.
         {
             let mut inflight = self.inflight.lock().unwrap();
             if let Some(old) = inflight.remove(&path) {
                 self.current_inflight_bytes
                     .fetch_sub(old.bytes.len(), Ordering::Relaxed);
-                if old.ephemeral {
-                    self.current_ephemeral_bytes
-                        .fetch_sub(old.bytes.len(), Ordering::Relaxed);
-                }
             }
             inflight.insert(
                 path.clone(),
@@ -283,27 +304,11 @@ impl WritePool {
                     bytes,
                     key,
                     submitted_at: Instant::now(),
-                    ephemeral,
+                    ephemeral: false,
                 },
             );
             self.current_inflight_bytes
                 .fetch_add(size, Ordering::Relaxed);
-            if ephemeral {
-                self.current_ephemeral_bytes
-                    .fetch_add(size, Ordering::Relaxed);
-
-                // Evict oldest ephemeral entries if over budget.
-                let eph_total = self.current_ephemeral_bytes.load(Ordering::Relaxed);
-                if eph_total > self.ephemeral_budget_bytes {
-                    self.evict_ephemeral(&mut inflight, eph_total);
-                }
-            }
-        }
-
-        // Ephemeral entries stay in the inflight map for reads but
-        // never queue for S3 PUT — the inflight map IS their storage.
-        if ephemeral {
-            return Ok(true);
         }
 
         // Coalesced writes enter the debounce timer instead of the
@@ -363,31 +368,32 @@ impl WritePool {
         }
     }
 
-    /// Evict the oldest ephemeral entries until ephemeral bytes
-    /// drop below budget. Called under the inflight lock.
-    fn evict_ephemeral(
+    /// Write an ephemeral file to the local disk directory.
+    /// Creates parent directories as needed. Path on disk mirrors
+    /// the S3 key path so reads can find it by the same name.
+    fn write_ephemeral_file(
         &self,
-        inflight: &mut HashMap<String, InflightWrite>,
-        mut eph_total: usize,
-    ) {
-        // Collect ephemeral entries sorted by submitted_at (oldest first).
-        let mut candidates: Vec<(Instant, String, usize)> = inflight
-            .iter()
-            .filter(|(_, e)| e.ephemeral)
-            .map(|(p, e)| (e.submitted_at, p.clone(), e.bytes.len()))
-            .collect();
-        candidates.sort_by_key(|(t, _, _)| *t);
-
-        for (_, path, size) in candidates {
-            if eph_total <= self.ephemeral_budget_bytes {
-                break;
-            }
-            inflight.remove(&path);
-            self.current_inflight_bytes.fetch_sub(size, Ordering::Relaxed);
-            self.current_ephemeral_bytes.fetch_sub(size, Ordering::Relaxed);
-            eph_total -= size;
-            log!("evict EPHEMERAL {} ({} bytes)", path, size);
+        dir: &std::path::Path,
+        path: &str,
+        data: &[u8],
+    ) -> io::Result<()> {
+        let file_path = dir.join(path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        std::fs::write(&file_path, data)?;
+        Ok(())
+    }
+
+    /// Read an ephemeral file from the local disk directory.
+    /// Returns None if the file doesn't exist.
+    fn read_ephemeral_file(
+        &self,
+        dir: &std::path::Path,
+        path: &str,
+    ) -> Option<Arc<Vec<u8>>> {
+        let file_path = dir.join(path);
+        std::fs::read(&file_path).ok().map(|v| Arc::new(v))
     }
 
     /// Force a coalesced path into the worker queue immediately,
@@ -573,7 +579,7 @@ mod tests {
         WritePool::start(WritePoolConfig {
             workers,
             budget_bytes: budget,
-            ephemeral_budget_bytes: 10_000_000,
+            ephemeral_dir: None,
             client,
         })
     }
@@ -662,36 +668,40 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_skips_queue_and_budget() {
-        // Ephemeral entries: visible via get(), but never queue for
-        // PUT and don't trigger budget rejection.
-        let (pool, handles) = make_pool(0, 100); // 100-byte budget
-        let big = Arc::new(vec![0u8; 200]);
-        // Durable over-budget → rejected
-        let accepted = pool
-            .enqueue("d.txt".into(), "d.txt\x01".into(), Arc::clone(&big), Durability::Durable, None)
-            .unwrap();
-        assert!(!accepted, "durable over budget must be rejected");
+    fn ephemeral_writes_to_disk() {
+        // Ephemeral with ephemeral_dir: writes to local disk,
+        // readable via get(), never touches inflight map or S3.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::s3::S3Config::default();
+        let agent = Arc::new(S3Client::build_agent(&cfg));
+        let client = Arc::new(S3Client::with_shared_agent(cfg, agent));
+        let (pool, handles) = WritePool::start(WritePoolConfig {
+            workers: 0,
+            budget_bytes: 100,
+            ephemeral_dir: Some(tmp.path().to_path_buf()),
+            client,
+        });
 
-        // Ephemeral over-budget → accepted (bypasses budget gate)
+        let data = Arc::new(b"ephemeral content on disk".to_vec());
         let accepted = pool
-            .enqueue("e.txt".into(), "e.txt\x01".into(), Arc::clone(&big), Durability::Ephemeral, None)
+            .enqueue("cache/pkg.tgz".into(), "cache/pkg.tgz\x01".into(),
+                      Arc::clone(&data), Durability::Ephemeral, None)
             .unwrap();
         assert!(accepted, "ephemeral must always be accepted");
-        assert_eq!(pool.inflight_count(), 1);
 
-        // Readable via get()
-        let got = pool.get("e.txt").expect("ephemeral must be readable");
-        assert_eq!(got.len(), 200);
+        // Not in inflight map (written to disk instead).
+        assert_eq!(pool.inflight_count(), 0);
 
-        // wait_for_all returns immediately (only ephemeral in map)
-        pool.wait_for_all();
+        // Readable via get() (reads from disk).
+        let got = pool.get("cache/pkg.tgz").expect("must read from disk");
+        assert_eq!(&*got, &*data);
 
-        // wait_for_path returns immediately for ephemeral path
-        pool.wait_for_path("e.txt");
+        // File exists on disk.
+        assert!(tmp.path().join("cache/pkg.tgz").exists());
 
         pool.shutdown.store(true, Ordering::Relaxed);
         pool.queue_cvar.notify_all();
+        pool.coalesce_cvar.notify_all();
         for h in handles {
             let _ = h.join();
         }

@@ -225,7 +225,7 @@ impl S3Fs {
         let (write_pool, write_threads) = WritePool::start(WritePoolConfig {
             workers: cfg.write_workers,
             budget_bytes: cfg.write_inflight_budget,
-            ephemeral_budget_bytes: cfg.ephemeral_budget,
+            ephemeral_dir: cfg.ephemeral_dir.clone(),
             client: Arc::clone(&client),
         });
 

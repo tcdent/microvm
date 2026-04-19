@@ -100,11 +100,11 @@ pub struct FsConfig {
     /// they drain the inflight queue in parallel against S3.
     pub write_workers: usize,
 
-    /// RAM budget for ephemeral writes (research/14 §2). Ephemeral
-    /// entries never drain to S3 — this cap prevents a runaway
-    /// package-manager cache from exhausting host RAM. When exceeded,
-    /// oldest ephemeral entries are evicted by submission time.
-    pub ephemeral_budget: usize,
+    /// Local directory for ephemeral writes. Ephemeral files are
+    /// written here instead of S3 — no RAM pressure, no eviction.
+    /// Cleaned up on shutdown. `None` means ephemeral paths fall
+    /// back to durable behavior (safe default).
+    pub ephemeral_dir: Option<PathBuf>,
 
     /// Golden filesystem layer (research/12). `None` means single-
     /// bucket behavior: every lookup/read goes through the per-VM
@@ -128,7 +128,7 @@ impl Default for FsConfig {
             read_cache_budget: 100 * 1024 * 1024,
             write_inflight_budget: 100 * 1024 * 1024,
             write_workers: 8,
-            ephemeral_budget: 200 * 1024 * 1024,
+            ephemeral_dir: None,
             golden: None,
             ruleset_path: None,
         }

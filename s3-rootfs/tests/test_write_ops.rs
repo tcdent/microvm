@@ -607,8 +607,10 @@ glob = "**/.npm/_cacache/**"
 durability = "ephemeral"
 "#).unwrap();
 
+    let eph_dir = tempfile::tempdir().unwrap();
     let fix = TestFixture::with_config(|cfg| {
         cfg.ruleset_path = Some(tmp.path().to_path_buf());
+        cfg.ephemeral_dir = Some(eph_dir.path().to_path_buf());
     });
     fix.seed_root();
 

@@ -84,6 +84,15 @@ fn config_from_env() -> LaunchConfig {
         fs.ruleset_path = Some(ruleset_path);
     }
 
+    // Ephemeral local directory (research/14 §2). Ephemeral files
+    // go to disk here instead of RAM. Must be on a real filesystem,
+    // not tmpfs. Created at boot, cleaned up on shutdown.
+    if let Ok(eph_dir) = std::env::var("VM_EPHEMERAL_DIR") {
+        let p = std::path::PathBuf::from(&eph_dir);
+        std::fs::create_dir_all(&p).expect("create ephemeral dir");
+        fs.ephemeral_dir = Some(p);
+    }
+
     // Golden layer: opt-in via VM_GOLDEN_BUCKET. When set, S3Fs::new
     // loads the manifest + every blob at orchestrator init. Manifest
     // key defaults to `.manifest` (research/12 convention); override
