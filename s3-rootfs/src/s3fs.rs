@@ -1156,16 +1156,24 @@ impl FileSystem for S3Fs {
         let meta = KeyMeta::new(libc::S_IFREG as u32 | 0o755, 0, 0);
         let key = keys::encode(&path, meta);
 
-        log!("S3 PUT create {}", path);
-        self.client.put(&key, &[])
-            .io_err(&format!("create PUT {}", path))?;
+        let rules = self.ruleset.resolve(&path);
+
+        // Ephemeral files never touch S3 — skip the initial empty PUT.
+        // The inode cache entry still gets created so lookups work;
+        // the data lives only in the inflight map after release.
+        if rules.durability != Durability::Ephemeral {
+            log!("S3 PUT create {}", path);
+            self.client.put(&key, &[])
+                .io_err(&format!("create PUT {}", path))?;
+        } else {
+            debug!("create EPHEMERAL {} (skipping S3 PUT)", path);
+        }
 
         let (ino, fuse_entry) = {
             let mut cache = self.cache.lock().unwrap();
             Self::insert_and_entry(&mut cache, &path, meta, 0)
         };
 
-        let rules = self.ruleset.resolve(&path);
         let mut handles = self.handles.lock().unwrap();
         let handle = handles.open(ino, true, rules);
 
@@ -1335,9 +1343,14 @@ impl FileSystem for S3Fs {
         let meta = KeyMeta::new(libc::S_IFDIR as u32 | 0o755, 0, 0);
         let key = keys::encode(&path, meta);
 
-        log!("S3 PUT mkdir {}", path);
-        self.client.put(&key, &[])
-            .io_err(&format!("mkdir PUT {}", path))?;
+        let rules = self.ruleset.resolve(&path);
+        if rules.durability != Durability::Ephemeral {
+            log!("S3 PUT mkdir {}", path);
+            self.client.put(&key, &[])
+                .io_err(&format!("mkdir PUT {}", path))?;
+        } else {
+            debug!("mkdir EPHEMERAL {} (skipping S3 PUT)", path);
+        }
 
         let mut cache = self.cache.lock().unwrap();
         let (_, entry) = Self::insert_and_entry(&mut cache, &path, meta, 0);

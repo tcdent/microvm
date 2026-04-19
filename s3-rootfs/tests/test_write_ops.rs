@@ -645,12 +645,13 @@ durability = "ephemeral"
     let n = fix.fs.read(&root_ctx(), found.inode, rh.unwrap(), &mut w, 4096, 0, None, 0).unwrap();
     assert_eq!(&w.buf[..n], data, "ephemeral file must be readable via inflight map");
 
-    // But S3 should only have the EMPTY bytes from create() — the
-    // deferred PUT was skipped for ephemeral.
+    // S3 should have NO object at all — both create() and release()
+    // skip S3 for ephemeral paths.
     let path = fix.path(".npm/_cacache/sha256-abc");
     let meta = s3_rootfs::KeyMeta::new(libc::S_IFREG as u32 | 0o755, 0, 0);
     let key = s3_rootfs::encode_key(&path, meta);
-    let stored = fix.client.get(&key).unwrap();
-    assert_eq!(stored.len(), 0,
-        "ephemeral file must NOT have been PUT to S3 — got {} bytes", stored.len());
+    let result = fix.client.get(&key);
+    assert!(result.is_err(),
+        "ephemeral file must NOT exist in S3 at all — got Ok({} bytes)",
+        result.as_ref().map(|b| b.len()).unwrap_or(0));
 }
