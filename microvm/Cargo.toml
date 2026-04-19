@@ -3,6 +3,14 @@ name = "microvm"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "microvm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "microvm"
+path = "src/main.rs"
+
 [dependencies]
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.24"

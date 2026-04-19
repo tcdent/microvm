@@ -11,23 +11,7 @@
 //! source (IPC, JSON, CLI flags) and terminal handling, and reuse
 //! `launcher::run` unchanged.
 
-#[macro_use]
-mod log;
-
-mod cpu;
-mod event_loop;
-mod kernel;
-mod launcher;
-mod memory;
-mod mptable;
-mod serial;
-mod virtio_console;
-mod virtio_fs;
-mod virtio_mmio;
-mod virtio_net;
-mod vm;
-
-use launcher::LaunchConfig;
+use microvm::launcher::LaunchConfig;
 use s3_rootfs::config::FsConfig;
 
 fn main() {
@@ -36,11 +20,11 @@ fn main() {
     let name = std::ffi::CString::new("microvm").unwrap();
     unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()); }
 
-    log::init();
-    s3_rootfs::set_log_fn(|msg| crate::log::write(msg));
+    microvm::log::init();
+    s3_rootfs::set_log_fn(|msg| microvm::log::write(msg));
 
     let cfg = config_from_env();
-    log!(
+    microvm::log::write(&format!(
         "Config: vm_id={} memory={}MB kernel={} initrd={} net={:?} s3={}",
         cfg.vm_id,
         cfg.mem_mb,
@@ -48,11 +32,11 @@ fn main() {
         cfg.initrd_path,
         cfg.net_ifname,
         cfg.fs.s3.endpoint,
-    );
+    ));
 
     let orig_term = setup_raw_terminal();
 
-    if let Err(e) = launcher::run(cfg) {
+    if let Err(e) = microvm::launcher::run(cfg) {
         eprintln!("Error: {e}");
     }
 
