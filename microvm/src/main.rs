@@ -41,14 +41,13 @@ fn main() {
 
     let cfg = config_from_env();
     log!(
-        "Config: vm_id={} memory={}MB kernel={} initrd={} net={:?} s3={} read_ahead={}B",
+        "Config: vm_id={} memory={}MB kernel={} initrd={} net={:?} s3={}",
         cfg.vm_id,
         cfg.mem_mb,
         cfg.kernel_path,
         cfg.initrd_path,
         cfg.net_ifname,
         cfg.fs.s3.endpoint,
-        cfg.fs.read_ahead_size,
     );
 
     let orig_term = setup_raw_terminal();
@@ -75,12 +74,6 @@ fn config_from_env() -> LaunchConfig {
     if let Ok(bucket) = std::env::var("VM_BUCKET") {
         fs.s3.bucket = bucket;
     }
-    fs.read_ahead_size = env_or("VM_READ_AHEAD", "128")
-        .parse::<usize>()
-        .unwrap_or(128)
-        * 1024
-        * 1024;
-
     // Workload ruleset (research/14 §1). Default: coding-agent.toml
     // shipped alongside the binary. Override via VM_RULESET env var.
     // Absent file is tolerated — empty ruleset, all paths get defaults.

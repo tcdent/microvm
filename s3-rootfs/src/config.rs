@@ -63,9 +63,6 @@ pub enum ManifestSource {
 /// - 100 MB cross-handle read cache. Re-opens of the same file hit
 ///   memory instead of S3. Per-file threshold (budget / 4) keeps a
 ///   single huge read from evicting everything else.
-/// - 128 MB read-ahead. Used for files above the per-file cache
-///   threshold — single GET per chunk, streamed. Sized so a 99 MB
-///   node binary is fetched in 1 GET instead of ~7 at 16 MB.
 /// - 100 MB inflight write budget. `release()` enqueues the buffer
 ///   and returns fast; a worker pool drains to S3 in the background.
 ///   Over budget, release falls back to synchronous PUT (backpressure).
@@ -87,16 +84,10 @@ pub struct FsConfig {
 
     /// Total RAM budget for the cross-handle read cache
     /// (`read_cache.rs`). Files ≤ budget / 4 are cached whole on
-    /// first read; larger files bypass the cache and use
-    /// `read_ahead_size` streaming. Set to 0 to disable caching
-    /// entirely (every read hits S3).
+    /// first read; larger files use dynamic read-ahead (per-fd
+    /// streak detection, research/14 §4). Set to 0 to disable
+    /// caching entirely (every read hits S3).
     pub read_cache_budget: usize,
-
-    /// Window size for sequential read-ahead on files larger than
-    /// the per-file cache threshold. A single GET fetches up to this
-    /// many bytes; subsequent reads within the window hit memory
-    /// (handle-local, freed on close).
-    pub read_ahead_size: usize,
 
     /// Total RAM budget for deferred writes. When `release()` would
     /// push the sum of pending-PUT bytes past this, the release
@@ -129,7 +120,6 @@ impl Default for FsConfig {
         Self {
             s3: S3Config::default(),
             read_cache_budget: 100 * 1024 * 1024,
-            read_ahead_size: 128 * 1024 * 1024,
             write_inflight_budget: 100 * 1024 * 1024,
             write_workers: 8,
             golden: None,
@@ -146,7 +136,6 @@ mod tests {
     fn default_is_sane() {
         let cfg = FsConfig::default();
         assert!(cfg.read_cache_budget > 0);
-        assert!(cfg.read_ahead_size > 0);
         assert!(cfg.write_inflight_budget > 0);
         assert!(cfg.write_workers > 0);
     }
@@ -159,6 +148,6 @@ mod tests {
         };
         assert_eq!(cfg.read_cache_budget, 32 * 1024 * 1024);
         // Other fields keep defaults.
-        assert_eq!(cfg.read_ahead_size, FsConfig::default().read_ahead_size);
+        assert_eq!(cfg.write_inflight_budget, FsConfig::default().write_inflight_budget);
     }
 }

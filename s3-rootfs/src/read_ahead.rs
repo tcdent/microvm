@@ -26,7 +26,7 @@ pub const MAX_WINDOW: usize = 256 * 1024 * 1024;
 /// bandwidth on random-access files that happen to do 2–3 sequential
 /// reads before seeking, large enough to avoid startup penalty on
 /// truly sequential workloads.
-const AUTO_INITIAL_WINDOW: usize = 128 * 1024; // 128 KB
+pub const AUTO_INITIAL_WINDOW: usize = 128 * 1024; // 128 KB
 
 /// Starting window for `ReadAhead::Aggressive`. Archives, binaries,
 /// streaming reads — skip the warmup, start large.

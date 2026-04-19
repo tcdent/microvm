@@ -114,9 +114,6 @@ pub struct S3Fs {
     /// path; holds `Arc<Vec<u8>>` values. Replaces the old per-handle
     /// `data`/`read_cached` buffer for small/medium files.
     read_cache: ReadCache,
-    /// Read-ahead chunk size for files above the per-file cache
-    /// threshold. Streaming buffer lives on the handle.
-    read_ahead_size: usize,
     /// Deferred-write queue + worker pool (research/13 §2).
     /// `release()` enqueues dirty buffers; workers drain to S3 in
     /// the background. `fsync()` blocks until the named path drains.
@@ -248,7 +245,6 @@ impl S3Fs {
             cache: Mutex::new(InodeCache::new()),
             handles: Mutex::new(HandleTable::new()),
             read_cache: ReadCache::new(cfg.read_cache_budget),
-            read_ahead_size: cfg.read_ahead_size,
             write_pool,
             write_threads: Mutex::new(Some(write_threads)),
             golden_inodes,
@@ -632,7 +628,7 @@ impl S3Fs {
             let handles = self.handles.lock().unwrap();
             handles.by_handle.get(&handle)
                 .map(|e| e.ra.current_window())
-                .unwrap_or(self.read_ahead_size)
+                .unwrap_or(crate::read_ahead::AUTO_INITIAL_WINDOW)
         };
         // ReadAhead::Off produces window=0 — skip prefetch entirely,
         // fetch only the exact requested range.
