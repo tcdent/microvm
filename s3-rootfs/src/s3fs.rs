@@ -1483,45 +1483,87 @@ impl FileSystem for S3Fs {
             let result = self.client.list(&old_prefix, None)
                 .io_err(&format!("rename LIST {}", old_prefix))?;
 
-            for obj in &result.objects {
-                if let Some((decoded_path, child_meta)) = keys::decode(&obj.key) {
-                    let suffix = &decoded_path[old_prefix.len()..];
-                    let new_child_path = format!("{}/{}", new_path, suffix);
-                    let old_key = keys::encode(decoded_path, child_meta);
-                    let new_key = keys::encode(&new_child_path, child_meta);
+            // Build the work list: decode each key, compute old/new
+            // keys. Errors in decode are skipped (same as before).
+            let work: Vec<_> = result.objects.iter().filter_map(|obj| {
+                let (decoded_path, child_meta) = keys::decode(&obj.key)?;
+                let suffix = &decoded_path[old_prefix.len()..];
+                let new_child_path = format!("{}/{}", new_path, suffix);
+                let old_key = keys::encode(decoded_path, child_meta);
+                let new_key = keys::encode(&new_child_path, child_meta);
+                Some((
+                    decoded_path.to_string(),
+                    new_child_path,
+                    old_key,
+                    new_key,
+                    child_meta,
+                    obj.size,
+                ))
+            }).collect();
 
-                    self.client.copy(&old_key, &new_key)
-                        .io_err(&format!("rename child COPY {} -> {}", decoded_path, new_child_path))?;
-                    self.client.delete(&old_key)
-                        .io_err(&format!("rename child DELETE {}", decoded_path))?;
+            // Parallel COPY+DELETE with bounded concurrency. Uses
+            // std::thread::scope so threads borrow &self.client
+            // without Arc overhead. 8 threads matches the write
+            // worker count.
+            const RENAME_CONCURRENCY: usize = 8;
+            let first_error: Mutex<Option<io::Error>> = Mutex::new(None);
 
-                    // Invalidate read cache for the old child path —
-                    // stale entries waste memory and could serve wrong
-                    // content if the old path is re-created later.
-                    self.read_cache.remove(decoded_path);
-
-                    // Migrate cache entry to the new path. Use the
-                    // REAL size from S3 LIST (obj.size), not whatever
-                    // the cache had — the cached size can be stale if
-                    // a deferred write landed in S3 but the cache
-                    // wasn't updated (e.g., async FUSE_RELEASE timing).
-                    let mut cache = self.cache.lock().unwrap();
-                    if let Some(mut entry) = cache.get(decoded_path).cloned() {
-                        entry.size = obj.size;
-                        cache.remove(decoded_path);
-                        cache.insert(&new_child_path, entry);
-                    } else {
-                        // No cache entry at old path — file exists in
-                        // S3 but was never looked up (deep tree, cold
-                        // cache). Create a fresh entry so subsequent
-                        // lookups at the new path hit tier-1 cache
-                        // instead of probing S3.
-                        cache.insert_from_key(
-                            &new_child_path,
-                            child_meta,
-                            obj.size,
-                        );
+            std::thread::scope(|s| {
+                let sem = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
+                for (old_decoded, new_child, old_key, new_key, _, _) in &work {
+                    // Acquire semaphore slot.
+                    let sem = Arc::clone(&sem);
+                    {
+                        let (lock, cvar) = &*sem;
+                        let mut count = lock.lock().unwrap();
+                        while *count >= RENAME_CONCURRENCY {
+                            count = cvar.wait(count).unwrap();
+                        }
+                        *count += 1;
                     }
+
+                    let client = &self.client;
+                    let err_slot = &first_error;
+                    s.spawn(move || {
+                        let result = client.copy(old_key, new_key)
+                            .and_then(|_| client.delete(old_key));
+                        if let Err(e) = result {
+                            let mut slot = err_slot.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("rename child {} -> {}: {}", old_decoded, new_child, e),
+                                ));
+                            }
+                        }
+                        let (lock, cvar) = &*sem;
+                        let mut count = lock.lock().unwrap();
+                        *count -= 1;
+                        cvar.notify_one();
+                    });
+                }
+            });
+
+            // Propagate the first error if any child COPY failed.
+            if let Some(e) = first_error.into_inner().unwrap() {
+                return Err(e);
+            }
+
+            // Cache updates: sequential (cache is Mutex-protected).
+            for (old_decoded, new_child_path, _, _, child_meta, size) in &work {
+                self.read_cache.remove(old_decoded);
+
+                let mut cache = self.cache.lock().unwrap();
+                if let Some(mut entry) = cache.get(old_decoded).cloned() {
+                    entry.size = *size;
+                    cache.remove(old_decoded);
+                    cache.insert(new_child_path, entry);
+                } else {
+                    cache.insert_from_key(
+                        new_child_path,
+                        *child_meta,
+                        *size,
+                    );
                 }
             }
         } else {
