@@ -1461,16 +1461,17 @@ impl FileSystem for S3Fs {
 
         match per_vm_meta {
             Some(meta) => {
-                // Per-VM owns this path: DELETE from vm-<id>. Also
-                // insert a sticky negative — if the same path also
-                // exists in golden, the negative keeps it hidden on
-                // future lookups. Pure per-VM files pay one extra
-                // HashSet insert; golden-materialized-then-deleted
-                // files are covered.
-                let key = keys::encode(&path, meta);
-                log!("S3 DELETE unlink {}", path);
-                self.client.delete(&key)
-                    .io_err(&format!("unlink DELETE {}", path))?;
+                let durability = self.ruleset.resolve(&path).durability;
+                if durability != Durability::Ephemeral {
+                    let key = keys::encode(&path, meta);
+                    log!("S3 DELETE unlink {}", path);
+                    self.client.delete(&key)
+                        .io_err(&format!("unlink DELETE {}", path))?;
+                }
+                // Remove ephemeral file from local disk if present.
+                if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+                    let _ = std::fs::remove_file(eph_dir.join(&path));
+                }
 
                 let mut cache = self.cache.lock().unwrap();
                 cache.remove(&path);
@@ -1866,9 +1867,21 @@ impl FileSystem for S3Fs {
         let meta = KeyMeta::new(libc::S_IFLNK as u32 | 0o777, 0, 0);
         let key = keys::encode(&path, meta);
 
-        log!("S3 PUT symlink {} -> {}", path, target);
-        self.client.put(&key, target.as_bytes())
-            .io_err(&format!("symlink PUT {}", path))?;
+        let durability = self.ruleset.resolve(&path).durability;
+        if durability == Durability::Ephemeral {
+            // Ephemeral: write symlink target to local disk.
+            if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+                let file_path = eph_dir.join(&path);
+                if let Some(parent) = file_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&file_path, target.as_bytes())?;
+            }
+        } else {
+            log!("S3 PUT symlink {} -> {}", path, target);
+            self.client.put(&key, target.as_bytes())
+                .io_err(&format!("symlink PUT {}", path))?;
+        }
 
         let mut cache = self.cache.lock().unwrap();
         let ino = cache.insert_from_key(&path, meta, target.len() as u64);
@@ -1900,18 +1913,34 @@ impl FileSystem for S3Fs {
             }
         };
 
-        // Verify directory is empty — LIST with max-keys=1
+        // Verify directory is empty — check S3 + ephemeral disk.
         let prefix = format!("{}/", path);
         let result = self.client.list_probe(&prefix, None, 1)
             .io_err(&format!("rmdir empty-check {}", prefix))?;
         if !result.objects.is_empty() {
             return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
+        // Also check ephemeral disk for children.
+        if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+            let disk_dir = eph_dir.join(&path);
+            if disk_dir.is_dir() {
+                let has_children = std::fs::read_dir(&disk_dir)
+                    .map(|mut rd| rd.next().is_some())
+                    .unwrap_or(false);
+                if has_children {
+                    return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+                }
+                let _ = std::fs::remove_dir(&disk_dir);
+            }
+        }
 
-        let key = keys::encode(&path, meta);
-        log!("S3 DELETE rmdir {}", path);
-        self.client.delete(&key)
-            .io_err(&format!("rmdir DELETE {}", path))?;
+        let durability = self.ruleset.resolve(&path).durability;
+        if durability != Durability::Ephemeral {
+            let key = keys::encode(&path, meta);
+            log!("S3 DELETE rmdir {}", path);
+            self.client.delete(&key)
+                .io_err(&format!("rmdir DELETE {}", path))?;
+        }
 
         let mut cache = self.cache.lock().unwrap();
         cache.remove(&path);
