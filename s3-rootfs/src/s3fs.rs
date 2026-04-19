@@ -1278,6 +1278,7 @@ impl FileSystem for S3Fs {
             key.clone(),
             Arc::clone(&shared),
             durability,
+            entry.rules.coalesce,
         )?;
 
         if deferred {
@@ -1811,11 +1812,15 @@ impl FileSystem for S3Fs {
         // Same deferred-or-sync path as release. flush is typically
         // called for explicit guest-requested partial writes (e.g.
         // before fsync); we still respect the inflight budget.
+        // flush() does NOT coalesce — the guest explicitly requested
+        // a sync point. Coalesced debounce timers are flushed by
+        // fsync() via wait_for_path(), which calls flush_coalesce().
         let deferred = self.write_pool.enqueue(
             path.clone(),
             key.clone(),
             Arc::clone(&shared),
             durability,
+            None, // no coalesce on explicit flush
         )?;
         if !deferred {
             self.client

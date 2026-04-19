@@ -22,7 +22,7 @@
 //! signal. `fsync()` is the opt-in durability point: blocks until
 //! the named path's inflight entry clears.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -93,6 +93,25 @@ pub struct WritePool {
     /// S3 client for PUTs. `Arc` so workers can hold their own
     /// reference; `S3Client` is `Sync`.
     client: Arc<S3Client>,
+
+    /// Coalesce (debounce) state for writes with `coalesce_ms` rules
+    /// (research/14 §3). Writes enter the inflight map immediately
+    /// but don't queue for PUT until the debounce timer expires.
+    /// Subsequent writes to the same path restart the timer.
+    coalesce: Mutex<CoalesceState>,
+    /// Wakes the timer thread when a new coalesced write arrives or
+    /// an existing timer is flushed. Also woken on shutdown.
+    coalesce_cvar: Condvar,
+}
+
+/// Debounce timer state. Two indexes for O(log n) insert/remove:
+/// - `by_path`: quick check "is this path pending?" + retrieve its
+///   expiry for removal from the time-sorted index.
+/// - `by_time`: sorted by `(expiry, path)` — the timer thread pops
+///   from the front.
+struct CoalesceState {
+    by_path: HashMap<String, Instant>,
+    by_time: BTreeMap<(Instant, String), ()>,
 }
 
 /// Knobs for constructing a pool. Caller supplies the S3 client and
@@ -119,9 +138,15 @@ impl WritePool {
             budget_bytes: cfg.budget_bytes,
             shutdown: AtomicBool::new(false),
             client: cfg.client,
+            coalesce: Mutex::new(CoalesceState {
+                by_path: HashMap::new(),
+                by_time: BTreeMap::new(),
+            }),
+            coalesce_cvar: Condvar::new(),
         });
 
-        let mut handles = Vec::with_capacity(cfg.workers);
+        // +1 for the coalesce timer thread.
+        let mut handles = Vec::with_capacity(cfg.workers + 1);
         for i in 0..cfg.workers {
             let pool_ref = Arc::clone(&pool);
             let h = thread::Builder::new()
@@ -130,6 +155,18 @@ impl WritePool {
                 .expect("spawn write worker");
             handles.push(h);
         }
+
+        // Timer thread: wakes on the earliest coalesce expiry,
+        // pops expired entries, pushes them to the worker queue.
+        {
+            let pool_ref = Arc::clone(&pool);
+            let h = thread::Builder::new()
+                .name("s3fs-coalesce".into())
+                .spawn(move || coalesce_loop(pool_ref))
+                .expect("spawn coalesce timer");
+            handles.push(h);
+        }
+
         (pool, handles)
     }
 
@@ -169,6 +206,7 @@ impl WritePool {
         key: String,
         bytes: Arc<Vec<u8>>,
         durability: Durability,
+        coalesce: Option<Duration>,
     ) -> io::Result<bool> {
         let ephemeral = durability == Durability::Ephemeral;
         let size = bytes.len();
@@ -217,6 +255,22 @@ impl WritePool {
             return Ok(true);
         }
 
+        // Coalesced writes enter the debounce timer instead of the
+        // worker queue. The timer thread pushes to queue on expiry.
+        // Subsequent writes to the same path restart the timer.
+        if let Some(window) = coalesce {
+            let expiry = Instant::now() + window;
+            let mut cs = self.coalesce.lock().unwrap();
+            // Remove any existing timer for this path (debounce restart).
+            if let Some(old_expiry) = cs.by_path.remove(&path) {
+                cs.by_time.remove(&(old_expiry, path.clone()));
+            }
+            cs.by_path.insert(path.clone(), expiry);
+            cs.by_time.insert((expiry, path), ());
+            self.coalesce_cvar.notify_one();
+            return Ok(true);
+        }
+
         // Push onto queue and wake one worker. Duplicate queue
         // entries for the same path are harmless: workers handle
         // "inflight entry gone by the time we got here" by skipping.
@@ -231,6 +285,10 @@ impl WritePool {
     /// Block until the named path has no inflight write. Used by
     /// `fsync`. If the path isn't inflight, returns immediately.
     pub fn wait_for_path(&self, path: &str) {
+        // Flush any pending coalesce timer for this path first —
+        // force immediate enqueue so the worker can drain it.
+        self.flush_coalesce(path);
+
         let mut inflight = self.inflight.lock().unwrap();
         // Ephemeral entries have no pending PUT — they're "done"
         // from the durability perspective the moment they're in
@@ -245,10 +303,42 @@ impl WritePool {
     /// clean shutdown. Ephemeral entries are excluded — they never
     /// queue for PUT and would block forever.
     pub fn wait_for_all(&self) {
+        // Flush all pending coalesce timers — force immediate enqueue.
+        self.flush_all_coalesce();
+
         let mut inflight = self.inflight.lock().unwrap();
         while inflight.values().any(|e| !e.ephemeral) {
             inflight = self.inflight_cvar.wait(inflight).unwrap();
         }
+    }
+
+    /// Force a coalesced path into the worker queue immediately,
+    /// canceling its debounce timer. No-op if the path has no
+    /// pending timer. Used by fsync (durability opt-in).
+    fn flush_coalesce(&self, path: &str) {
+        let mut cs = self.coalesce.lock().unwrap();
+        if let Some(expiry) = cs.by_path.remove(path) {
+            cs.by_time.remove(&(expiry, path.to_string()));
+            let mut q = self.queue.lock().unwrap();
+            q.push_back(path.to_string());
+            self.queue_cvar.notify_one();
+        }
+    }
+
+    /// Force all coalesced paths into the worker queue. Used by
+    /// wait_for_all (rename drain, shutdown).
+    fn flush_all_coalesce(&self) {
+        let mut cs = self.coalesce.lock().unwrap();
+        if cs.by_path.is_empty() {
+            return;
+        }
+        let paths: Vec<String> = cs.by_path.drain().map(|(p, _)| p).collect();
+        cs.by_time.clear();
+        let mut q = self.queue.lock().unwrap();
+        for p in paths {
+            q.push_back(p);
+        }
+        self.queue_cvar.notify_all();
     }
 
     /// Request graceful shutdown: stop accepting work, wake all
@@ -258,6 +348,7 @@ impl WritePool {
         self.shutdown.store(true, Ordering::Relaxed);
         self.queue_cvar.notify_all();
         self.inflight_cvar.notify_all();
+        self.coalesce_cvar.notify_all();
     }
 }
 
@@ -340,6 +431,53 @@ fn worker_loop(pool: Arc<WritePool>) {
     }
 }
 
+/// Timer thread for coalesced writes (research/14 §3). Sleeps until
+/// the earliest timer expiry, pops expired entries, pushes them to
+/// the worker queue. Woken by `coalesce_cvar` when a new timer is
+/// set or flushed, or on shutdown.
+fn coalesce_loop(pool: Arc<WritePool>) {
+    loop {
+        let mut cs = pool.coalesce.lock().unwrap();
+        loop {
+            if pool.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // Pop any expired timers.
+            let now = Instant::now();
+            let mut fired = Vec::new();
+            while let Some((&(expiry, ref path), _)) = cs.by_time.first_key_value() {
+                if expiry > now {
+                    break;
+                }
+                let path = path.clone();
+                cs.by_time.pop_first();
+                cs.by_path.remove(&path);
+                fired.push(path);
+            }
+
+            if !fired.is_empty() {
+                let mut q = pool.queue.lock().unwrap();
+                for p in fired {
+                    q.push_back(p);
+                }
+                pool.queue_cvar.notify_all();
+                continue; // re-check for more expired
+            }
+
+            // Sleep until the next expiry or until woken.
+            if let Some((&(expiry, _), _)) = cs.by_time.first_key_value() {
+                let wait = expiry.saturating_duration_since(now);
+                let (guard, _) = pool.coalesce_cvar.wait_timeout(cs, wait).unwrap();
+                cs = guard;
+            } else {
+                // No pending timers — sleep until woken.
+                cs = pool.coalesce_cvar.wait(cs).unwrap();
+            }
+        }
+    }
+}
+
 // `io` usage inside this module is confined to one return type.
 use std::io;
 
@@ -366,7 +504,7 @@ mod tests {
         let (pool, handles) = make_pool(1, 100);
         let big = Arc::new(vec![0u8; 200]);
         let accepted = pool
-            .enqueue("big.txt".into(), "big.txt\x01".into(), big, Durability::Durable)
+            .enqueue("big.txt".into(), "big.txt\x01".into(), big, Durability::Durable, None)
             .unwrap();
         assert!(
             !accepted,
@@ -395,6 +533,7 @@ mod tests {
                 "greet.txt\x01meta".into(),
                 Arc::clone(&payload),
                 Durability::Durable,
+                None,
             )
             .unwrap();
         assert!(accepted);
@@ -415,8 +554,8 @@ mod tests {
         let (pool, handles) = make_pool(0, 10_000);
         let v1 = Arc::new(vec![0x11u8; 100]);
         let v2 = Arc::new(vec![0x22u8; 200]);
-        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v1), Durability::Durable).unwrap();
-        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v2), Durability::Durable).unwrap();
+        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v1), Durability::Durable, None).unwrap();
+        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v2), Durability::Durable, None).unwrap();
         assert_eq!(pool.inflight_count(), 1);
         // Total bytes = only the newer write (100 replaced, 200 now).
         assert_eq!(pool.current_bytes(), 200);
@@ -451,13 +590,13 @@ mod tests {
         let big = Arc::new(vec![0u8; 200]);
         // Durable over-budget → rejected
         let accepted = pool
-            .enqueue("d.txt".into(), "d.txt\x01".into(), Arc::clone(&big), Durability::Durable)
+            .enqueue("d.txt".into(), "d.txt\x01".into(), Arc::clone(&big), Durability::Durable, None)
             .unwrap();
         assert!(!accepted, "durable over budget must be rejected");
 
         // Ephemeral over-budget → accepted (bypasses budget gate)
         let accepted = pool
-            .enqueue("e.txt".into(), "e.txt\x01".into(), Arc::clone(&big), Durability::Ephemeral)
+            .enqueue("e.txt".into(), "e.txt\x01".into(), Arc::clone(&big), Durability::Ephemeral, None)
             .unwrap();
         assert!(accepted, "ephemeral must always be accepted");
         assert_eq!(pool.inflight_count(), 1);
@@ -474,6 +613,71 @@ mod tests {
 
         pool.shutdown.store(true, Ordering::Relaxed);
         pool.queue_cvar.notify_all();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    #[test]
+    fn coalesce_debounces_then_drains() {
+        // Coalesced writes don't queue immediately; they wait for the
+        // debounce timer. Two rapid writes to the same path should
+        // produce exactly one entry when the timer fires.
+        let (pool, handles) = make_pool(0, 100_000); // 0 workers — manual drain
+
+        let v1 = Arc::new(b"first".to_vec());
+        let v2 = Arc::new(b"second".to_vec());
+        let window = Duration::from_millis(50);
+
+        pool.enqueue("c.txt".into(), "c\x01".into(), Arc::clone(&v1),
+                      Durability::Durable, Some(window)).unwrap();
+        pool.enqueue("c.txt".into(), "c\x01".into(), Arc::clone(&v2),
+                      Durability::Durable, Some(window)).unwrap();
+
+        // Queue should be empty (coalesced, waiting for timer)
+        assert!(pool.queue.lock().unwrap().is_empty(),
+            "coalesced writes must not appear in queue before timer");
+
+        // Inflight has the latest bytes
+        let got = pool.get("c.txt").unwrap();
+        assert!(Arc::ptr_eq(&got, &v2), "inflight must hold latest write");
+
+        // Wait for timer to fire (50ms + slack)
+        thread::sleep(Duration::from_millis(100));
+
+        // Queue should now have one entry
+        let q = pool.queue.lock().unwrap();
+        assert_eq!(q.len(), 1, "timer must have pushed exactly one entry");
+
+        pool.shutdown.store(true, Ordering::Relaxed);
+        pool.queue_cvar.notify_all();
+        pool.coalesce_cvar.notify_all();
+        drop(q);
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    #[test]
+    fn flush_coalesce_forces_immediate_queue() {
+        // fsync must flush the coalesce timer and push to queue
+        // immediately, not wait for the debounce window.
+        let (pool, handles) = make_pool(0, 100_000);
+
+        let data = Arc::new(b"fsync me".to_vec());
+        let window = Duration::from_secs(60); // very long — won't fire naturally
+
+        pool.enqueue("s.txt".into(), "s\x01".into(), data,
+                      Durability::Durable, Some(window)).unwrap();
+        assert!(pool.queue.lock().unwrap().is_empty());
+
+        // flush_coalesce should push immediately
+        pool.flush_coalesce("s.txt");
+        assert_eq!(pool.queue.lock().unwrap().len(), 1);
+
+        pool.shutdown.store(true, Ordering::Relaxed);
+        pool.queue_cvar.notify_all();
+        pool.coalesce_cvar.notify_all();
         for h in handles {
             let _ = h.join();
         }
