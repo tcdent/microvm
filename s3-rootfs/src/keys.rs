@@ -12,7 +12,7 @@ const META_SEP: u8 = 0x01;
 const META_LEN: usize = 20; // 4 (mode) + 8 (uid) + 8 (gid) hex chars
 
 /// Metadata extracted from an S3 key
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyMeta {
     pub mode: u32,
     pub uid: u32,

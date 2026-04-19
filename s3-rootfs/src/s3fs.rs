@@ -1572,23 +1572,13 @@ impl FileSystem for S3Fs {
         _handle: Option<Self::Handle>,
         valid: fuse_backend_rs::abi::fuse_abi::SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
-        // Only SIZE is honored. MODE / UID / GID changes would require
-        // rewriting the S3 key (metadata is embedded in the key, not in
-        // HTTP headers), which is a copy+delete pair — deferred; see
-        // research/07 on the metadata-in-keys design. ATIME/MTIME/CTIME
-        // are silently ignored because S3 has no equivalent concept and
-        // callers (chmod, touch) don't hard-fail when they're dropped.
-        // If a caller actually needs these, the ENOSYS return would be
-        // the POSIX-correct answer — but FUSE mount tools today treat
-        // that as a hard error on common commands (apt install, etc.),
-        // so we pretend success.
-        if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::SIZE) {
+        use fuse_backend_rs::abi::fuse_abi::SetattrValid;
+
+        // SIZE: truncate the file (resize handle buffers + update cache).
+        if valid.contains(SetattrValid::SIZE) {
             let new_size = attr.st_size as usize;
             log!("setattr truncate ino={} size={}", inode, new_size);
 
-            // Update cached size. Same pattern as write() — snapshot
-            // path+inode once, mutate the clone, write it back; avoids
-            // a second get_by_ino().unwrap() under the same lock.
             let mut cache = self.cache.lock().unwrap();
             let snapshot = cache.get_by_ino(inode)
                 .map(|(p, c)| (p.to_string(), c.clone()));
@@ -1598,8 +1588,6 @@ impl FileSystem for S3Fs {
             }
             drop(cache);
 
-            // Only truncate handle buffers for explicit ftruncate, not O_TRUNC
-            // (O_TRUNC skips the open preload, so the buffer starts empty)
             let mut handles = self.handles.lock().unwrap();
             for entry in handles.by_handle.values_mut() {
                 if entry.inode == inode {
@@ -1612,6 +1600,76 @@ impl FileSystem for S3Fs {
                 }
             }
         }
+
+        // MODE / UID / GID: metadata is embedded in the S3 key, so
+        // changing it requires re-encoding the key (COPY + DELETE).
+        // Same pattern as rename — ephemeral paths just update the
+        // inflight entry's key; durable paths do a server-side COPY.
+        let meta_changed = valid.intersects(
+            SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID,
+        );
+        if meta_changed {
+            let mut cache = self.cache.lock().unwrap();
+            let snapshot = cache.get_by_ino(inode)
+                .map(|(p, c)| (p.to_string(), c.clone()));
+            if let Some((path, mut cached)) = snapshot {
+                let old_meta = cached.meta;
+
+                // Apply requested changes to the meta.
+                if valid.contains(SetattrValid::MODE) {
+                    // Preserve file type bits, take permission bits from attr.
+                    let file_type = old_meta.mode & libc::S_IFMT as u32;
+                    let perm_bits = attr.st_mode & !libc::S_IFMT as u32;
+                    cached.meta = KeyMeta::new(file_type | perm_bits, cached.meta.uid, cached.meta.gid);
+                }
+                if valid.contains(SetattrValid::UID) {
+                    cached.meta = KeyMeta::new(cached.meta.mode, attr.st_uid, cached.meta.gid);
+                }
+                if valid.contains(SetattrValid::GID) {
+                    cached.meta = KeyMeta::new(cached.meta.mode, cached.meta.uid, attr.st_gid);
+                }
+
+                let new_meta = cached.meta;
+                cache.insert(&path, cached);
+                drop(cache);
+
+                // Only re-key if the encoded key actually changed.
+                if old_meta != new_meta {
+                    let old_key = keys::encode(&path, old_meta);
+                    let new_key = keys::encode(&path, new_meta);
+
+                    // Check if the path has an inflight write — update
+                    // the pending entry's key so the worker PUTs to the
+                    // new key when it drains.
+                    if self.write_pool.is_ephemeral(&path) {
+                        // Ephemeral: no S3 object to re-key.
+                        self.write_pool.rename_path(&path, &path, new_key);
+                    } else if self.write_pool.get(&path).is_some() {
+                        // Durable inflight: update the key the worker
+                        // will PUT to. Don't touch S3 — the old key's
+                        // content will be superseded by the inflight PUT.
+                        self.write_pool.rename_path(&path, &path, new_key);
+                        // Delete the old key (stale content from create).
+                        let _ = self.client.delete(&old_key);
+                    } else {
+                        // No inflight: re-key via S3 COPY + DELETE.
+                        log!("setattr re-key {} (mode {:o} -> {:o})", path,
+                             old_meta.mode, new_meta.mode);
+                        self.write_pool.wait_for_path(&path);
+                        self.client.copy(&old_key, &new_key)
+                            .io_err(&format!("setattr COPY {}", path))?;
+                        self.client.delete(&old_key)
+                            .io_err(&format!("setattr DELETE {}", path))?;
+                    }
+                    // Invalidate read cache — the old key is gone.
+                    self.read_cache.remove(&path);
+                }
+            }
+        }
+
+        // ATIME / MTIME / CTIME: silently ignored. S3 has no mutable
+        // timestamp concept. FUSE mount tools (apt, chmod, touch) don't
+        // hard-fail when these are dropped.
 
         let cache = self.cache.lock().unwrap();
         let (_, entry) = cache.get_by_ino(inode)
