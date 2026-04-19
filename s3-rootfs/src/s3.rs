@@ -406,7 +406,10 @@ impl ListResult {
                     continue;
                 }
             }
-            i += 1;
+            // Advance to the next UTF-8 char boundary. Plain `i += 1`
+            // panics on multi-byte characters (e.g. Chinese path names
+            // in node's test fixtures).
+            i += xml[i..].chars().next().map_or(1, |c| c.len_utf8());
         }
 
         let is_truncated = extract_tag(xml, "IsTruncated")
