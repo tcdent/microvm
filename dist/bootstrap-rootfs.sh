@@ -74,8 +74,12 @@ mkdir -p "$CACHE_DIR"
 # NOTE: libapparmor1 is REQUIRED by systemd binary (linked at compile time).
 #       Removing it causes /sbin/init to fail at "cannot open shared object".
 #       Keep libapparmor1, only remove the userspace apparmor tools+profiles.
+# NOTE: gpgv + sqv + libfido2-1 + libcbor0.10 are REQUIRED by trixie's apt
+#       solver 3.0 dep graph. Purging them breaks every 'apt install' inside
+#       the running VM with 'Unmet dependencies'. ~1 MB each, not worth the
+#       breakage — keep them.
 echo "==> Purging unneeded packages..."
-PURGE_PKGS="apparmor libfido2-1 libcbor0.10 sqv gnupg gpgv gnupg-l10n"
+PURGE_PKGS="apparmor gnupg gnupg-l10n"
 for pkg in $PURGE_PKGS; do
     chroot "$WORK" dpkg --purge --force-depends "$pkg" 2>/dev/null || true
 done
@@ -146,6 +150,39 @@ ln -sf /etc/systemd/system/network-setup.service \
 
 # Set hostname
 echo "microvm" > "$WORK/etc/hostname"
+
+# ── apt sources ────────────────────────────────────────────────
+# Debian 13 (trixie) uses deb822-style sources in /etc/apt/sources.list.d/.
+# The legacy /etc/apt/sources.list is left empty by debootstrap, so apt
+# update silently fetches nothing. Pin a plain sources.list so legacy
+# tooling and scripts that expect it work.
+cat > "$WORK/etc/apt/sources.list" << 'SOURCES'
+deb http://deb.debian.org/debian trixie main
+deb http://deb.debian.org/debian trixie-updates main
+deb http://security.debian.org/debian-security trixie-security main
+SOURCES
+
+# ── DNS pinning ────────────────────────────────────────────────
+# VM macvtap is peer-isolated from elsenor's sibling macvlans — the DHCP-
+# advertised local DNS (192.168.88.11) is unreachable from the VM. Any
+# external resolver routed through the switch works fine. Pin /etc/resolv.conf
+# to public resolvers AND tell dhclient to 'supersede' the DHCP-provided
+# nameservers so lease acquisition doesn't overwrite this file.
+cat > "$WORK/etc/resolv.conf" << 'RESOLV'
+nameserver 1.1.1.1
+nameserver 9.9.9.9
+RESOLV
+
+mkdir -p "$WORK/etc/dhcp"
+# If dhclient.conf already exists (debootstrap creates one), append; else
+# create fresh. 'supersede' forces dhclient to use our nameservers
+# regardless of what the DHCP server hands out.
+cat >> "$WORK/etc/dhcp/dhclient.conf" << 'DHCLIENT'
+
+# Macvtap DNS override: ignore DHCP-provided nameservers (unreachable
+# from macvtap peer isolation) and always use public resolvers.
+supersede domain-name-servers 1.1.1.1, 9.9.9.9;
+DHCLIENT
 
 echo "    serial console: ttyS0 (autologin root)"
 echo "    default target: multi-user.target"
