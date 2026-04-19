@@ -26,7 +26,7 @@ use crate::config::FsConfig;
 use crate::inode_cache::{CachedInode, InodeCache};
 use crate::keys::{self, KeyMeta};
 use crate::read_cache::{self, ReadCache};
-use crate::ruleset::{HandleRules, Ruleset};
+use crate::ruleset::{Durability, HandleRules, Ruleset};
 use crate::s3::{S3Client, S3ResultExt};
 use crate::storage::{self, ObjectBody};
 use crate::write_pool::{WritePool, WritePoolConfig};
@@ -1266,21 +1266,26 @@ impl FileSystem for S3Fs {
         let data_len = data.len() as u64;
         let shared = Arc::new(data);
 
+        let durability = entry.rules.durability;
+
         // Try to enqueue for deferred PUT. If the inflight budget
         // would be exceeded, fall back to a synchronous inline PUT
         // — the caller waits, the queue doesn't grow. This is the
-        // backpressure path.
+        // backpressure path. Ephemeral writes always succeed (they
+        // skip S3 entirely — the inflight map IS their storage).
         let deferred = self.write_pool.enqueue(
             path.clone(),
             key.clone(),
             Arc::clone(&shared),
+            durability,
         )?;
 
         if deferred {
             debug!(
-                "release DEFERRED {} ({} bytes, inflight total={}B)",
+                "release DEFERRED {} ({} bytes, {:?}, inflight total={}B)",
                 path,
                 data_len,
+                durability,
                 self.write_pool.current_bytes()
             );
         } else {
@@ -1775,7 +1780,7 @@ impl FileSystem for S3Fs {
         // handle; release/subsequent-flush still send the latest
         // version to the inflight queue, which replaces whatever was
         // there.
-        let snapshot: Option<(String, KeyMeta, Option<String>, Arc<Vec<u8>>)> = {
+        let snapshot: Option<(String, KeyMeta, Option<String>, Arc<Vec<u8>>, Durability)> = {
             let handles = self.handles.lock().unwrap();
             match handles.by_handle.get(&handle) {
                 Some(entry) if entry.dirty => {
@@ -1787,7 +1792,7 @@ impl FileSystem for S3Fs {
                         if path.is_empty() {
                             None
                         } else {
-                            Some((path, meta, hl_uuid, Arc::new(data.clone())))
+                            Some((path, meta, hl_uuid, Arc::new(data.clone()), entry.rules.durability))
                         }
                     } else {
                         None
@@ -1797,7 +1802,7 @@ impl FileSystem for S3Fs {
             }
         };
 
-        let Some((path, meta, hl_uuid, shared)) = snapshot else { return Ok(()); };
+        let Some((path, meta, hl_uuid, shared, durability)) = snapshot else { return Ok(()); };
         let key = match hl_uuid {
             Some(ref uuid) => storage::hardlink_key(uuid, meta),
             None => keys::encode(&path, meta),
@@ -1810,6 +1815,7 @@ impl FileSystem for S3Fs {
             path.clone(),
             key.clone(),
             Arc::clone(&shared),
+            durability,
         )?;
         if !deferred {
             self.client

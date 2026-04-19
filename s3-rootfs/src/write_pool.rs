@@ -29,6 +29,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::log;
+use crate::ruleset::Durability;
 use crate::s3::S3Client;
 
 /// One pending write.
@@ -45,6 +46,10 @@ pub struct InflightWrite {
     /// for a worker. Not used in the control path.
     #[allow(dead_code)]
     pub submitted_at: Instant,
+    /// Ephemeral entries live in the inflight map for read-your-writes
+    /// but never queue for S3 PUT. Workers skip them; wait_for_path
+    /// and wait_for_all ignore them.
+    pub ephemeral: bool,
 }
 
 /// Shared state between `S3Fs`, the writer threads, and any thread
@@ -163,7 +168,9 @@ impl WritePool {
         path: String,
         key: String,
         bytes: Arc<Vec<u8>>,
+        durability: Durability,
     ) -> io::Result<bool> {
+        let ephemeral = durability == Durability::Ephemeral;
         let size = bytes.len();
 
         // Budget check — cheap atomic load, no lock. Racy: two
@@ -172,9 +179,16 @@ impl WritePool {
         // slack; the next enqueue after that correctly sync-falls-
         // back. Tightening would need a Mutex around the decision,
         // which doesn't pay.
-        let current = self.current_inflight_bytes.load(Ordering::Relaxed);
-        if current.saturating_add(size) > self.budget_bytes {
-            return Ok(false);
+        //
+        // Ephemeral writes skip the budget gate — they never queue
+        // for S3 PUT and the inflight map IS their storage. Over-
+        // budget for ephemeral means RAM pressure; a future eviction
+        // pass will handle that (research/14 §2).
+        if !ephemeral {
+            let current = self.current_inflight_bytes.load(Ordering::Relaxed);
+            if current.saturating_add(size) > self.budget_bytes {
+                return Ok(false);
+            }
         }
 
         // Insert (or replace) in inflight map, adjust counter.
@@ -190,10 +204,17 @@ impl WritePool {
                     bytes,
                     key,
                     submitted_at: Instant::now(),
+                    ephemeral,
                 },
             );
             self.current_inflight_bytes
                 .fetch_add(size, Ordering::Relaxed);
+        }
+
+        // Ephemeral entries stay in the inflight map for reads but
+        // never queue for S3 PUT — the inflight map IS their storage.
+        if ephemeral {
+            return Ok(true);
         }
 
         // Push onto queue and wake one worker. Duplicate queue
@@ -211,16 +232,21 @@ impl WritePool {
     /// `fsync`. If the path isn't inflight, returns immediately.
     pub fn wait_for_path(&self, path: &str) {
         let mut inflight = self.inflight.lock().unwrap();
-        while inflight.contains_key(path) {
+        // Ephemeral entries have no pending PUT — they're "done"
+        // from the durability perspective the moment they're in
+        // the inflight map.
+        while inflight.get(path).is_some_and(|e| !e.ephemeral) {
             inflight = self.inflight_cvar.wait(inflight).unwrap();
         }
     }
 
-    /// Block until all inflight writes have drained. Used by
-    /// `syncfs`-style whole-filesystem fsync and by clean shutdown.
+    /// Block until all non-ephemeral inflight writes have drained.
+    /// Used by `syncfs`-style whole-filesystem fsync, rename, and
+    /// clean shutdown. Ephemeral entries are excluded — they never
+    /// queue for PUT and would block forever.
     pub fn wait_for_all(&self) {
         let mut inflight = self.inflight.lock().unwrap();
-        while !inflight.is_empty() {
+        while inflight.values().any(|e| !e.ephemeral) {
             inflight = self.inflight_cvar.wait(inflight).unwrap();
         }
     }
@@ -340,7 +366,7 @@ mod tests {
         let (pool, handles) = make_pool(1, 100);
         let big = Arc::new(vec![0u8; 200]);
         let accepted = pool
-            .enqueue("big.txt".into(), "big.txt\x01".into(), big)
+            .enqueue("big.txt".into(), "big.txt\x01".into(), big, Durability::Durable)
             .unwrap();
         assert!(
             !accepted,
@@ -368,6 +394,7 @@ mod tests {
                 "greet.txt".into(),
                 "greet.txt\x01meta".into(),
                 Arc::clone(&payload),
+                Durability::Durable,
             )
             .unwrap();
         assert!(accepted);
@@ -388,8 +415,8 @@ mod tests {
         let (pool, handles) = make_pool(0, 10_000);
         let v1 = Arc::new(vec![0x11u8; 100]);
         let v2 = Arc::new(vec![0x22u8; 200]);
-        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v1)).unwrap();
-        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v2)).unwrap();
+        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v1), Durability::Durable).unwrap();
+        pool.enqueue("f".into(), "f\x01".into(), Arc::clone(&v2), Durability::Durable).unwrap();
         assert_eq!(pool.inflight_count(), 1);
         // Total bytes = only the newer write (100 replaced, 200 now).
         assert_eq!(pool.current_bytes(), 200);
@@ -408,6 +435,42 @@ mod tests {
         let (pool, handles) = make_pool(0, 10_000);
         // No inflight writes → wait_for_all returns immediately.
         pool.wait_for_all();
+
+        pool.shutdown.store(true, Ordering::Relaxed);
+        pool.queue_cvar.notify_all();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    #[test]
+    fn ephemeral_skips_queue_and_budget() {
+        // Ephemeral entries: visible via get(), but never queue for
+        // PUT and don't trigger budget rejection.
+        let (pool, handles) = make_pool(0, 100); // 100-byte budget
+        let big = Arc::new(vec![0u8; 200]);
+        // Durable over-budget → rejected
+        let accepted = pool
+            .enqueue("d.txt".into(), "d.txt\x01".into(), Arc::clone(&big), Durability::Durable)
+            .unwrap();
+        assert!(!accepted, "durable over budget must be rejected");
+
+        // Ephemeral over-budget → accepted (bypasses budget gate)
+        let accepted = pool
+            .enqueue("e.txt".into(), "e.txt\x01".into(), Arc::clone(&big), Durability::Ephemeral)
+            .unwrap();
+        assert!(accepted, "ephemeral must always be accepted");
+        assert_eq!(pool.inflight_count(), 1);
+
+        // Readable via get()
+        let got = pool.get("e.txt").expect("ephemeral must be readable");
+        assert_eq!(got.len(), 200);
+
+        // wait_for_all returns immediately (only ephemeral in map)
+        pool.wait_for_all();
+
+        // wait_for_path returns immediately for ephemeral path
+        pool.wait_for_path("e.txt");
 
         pool.shutdown.store(true, Ordering::Relaxed);
         pool.queue_cvar.notify_all();
