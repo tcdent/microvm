@@ -8,6 +8,15 @@
 # Paths are glob-matched against S3 key paths (no leading slash).
 # Last-match-wins for overlapping patterns.
 
+# ── nvm ───────────────────────────────────────────────────────────
+# nvm's download cache: tarball extraction staging. 90%+ of PUT
+# volume during `nvm install`. Rebuilt from tarball on demand;
+# same-session reads served from inflight map.
+
+[[rule]]
+glob = "**/.nvm/.cache/**"
+durability = "ephemeral"
+
 # ── npm / node ────────────────────────────────────────────────────
 
 [[rule]]
