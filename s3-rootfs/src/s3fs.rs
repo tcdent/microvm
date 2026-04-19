@@ -954,6 +954,71 @@ impl FileSystem for S3Fs {
             idx += 1;
         }
 
+        // Tier 3: ephemeral children on local disk. Ephemeral files
+        // skip S3 PUT (research/14 §2), so the S3 LIST in tier 1
+        // doesn't see them. Scan the ephemeral_dir for direct
+        // children under the parent path.
+        if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+            let eph_parent = eph_dir.join(&parent_path);
+            if let Ok(entries) = std::fs::read_dir(&eph_parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if emitted.contains(name_str.as_ref()) {
+                        continue; // already emitted from S3 or golden
+                    }
+                    let full_path = if parent_path.is_empty() {
+                        name_str.to_string()
+                    } else {
+                        format!("{}/{}", parent_path, name_str)
+                    };
+                    if cache.is_negative(&full_path) {
+                        continue;
+                    }
+
+                    // Determine type from local fs metadata.
+                    let ft = entry.file_type().unwrap_or(std::fs::FileType::from(
+                        std::fs::metadata(entry.path()).ok()
+                            .map(|m| m.file_type())
+                            .unwrap_or_else(|| entry.file_type().unwrap()),
+                    ));
+                    let (d_type, mode) = if ft.is_dir() {
+                        (libc::DT_DIR, libc::S_IFDIR as u32 | 0o755)
+                    } else if ft.is_symlink() {
+                        (libc::DT_LNK, libc::S_IFLNK as u32 | 0o777)
+                    } else {
+                        (libc::DT_REG, libc::S_IFREG as u32 | 0o644)
+                    };
+
+                    // Ensure inode cache has this entry.
+                    let ino = if let Some(cached) = cache.get(&full_path) {
+                        cached.ino
+                    } else {
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        cache.insert_from_key(
+                            &full_path,
+                            KeyMeta::new(mode, 0, 0),
+                            size,
+                        )
+                    };
+
+                    if idx >= offset {
+                        match add_entry(DirEntry {
+                            ino,
+                            offset: idx + 1,
+                            type_: d_type as u32,
+                            name: name_str.as_bytes(),
+                        }) {
+                            Ok(0) => return Ok(()),
+                            Ok(_) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    idx += 1;
+                }
+            }
+        }
+
         Ok(())
     }
 

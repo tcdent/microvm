@@ -186,6 +186,11 @@ impl WritePool {
         self.current_inflight_bytes.load(Ordering::Relaxed)
     }
 
+    /// The ephemeral directory path, if configured.
+    pub fn ephemeral_dir(&self) -> Option<&std::path::Path> {
+        self.ephemeral_dir.as_deref()
+    }
+
     /// Number of paths currently awaiting PUT. For tests and
     /// observability.
     pub fn inflight_count(&self) -> usize {
