@@ -199,15 +199,6 @@ impl WritePool {
         self.inflight.lock().unwrap().len()
     }
 
-    /// Check if a path has an ephemeral inflight entry.
-    pub fn is_ephemeral(&self, path: &str) -> bool {
-        self.inflight
-            .lock()
-            .unwrap()
-            .get(path)
-            .is_some_and(|e| e.ephemeral)
-    }
-
     /// Move an inflight entry from old_path to new_path with a new
     /// S3 key. Used by rename() for ephemeral files that were never
     /// PUT to S3 — the inflight map IS their storage, so the entry

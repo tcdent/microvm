@@ -1578,10 +1578,12 @@ impl FileSystem for S3Fs {
         let old_key = keys::encode(&old_path, meta);
         let new_key = keys::encode(&new_path, meta);
 
-        if self.write_pool.is_ephemeral(&old_path) {
-            // Ephemeral source: the old key was never PUT to S3.
-            // Move the inflight entry (which IS the data) to the new
-            // path+key. No S3 ops needed.
+        // Resolve durability from the RULESET, not inflight state.
+        // Ephemeral entries may have been evicted or not yet released.
+        let durability = self.ruleset.resolve(&old_path).durability;
+        if durability == Durability::Ephemeral {
+            // Ephemeral source: no S3 object. Move the inflight entry
+            // (if present) to the new path+key. No S3 ops.
             log!("rename EPHEMERAL {} -> {}", old_path, new_path);
             self.write_pool.rename_path(&old_path, &new_path, new_key);
         } else {
@@ -1681,18 +1683,20 @@ impl FileSystem for S3Fs {
                     let old_key = keys::encode(&path, old_meta);
                     let new_key = keys::encode(&path, new_meta);
 
-                    // Check if the path has an inflight write — update
-                    // the pending entry's key so the worker PUTs to the
-                    // new key when it drains.
-                    if self.write_pool.is_ephemeral(&path) {
-                        // Ephemeral: no S3 object to re-key.
+                    // Resolve durability from the RULESET, not from
+                    // inflight state. Ephemeral entries may have been
+                    // evicted (budget pressure) or not yet released —
+                    // the ruleset is the authoritative source.
+                    let durability = self.ruleset.resolve(&path).durability;
+                    if durability == Durability::Ephemeral {
+                        // Ephemeral: no S3 object to re-key. Update
+                        // the inflight entry's key if present.
                         self.write_pool.rename_path(&path, &path, new_key);
                     } else if self.write_pool.get(&path).is_some() {
                         // Durable inflight: update the key the worker
                         // will PUT to. Don't touch S3 — the old key's
                         // content will be superseded by the inflight PUT.
                         self.write_pool.rename_path(&path, &path, new_key);
-                        // Delete the old key (stale content from create).
                         let _ = self.client.delete(&old_key);
                     } else {
                         // No inflight: re-key via S3 COPY + DELETE.
