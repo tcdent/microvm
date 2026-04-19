@@ -29,11 +29,12 @@ pub fn spawn(
     // 1. Collision check — registry.insert will reject if already running.
     // (We do the insert at step 8 below, which has the same check.)
 
-    // 2. Bucket name — use spec.bucket if provided, else 'vm-<hash>'.
-    let bucket = spec.bucket.clone()
-        .unwrap_or_else(|| format!("vm-{}", name_hash));
-    // TODO phase 5: actually create the bucket via S3 admin API.
-    eprintln!("vm::spawn: bucket={} (stub — assumes exists)", bucket);
+    // 2. Bucket — ensure exists via S3 admin (HEAD + PUT if missing).
+    let bucket = crate::bucket::ensure(
+        &name_hash,
+        spec.bucket.as_deref(),
+        &shared.s3_admin,
+    )?;
 
     // 3. Ephemeral dir — on-disk, per-VM.
     let ephemeral_dir = spec.ephemeral_dir.clone()
