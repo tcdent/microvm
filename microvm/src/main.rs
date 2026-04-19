@@ -87,6 +87,8 @@ fn config_from_env() -> LaunchConfig {
     // Ephemeral local directory (research/14 §2). Ephemeral files
     // go to disk here instead of RAM. Must be on a real filesystem,
     // not tmpfs. Created at boot, cleaned up on shutdown.
+    // For multi-VM hosts, use a per-VM path (e.g. /data/ephemeral/<vm_id>/)
+    // to prevent cross-VM interference.
     if let Ok(eph_dir) = std::env::var("VM_EPHEMERAL_DIR") {
         let p = std::path::PathBuf::from(&eph_dir);
         std::fs::create_dir_all(&p).expect("create ephemeral dir");

@@ -217,13 +217,16 @@ impl WritePool {
         }
         // Move ephemeral file on disk if present.
         if let Some(ref dir) = self.ephemeral_dir {
-            let old_file = dir.join(old_path);
-            if old_file.exists() {
-                let new_file = dir.join(new_path);
-                if let Some(parent) = new_file.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+            if let (Ok(old_file), Ok(new_file)) = (
+                Self::ephemeral_path(dir, old_path),
+                Self::ephemeral_path(dir, new_path),
+            ) {
+                if old_file.exists() {
+                    if let Some(parent) = new_file.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::rename(&old_file, &new_file);
                 }
-                let _ = std::fs::rename(&old_file, &new_file);
             }
         }
     }
@@ -376,13 +379,26 @@ impl WritePool {
     /// Write an ephemeral file to the local disk directory.
     /// Creates parent directories as needed. Path on disk mirrors
     /// the S3 key path so reads can find it by the same name.
+    /// Resolve an ephemeral file path with traversal defense.
+    /// Rejects paths containing `..` to prevent writes outside
+    /// the ephemeral directory.
+    fn ephemeral_path(dir: &std::path::Path, path: &str) -> io::Result<std::path::PathBuf> {
+        if path.split('/').any(|c| c == "..") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path traversal rejected: {}", path),
+            ));
+        }
+        Ok(dir.join(path))
+    }
+
     fn write_ephemeral_file(
         &self,
         dir: &std::path::Path,
         path: &str,
         data: &[u8],
     ) -> io::Result<()> {
-        let file_path = dir.join(path);
+        let file_path = Self::ephemeral_path(dir, path)?;
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -391,13 +407,13 @@ impl WritePool {
     }
 
     /// Read an ephemeral file from the local disk directory.
-    /// Returns None if the file doesn't exist.
+    /// Returns None if the file doesn't exist or path is invalid.
     fn read_ephemeral_file(
         &self,
         dir: &std::path::Path,
         path: &str,
     ) -> Option<Arc<Vec<u8>>> {
-        let file_path = dir.join(path);
+        let file_path = Self::ephemeral_path(dir, path).ok()?;
         std::fs::read(&file_path).ok().map(|v| Arc::new(v))
     }
 

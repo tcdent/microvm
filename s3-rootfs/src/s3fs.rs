@@ -293,6 +293,15 @@ impl Drop for S3Fs {
                 let _ = h.join();
             }
         }
+        // Clean up ephemeral directory. Best-effort — if removal
+        // fails (permissions, files still open), log and continue.
+        if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+            if eph_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(eph_dir) {
+                    crate::log!("S3Fs: ephemeral dir cleanup failed: {}", e);
+                }
+            }
+        }
     }
 }
 
