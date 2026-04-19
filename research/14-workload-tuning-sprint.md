@@ -194,6 +194,17 @@ These items carried over from research/13 §5 and are sprint-scope:
   and refuse to start, OR document as "one VM per macvtap". Detection
   is cheap (flock on `/dev/tap<N>` or check `ip link`'s bound state)
   and prevents a confusing silent-failure mode.
+- **Ephemeral RAM eviction policy** (surfaced during §2 landing
+  2026-04-18). `WritePool::enqueue` for Ephemeral bypasses the PUT-
+  transit budget, correctly — that budget is for writes waiting on
+  S3, not for data whose storage IS the inflight map. But Ephemeral
+  currently has NO ceiling: a rogue workload (pathological cache
+  growth, runaway test, adversarial input) can accumulate
+  unboundedly in host RAM. Need: separate Ephemeral budget +
+  eviction policy (LRU by `submitted_at`? Path-class weights? Drop
+  oldest-per-path first?). Not a correctness bug for any workload
+  we've seen, but a host-stability bug waiting for the wrong
+  workload. First-class follow-up, size unknown.
 - **Git+SSH dependency auth** (vm:2.5 2026-04-18). npm/cargo/pip
   packages with SSH git URLs (observed: openclaw's libsignal-node
   using `ssh://git@github.com/...`) fail inside the VM without SSH
