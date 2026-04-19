@@ -46,10 +46,6 @@ pub struct InflightWrite {
     /// for a worker. Not used in the control path.
     #[allow(dead_code)]
     pub submitted_at: Instant,
-    /// Ephemeral entries live in the inflight map for read-your-writes
-    /// but never queue for S3 PUT. Workers skip them; wait_for_path
-    /// and wait_for_all ignore them.
-    pub ephemeral: bool,
 }
 
 /// Shared state between `S3Fs`, the writer threads, and any thread
@@ -267,36 +263,23 @@ impl WritePool {
         durability: Durability,
         coalesce: Option<Duration>,
     ) -> io::Result<bool> {
-        let ephemeral = durability == Durability::Ephemeral;
         let size = bytes.len();
-
-        // Budget check — cheap atomic load, no lock. Racy: two
-        // concurrent enqueues might both see "room" and both
-        // commit, exceeding budget by up to one buffer. Acceptable
-        // slack; the next enqueue after that correctly sync-falls-
-        // back. Tightening would need a Mutex around the decision,
-        // which doesn't pay.
-        //
-        // Ephemeral writes skip the budget gate — they never queue
-        // for S3 PUT and the inflight map IS their storage. Over-
-        // budget for ephemeral means RAM pressure; a future eviction
-        // pass will handle that (research/14 §2).
-        if !ephemeral {
-            let current = self.current_inflight_bytes.load(Ordering::Relaxed);
-            if current.saturating_add(size) > self.budget_bytes {
-                return Ok(false);
-            }
-        }
 
         // Ephemeral: write to local disk, not the inflight map.
         // No RAM pressure, no eviction — disk handles the storage.
         // If no ephemeral_dir is configured, fall through to durable.
-        if ephemeral {
+        if durability == Durability::Ephemeral {
             if let Some(ref dir) = self.ephemeral_dir {
                 self.write_ephemeral_file(dir, &path, &bytes)?;
                 return Ok(true);
             }
             // No ephemeral_dir → fall through to durable behavior.
+        }
+
+        // Budget check for durable/local writes.
+        let current = self.current_inflight_bytes.load(Ordering::Relaxed);
+        if current.saturating_add(size) > self.budget_bytes {
+            return Ok(false);
         }
 
         // Insert (or replace) in inflight map, adjust counter.
@@ -312,7 +295,6 @@ impl WritePool {
                     bytes,
                     key,
                     submitted_at: Instant::now(),
-                    ephemeral: false,
                 },
             );
             self.current_inflight_bytes
@@ -357,7 +339,7 @@ impl WritePool {
         // Ephemeral entries have no pending PUT — they're "done"
         // from the durability perspective the moment they're in
         // the inflight map.
-        while inflight.get(path).is_some_and(|e| !e.ephemeral) {
+        while inflight.contains_key(path) {
             inflight = self.inflight_cvar.wait(inflight).unwrap();
         }
     }
@@ -371,7 +353,7 @@ impl WritePool {
         self.flush_all_coalesce();
 
         let mut inflight = self.inflight.lock().unwrap();
-        while inflight.values().any(|e| !e.ephemeral) {
+        while !inflight.is_empty() {
             inflight = self.inflight_cvar.wait(inflight).unwrap();
         }
     }

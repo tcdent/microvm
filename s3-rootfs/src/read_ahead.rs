@@ -83,8 +83,9 @@ impl ReadAheadState {
     /// — those don't exercise the RA path and would fake sequential
     /// detection.
     pub fn observe(&mut self, offset: u64, size: u32) {
-        if self.mode == ReadAhead::Off {
-            return;
+        match self.mode {
+            ReadAhead::Off => return,
+            ReadAhead::Auto | ReadAhead::Aggressive => {}
         }
 
         if self.last_end == Some(offset) {
@@ -128,7 +129,7 @@ impl ReadAheadState {
 
     /// Whether read-ahead is active for this handle.
     pub fn is_active(&self) -> bool {
-        self.mode != ReadAhead::Off && self.window > 0
+        matches!(self.mode, ReadAhead::Auto | ReadAhead::Aggressive) && self.window > 0
     }
 
     /// The window to use for the next prefetch GET.

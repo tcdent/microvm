@@ -1242,12 +1242,15 @@ impl FileSystem for S3Fs {
         // Ephemeral files never touch S3 — skip the initial empty PUT.
         // The inode cache entry still gets created so lookups work;
         // the data lives only in the inflight map after release.
-        if rules.durability != Durability::Ephemeral {
-            log!("S3 PUT create {}", path);
-            self.client.put(&key, &[])
-                .io_err(&format!("create PUT {}", path))?;
-        } else {
-            debug!("create EPHEMERAL {} (skipping S3 PUT)", path);
+        match rules.durability {
+            Durability::Ephemeral => {
+                debug!("create EPHEMERAL {} (skipping S3 PUT)", path);
+            }
+            Durability::Local | Durability::Durable => {
+                log!("S3 PUT create {}", path);
+                self.client.put(&key, &[])
+                    .io_err(&format!("create PUT {}", path))?;
+            }
         }
 
         let (ino, fuse_entry) = {
@@ -1424,13 +1427,15 @@ impl FileSystem for S3Fs {
         let meta = KeyMeta::new(libc::S_IFDIR as u32 | 0o755, 0, 0);
         let key = keys::encode(&path, meta);
 
-        let rules = self.ruleset.resolve(&path);
-        if rules.durability != Durability::Ephemeral {
-            log!("S3 PUT mkdir {}", path);
-            self.client.put(&key, &[])
-                .io_err(&format!("mkdir PUT {}", path))?;
-        } else {
-            debug!("mkdir EPHEMERAL {} (skipping S3 PUT)", path);
+        match self.ruleset.resolve(&path).durability {
+            Durability::Ephemeral => {
+                debug!("mkdir EPHEMERAL {} (skipping S3 PUT)", path);
+            }
+            Durability::Local | Durability::Durable => {
+                log!("S3 PUT mkdir {}", path);
+                self.client.put(&key, &[])
+                    .io_err(&format!("mkdir PUT {}", path))?;
+            }
         }
 
         let mut cache = self.cache.lock().unwrap();
@@ -1461,16 +1466,18 @@ impl FileSystem for S3Fs {
 
         match per_vm_meta {
             Some(meta) => {
-                let durability = self.ruleset.resolve(&path).durability;
-                if durability != Durability::Ephemeral {
-                    let key = keys::encode(&path, meta);
-                    log!("S3 DELETE unlink {}", path);
-                    self.client.delete(&key)
-                        .io_err(&format!("unlink DELETE {}", path))?;
-                }
-                // Remove ephemeral file from local disk if present.
-                if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
-                    let _ = std::fs::remove_file(eph_dir.join(&path));
+                match self.ruleset.resolve(&path).durability {
+                    Durability::Ephemeral => {
+                        if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+                            let _ = std::fs::remove_file(eph_dir.join(&path));
+                        }
+                    }
+                    Durability::Local | Durability::Durable => {
+                        let key = keys::encode(&path, meta);
+                        log!("S3 DELETE unlink {}", path);
+                        self.client.delete(&key)
+                            .io_err(&format!("unlink DELETE {}", path))?;
+                    }
                 }
 
                 let mut cache = self.cache.lock().unwrap();
@@ -1554,7 +1561,8 @@ impl FileSystem for S3Fs {
             // Check source durability to decide S3 vs local-disk rename.
             let dir_durability = self.ruleset.resolve(&old_path).durability;
 
-            if dir_durability == Durability::Ephemeral {
+            match dir_durability {
+            Durability::Ephemeral => {
                 // Ephemeral dir: children live on local disk, not S3.
                 // Rename the entire subtree on disk in one shot.
                 if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
@@ -1578,7 +1586,8 @@ impl FileSystem for S3Fs {
                     cache.insert(&new_child, entry);
                 }
                 drop(cache);
-            } else {
+            }
+            Durability::Local | Durability::Durable => {
             // Durable dir: children are in S3.
             self.write_pool.wait_for_all();
 
@@ -1670,7 +1679,8 @@ impl FileSystem for S3Fs {
                     );
                 }
             }
-            } // end durable dir rename
+            } // end Durable/Local dir rename
+            } // end match dir_durability
         } else {
             // Single-file rename: drain any pending deferred write for
             // this specific path before the server-side COPY. Same
@@ -1686,17 +1696,17 @@ impl FileSystem for S3Fs {
         // Resolve durability from the RULESET, not inflight state.
         // Ephemeral entries may have been evicted or not yet released.
         let durability = self.ruleset.resolve(&old_path).durability;
-        if durability == Durability::Ephemeral {
-            // Ephemeral source: no S3 object. Move the inflight entry
-            // (if present) to the new path+key. No S3 ops.
-            log!("rename EPHEMERAL {} -> {}", old_path, new_path);
-            self.write_pool.rename_path(&old_path, &new_path, new_key);
-        } else {
-            // Durable source: server-side S3 copy, no data through client.
-            self.client.copy(&old_key, &new_key)
-                .io_err(&format!("rename COPY {} -> {}", old_path, new_path))?;
-            self.client.delete(&old_key)
-                .io_err(&format!("rename DELETE {}", old_path))?;
+        match durability {
+            Durability::Ephemeral => {
+                log!("rename EPHEMERAL {} -> {}", old_path, new_path);
+                self.write_pool.rename_path(&old_path, &new_path, new_key);
+            }
+            Durability::Local | Durability::Durable => {
+                self.client.copy(&old_key, &new_key)
+                    .io_err(&format!("rename COPY {} -> {}", old_path, new_path))?;
+                self.client.delete(&old_key)
+                    .io_err(&format!("rename DELETE {}", old_path))?;
+            }
         }
 
         // Read-cache invalidation: drop the old-path entry if any.
@@ -1792,26 +1802,27 @@ impl FileSystem for S3Fs {
                     // inflight state. Ephemeral entries may have been
                     // evicted (budget pressure) or not yet released —
                     // the ruleset is the authoritative source.
-                    let durability = self.ruleset.resolve(&path).durability;
-                    if durability == Durability::Ephemeral {
-                        // Ephemeral: no S3 object to re-key. Update
-                        // the inflight entry's key if present.
-                        self.write_pool.rename_path(&path, &path, new_key);
-                    } else if self.write_pool.get(&path).is_some() {
-                        // Durable inflight: update the key the worker
-                        // will PUT to. Don't touch S3 — the old key's
-                        // content will be superseded by the inflight PUT.
-                        self.write_pool.rename_path(&path, &path, new_key);
-                        let _ = self.client.delete(&old_key);
-                    } else {
-                        // No inflight: re-key via S3 COPY + DELETE.
-                        log!("setattr re-key {} (mode {:o} -> {:o})", path,
-                             old_meta.mode, new_meta.mode);
-                        self.write_pool.wait_for_path(&path);
-                        self.client.copy(&old_key, &new_key)
-                            .io_err(&format!("setattr COPY {}", path))?;
-                        self.client.delete(&old_key)
-                            .io_err(&format!("setattr DELETE {}", path))?;
+                    match self.ruleset.resolve(&path).durability {
+                        Durability::Ephemeral => {
+                            self.write_pool.rename_path(&path, &path, new_key);
+                        }
+                        Durability::Local | Durability::Durable => {
+                            if self.write_pool.get(&path).is_some() {
+                                // Inflight: update key for pending PUT,
+                                // delete stale old key from create().
+                                self.write_pool.rename_path(&path, &path, new_key);
+                                let _ = self.client.delete(&old_key);
+                            } else {
+                                // Clean: re-key via S3 COPY + DELETE.
+                                log!("setattr re-key {} (mode {:o} -> {:o})", path,
+                                     old_meta.mode, new_meta.mode);
+                                self.write_pool.wait_for_path(&path);
+                                self.client.copy(&old_key, &new_key)
+                                    .io_err(&format!("setattr COPY {}", path))?;
+                                self.client.delete(&old_key)
+                                    .io_err(&format!("setattr DELETE {}", path))?;
+                            }
+                        }
                     }
                     // Invalidate read cache — the old key is gone.
                     self.read_cache.remove(&path);
@@ -1867,20 +1878,21 @@ impl FileSystem for S3Fs {
         let meta = KeyMeta::new(libc::S_IFLNK as u32 | 0o777, 0, 0);
         let key = keys::encode(&path, meta);
 
-        let durability = self.ruleset.resolve(&path).durability;
-        if durability == Durability::Ephemeral {
-            // Ephemeral: write symlink target to local disk.
-            if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
-                let file_path = eph_dir.join(&path);
-                if let Some(parent) = file_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+        match self.ruleset.resolve(&path).durability {
+            Durability::Ephemeral => {
+                if let Some(eph_dir) = self.write_pool.ephemeral_dir() {
+                    let file_path = eph_dir.join(&path);
+                    if let Some(parent) = file_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&file_path, target.as_bytes())?;
                 }
-                std::fs::write(&file_path, target.as_bytes())?;
             }
-        } else {
-            log!("S3 PUT symlink {} -> {}", path, target);
-            self.client.put(&key, target.as_bytes())
-                .io_err(&format!("symlink PUT {}", path))?;
+            Durability::Local | Durability::Durable => {
+                log!("S3 PUT symlink {} -> {}", path, target);
+                self.client.put(&key, target.as_bytes())
+                    .io_err(&format!("symlink PUT {}", path))?;
+            }
         }
 
         let mut cache = self.cache.lock().unwrap();
@@ -1934,12 +1946,14 @@ impl FileSystem for S3Fs {
             }
         }
 
-        let durability = self.ruleset.resolve(&path).durability;
-        if durability != Durability::Ephemeral {
-            let key = keys::encode(&path, meta);
-            log!("S3 DELETE rmdir {}", path);
-            self.client.delete(&key)
-                .io_err(&format!("rmdir DELETE {}", path))?;
+        match self.ruleset.resolve(&path).durability {
+            Durability::Ephemeral => {}
+            Durability::Local | Durability::Durable => {
+                let key = keys::encode(&path, meta);
+                log!("S3 DELETE rmdir {}", path);
+                self.client.delete(&key)
+                    .io_err(&format!("rmdir DELETE {}", path))?;
+            }
         }
 
         let mut cache = self.cache.lock().unwrap();
