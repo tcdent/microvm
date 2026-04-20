@@ -24,6 +24,9 @@ pub struct VmEntry {
     /// Shared with the VM's vcpu loop. Setting this to true causes
     /// the vcpu loop to exit at the next iteration.
     pub shutdown_flag: Arc<AtomicBool>,
+    /// Tap device name allocated by tap::allocate. None if the user
+    /// provided an explicit net_ifname (skip release on stop).
+    pub allocated_tap: Option<String>,
 }
 
 impl VmRegistry {
@@ -98,5 +101,12 @@ impl VmRegistry {
         self.entries.lock().unwrap()
             .get_mut(name_hash)
             .and_then(|e| e.thread.take())
+    }
+
+    /// Get the allocated tap name for cleanup on stop.
+    pub fn allocated_tap(&self, name_hash: &str) -> Option<String> {
+        self.entries.lock().unwrap()
+            .get(name_hash)
+            .and_then(|e| e.allocated_tap.clone())
     }
 }

@@ -17,6 +17,7 @@ pub mod vm;
 pub mod bucket;
 pub mod log;
 pub mod ipc;
+pub mod tap;
 
 use std::sync::Arc;
 
@@ -87,6 +88,12 @@ impl Orchestrator {
         // Thread's own cleanup transitions to Stopped/Crashed.
         // If it didn't (e.g. join returned before transition), force it.
         self.registry.transition_state(&hash, VmState::Stopped);
+
+        // Release the tap device if we allocated it.
+        if let Some(tap) = self.registry.allocated_tap(&hash) {
+            tap::release(&tap);
+        }
+
         Ok(())
     }
 

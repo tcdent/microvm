@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use s3_rootfs::{GoldenBlobCache, GoldenInodeCache, S3Client, S3Config};
+
 use crate::bucket::S3AdminClient;
 use crate::config::DaemonConfig;
 use crate::Error;
@@ -19,7 +21,10 @@ use crate::Error;
 pub struct SharedContext {
     pub config: DaemonConfig,
     pub s3_admin: Arc<S3AdminClient>,
-    // TODO: tap pool handle, log dir state.
+    /// Pre-loaded golden caches, shared across all VMs.
+    /// None if no default_golden_bucket is configured.
+    pub golden_inodes: Option<Arc<GoldenInodeCache>>,
+    pub golden_blobs: Option<Arc<GoldenBlobCache>>,
 }
 
 impl SharedContext {
@@ -34,6 +39,33 @@ impl SharedContext {
         let _ = std::fs::create_dir_all(&config.log_dir);
         let _ = std::fs::create_dir_all(&config.ephemeral_root);
 
-        Ok(Self { config, s3_admin })
+        // Pre-load golden caches once for sharing across all VMs.
+        let (golden_inodes, golden_blobs) = match &config.default_golden_bucket {
+            Some(bucket) => {
+                let s3_cfg = S3Config {
+                    endpoint: config.s3_endpoint.clone(),
+                    bucket: bucket.clone(),
+                    ..S3Config::default()
+                };
+                let client = S3Client::new(s3_cfg);
+                let golden_cfg = s3_rootfs::GoldenConfig {
+                    bucket: bucket.clone(),
+                    manifest: s3_rootfs::ManifestSource::S3Key(".manifest".to_string()),
+                };
+                match s3_rootfs::load_golden(&golden_cfg, &client) {
+                    Ok((inodes, blobs)) => {
+                        eprintln!("SharedContext: loaded golden caches from {}", bucket);
+                        (Some(inodes), Some(blobs))
+                    }
+                    Err(e) => {
+                        eprintln!("SharedContext: golden load failed ({}), per-VM fallback", e);
+                        (None, None)
+                    }
+                }
+            }
+            None => (None, None),
+        };
+
+        Ok(Self { config, s3_admin, golden_inodes, golden_blobs })
     }
 }

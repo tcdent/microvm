@@ -44,8 +44,17 @@ pub fn spawn(
         return Err(Error::Spawn(format!("create ephemeral dir: {e}")));
     }
 
-    // 4. Network — pass through from spec; real tap pool lands later.
-    let net_ifname = spec.net_ifname.clone();
+    // 4. Network — allocate tap on demand, or use spec-provided name.
+    let (net_ifname, allocated_tap) = match spec.net_ifname.clone() {
+        Some(name) => (Some(name), None), // user-provided, skip allocation
+        None => match crate::tap::allocate(&name_hash) {
+            Ok(tap) => (Some(tap.clone()), Some(tap)),
+            Err(e) => {
+                eprintln!("vm::spawn: tap allocate failed ({}), proceeding without net", e);
+                (None, None)
+            }
+        },
+    };
 
     // 5. Log dir — per-VM log directory.
     let log_dir = shared.config.log_dir.join(&name_hash);
@@ -65,13 +74,22 @@ pub fn spawn(
         }
     }
 
-    if let Some(ref golden) = spec.golden_bucket.as_ref()
-        .or(shared.config.default_golden_bucket.as_ref())
-    {
-        fs.golden = Some(s3_rootfs::GoldenConfig {
-            bucket: golden.to_string(),
-            manifest: s3_rootfs::ManifestSource::S3Key(".manifest".to_string()),
-        });
+    // Golden: use shared pre-loaded caches if the spec doesn't
+    // override with a different golden bucket. If spec has a
+    // different golden_bucket, fall back to per-VM load via FsConfig.
+    let use_shared_golden = spec.golden_bucket.is_none()
+        && shared.golden_inodes.is_some()
+        && shared.golden_blobs.is_some();
+
+    if !use_shared_golden {
+        if let Some(ref golden) = spec.golden_bucket.as_ref()
+            .or(shared.config.default_golden_bucket.as_ref())
+        {
+            fs.golden = Some(s3_rootfs::GoldenConfig {
+                bucket: golden.to_string(),
+                manifest: s3_rootfs::ManifestSource::S3Key(".manifest".to_string()),
+            });
+        }
     }
 
     // 7. Build LaunchConfig with shared shutdown flag.
@@ -101,19 +119,35 @@ pub fn spawn(
         started_at: Instant::now(),
         thread: None,
         shutdown_flag,
+        allocated_tap: allocated_tap.clone(),
     };
     registry.insert(entry)?;
 
     // 9. Spawn the VM thread.
     let reg = Arc::clone(&registry);
     let hash = name_hash.clone();
+    // Clone shared golden Arcs for the thread (cheap Arc::clone).
+    let shared_golden_inodes = if use_shared_golden {
+        shared.golden_inodes.clone()
+    } else { None };
+    let shared_golden_blobs = if use_shared_golden {
+        shared.golden_blobs.clone()
+    } else { None };
     let handle = std::thread::Builder::new()
         .name(format!("vm-{}", name_hash))
         .spawn(move || {
             reg.transition_state(&hash, VmState::Running);
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                microvm::launcher::run(cfg)
+                // Use shared golden caches if available, else per-VM load.
+                if let (Some(inodes), Some(blobs)) = (shared_golden_inodes, shared_golden_blobs) {
+                    let fs = std::sync::Arc::new(
+                        s3_rootfs::S3Fs::new_with_golden(cfg.fs.clone(), inodes, blobs)
+                    );
+                    microvm::launcher::launch_vm(cfg, fs)
+                } else {
+                    microvm::launcher::run(cfg)
+                }
             }));
 
             let final_state = match result {
