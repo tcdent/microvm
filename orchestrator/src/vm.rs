@@ -64,6 +64,8 @@ pub fn spawn(
     let mut fs = FsConfig::default();
     fs.s3.endpoint = shared.config.s3_endpoint.clone();
     fs.s3.bucket = bucket;
+    fs.s3.access_key = shared.config.s3_admin_access_key.clone();
+    fs.s3.secret_key = shared.config.s3_admin_secret_key.clone();
     fs.ephemeral_dir = Some(ephemeral_dir);
 
     if let Some(ref ruleset) = spec.ruleset.as_ref()

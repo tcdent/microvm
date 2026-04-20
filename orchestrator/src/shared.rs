@@ -45,6 +45,8 @@ impl SharedContext {
                 let s3_cfg = S3Config {
                     endpoint: config.s3_endpoint.clone(),
                     bucket: bucket.clone(),
+                    access_key: config.s3_admin_access_key.clone(),
+                    secret_key: config.s3_admin_secret_key.clone(),
                     ..S3Config::default()
                 };
                 let client = S3Client::new(s3_cfg);
