@@ -69,6 +69,10 @@ pub struct LaunchConfig {
     /// KVM_RUN. `None` means no external shutdown control (the
     /// standalone binary doesn't use this).
     pub shutdown: Option<Arc<AtomicBool>>,
+    /// Optional file path for serial console output. When set,
+    /// serial writes go to this file (append mode). When None,
+    /// serial writes go to stdout (standalone binary behavior).
+    pub log_file: Option<std::path::PathBuf>,
 }
 
 // ── Filesystem bring-up ────────────────────────────────────────────────
@@ -180,8 +184,28 @@ impl System {
         cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
 
         // Serial (ttyS0): output-only for early boot messages before
-        // virtio-console comes up.
-        let serial = serial::create(&vm);
+        // virtio-console comes up. Output goes to log_file if set,
+        // otherwise stdout.
+        let serial_output: Box<dyn std::io::Write + Send> = match &cfg.log_file {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap_or_else(|e| {
+                        log!("serial log open failed ({}), falling back to stdout: {}", path.display(), e);
+                        // Can't return Box<Stdout> from this closure easily,
+                        // so create a /dev/null fallback and warn.
+                        std::fs::File::open("/dev/null").unwrap()
+                    });
+                Box::new(f)
+            }
+            None => Box::new(std::io::stdout()),
+        };
+        let serial = serial::create(&vm, serial_output);
 
         // Virtio-console (hvc0): interactive post-boot console.
         let console = VirtioConsole::stdio(VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_BASE);

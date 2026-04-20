@@ -23,7 +23,7 @@ impl Trigger for IrqTrigger {
     }
 }
 
-type InnerSerial = VmSerial<IrqTrigger, NoEvents, io::Stdout>;
+type InnerSerial = VmSerial<IrqTrigger, NoEvents, Box<dyn io::Write + Send>>;
 
 pub struct Serial {
     inner: Arc<Mutex<InnerSerial>>,
@@ -59,10 +59,10 @@ impl Serial {
     }
 }
 
-pub fn create(vm: &VmFd) -> Serial {
+pub fn create(vm: &VmFd, output: Box<dyn io::Write + Send>) -> Serial {
     let eventfd = EventFd::new(libc::EFD_NONBLOCK).expect("eventfd");
     vm.register_irqfd(&eventfd, SERIAL_IRQ).expect("register serial irqfd");
     let trigger = IrqTrigger { eventfd: Arc::new(eventfd) };
-    let inner = InnerSerial::new(trigger, io::stdout());
+    let inner = InnerSerial::new(trigger, output);
     Serial { inner: Arc::new(Mutex::new(inner)) }
 }

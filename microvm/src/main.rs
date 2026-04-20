@@ -99,6 +99,7 @@ fn config_from_env() -> LaunchConfig {
         vm_id: env_or("VM_ID", "default"),
         fs,
         shutdown: None,
+        log_file: None,
     }
 }
 

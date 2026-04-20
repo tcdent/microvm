@@ -90,6 +90,7 @@ pub fn spawn(
         vm_id: name_hash.clone(),
         fs,
         shutdown: Some(Arc::clone(&shutdown_flag)),
+        log_file: Some(log_dir.join("serial.log")),
     };
 
     // 8. Insert into registry as Starting.

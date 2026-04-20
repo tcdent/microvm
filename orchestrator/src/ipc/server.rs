@@ -51,6 +51,29 @@ pub fn serve(orch: Arc<Orchestrator>, shutdown: Arc<AtomicBool>) -> std::io::Res
     Ok(())
 }
 
+/// Stream log output (tail -f semantics). Reads the log file,
+/// sends content, then polls for new bytes until client disconnects.
+fn stream_logs(orch: &Orchestrator, name: &str, writer: &mut impl Write) {
+    let hash = crate::registry::VmRegistry::name_hash(name);
+    let path = crate::log::log_path(&orch.config.log_dir, &hash);
+    let mut offset = 0u64;
+
+    loop {
+        // Read any new bytes since last offset.
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if content.len() as u64 > offset {
+                let new = &content[offset as usize..];
+                let resp = Response::LogChunk(new.to_string());
+                if writeln!(writer, "{}", serde_json::to_string(&resp).unwrap()).is_err() {
+                    break; // client disconnected
+                }
+                offset = content.len() as u64;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn handle_connection(orch: Arc<Orchestrator>, stream: std::os::unix::net::UnixStream) {
     // Set blocking for the per-connection handler.
     let _ = stream.set_nonblocking(false);
@@ -74,6 +97,13 @@ fn handle_connection(orch: Arc<Orchestrator>, stream: std::os::unix::net::UnixSt
                 continue;
             }
         };
+
+        // Logs{follow:true} needs streaming — multiple responses
+        // until client disconnects.
+        if let Command::Logs { ref name, follow: true } = cmd {
+            stream_logs(&orch, name, &mut writer);
+            break; // streaming takes over the connection
+        }
 
         let resp = handler::dispatch(&orch, cmd);
         let json = serde_json::to_string(&resp).unwrap();
