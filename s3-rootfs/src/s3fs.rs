@@ -241,6 +241,52 @@ impl S3Fs {
             crate::log!("S3Fs: loaded {} ruleset rules", ruleset.len());
         }
 
+        Self::build(client, cfg, write_pool, write_threads, golden_inodes, golden_blobs, ruleset)
+    }
+
+    /// Construct with pre-loaded golden caches. Used by the
+    /// orchestrator to share one golden cache across all VMs
+    /// instead of loading N copies.
+    ///
+    /// The golden config on `cfg` is ignored — the pre-loaded
+    /// caches take precedence. Everything else (S3 client, write
+    /// pool, ruleset) is built per-VM as normal.
+    pub fn new_with_golden(
+        cfg: FsConfig,
+        golden_inodes: Arc<GoldenInodeCache>,
+        golden_blobs: Arc<GoldenBlobCache>,
+    ) -> Self {
+        let client = Arc::new(S3Client::new(cfg.s3.clone()));
+
+        let (write_pool, write_threads) = WritePool::start(WritePoolConfig {
+            workers: cfg.write_workers,
+            budget_bytes: cfg.write_inflight_budget,
+            ephemeral_dir: cfg.ephemeral_dir.clone(),
+            client: Arc::clone(&client),
+        });
+
+        let ruleset = match &cfg.ruleset_path {
+            Some(path) => Ruleset::from_toml(path).unwrap_or_else(|e| {
+                panic!("S3Fs::new_with_golden: failed to load ruleset from {}: {e}", path.display())
+            }),
+            None => Ruleset::empty(),
+        };
+        if !ruleset.is_empty() {
+            crate::log!("S3Fs: loaded {} ruleset rules", ruleset.len());
+        }
+
+        Self::build(client, cfg, write_pool, write_threads, golden_inodes, golden_blobs, ruleset)
+    }
+
+    fn build(
+        client: Arc<S3Client>,
+        cfg: FsConfig,
+        write_pool: Arc<WritePool>,
+        write_threads: Vec<std::thread::JoinHandle<()>>,
+        golden_inodes: Arc<GoldenInodeCache>,
+        golden_blobs: Arc<GoldenBlobCache>,
+        ruleset: Ruleset,
+    ) -> Self {
         S3Fs {
             client,
             cache: Mutex::new(InodeCache::new()),
