@@ -368,11 +368,24 @@ Success criteria met:
 - Re-launching a stopped name reuses its bucket (persistence). ✓
 - Orchestrator crash takes all VMs down ("house of cards" by design). ✓
 
+Amendments (same day, pre-close):
+- `dcd2363` + `d9a2234`: golden cache actually shared (N VMs, 1 copy)
+  via new `S3Fs::new_with_golden(cfg, inodes, blobs)` constructor.
+  SharedContext preloads once; each VM's spawn passes the shared
+  Arcs when spec doesn't override golden_bucket.
+- `d9a2234`: tap allocation on-demand via `ip link add/set/del`
+  (orchestrator/src/tap.rs). VmEntry tracks allocated_tap for
+  cleanup in stop_vm. Opt-out if spec.net_ifname is provided.
+  Requires CAP_NET_ADMIN on the microd process.
+
 Known gaps carried to sprint-16 candidates:
-- Cache/pool hoisting for perf (the deferred optimization from §2).
+- Write pool sharing across VMs (only golden is shared today; each
+  VM still has its own `Arc<WritePool>`).
 - ACPI-style graceful guest shutdown (stop_vm currently waits on vcpu exit; a busy guest can take arbitrary time).
-- Tap device pool allocation (currently passes through spec.net_ifname; multi-VM on the same macvtap would collide).
 - S3-native rename batch (carried from sprint-14 §5).
 - Git+SSH dependency auth, IPv6 link-local, VM_ID ephemeral_dir enforcement (all sprint-14 §5).
 - Real AWS S3 sigv4 compliance (rusty-s3 gets us part way; some endpoints may still need tweaks for live AWS).
 - Orchestrator restart recovery (v0 is "house of cards" — no reconnect).
+- Per-VM S3 access still uses FsConfig default creds; daemon admin
+  creds aren't threaded through to per-VM S3Fs instances. Works
+  for RustFS/MinIO where admin==dev creds, latent gap for real AWS.
