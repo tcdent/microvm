@@ -80,11 +80,23 @@ fn run(root: &Path, bucket: &str, endpoint: &str, threads: usize) -> io::Result<
     // — the bucket identity is per-call via put_to / exists_in.
     // Primary bucket is unused here (we always go through
     // bucket-overrides), so we just pass `bucket` as the primary.
-    let cfg = S3Config {
+    //
+    // Credentials: honor standard AWS env vars if set. Without this,
+    // S3Config::default() silently sends `minioadmin/minioadmin`
+    // against whatever endpoint the caller pointed us at — which
+    // 403s against any real deployment. bootstrap-golden.sh exports
+    // these env vars from /etc/microd/config.ini.
+    let mut cfg = S3Config {
         endpoint: endpoint.to_string(),
         bucket: bucket.to_string(),
         ..S3Config::default()
     };
+    if let Ok(v) = std::env::var("AWS_ACCESS_KEY_ID") {
+        cfg.access_key = v;
+    }
+    if let Ok(v) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+        cfg.secret_key = v;
+    }
     let agent = Arc::new(S3Client::build_agent(&cfg));
     let client = Arc::new(S3Client::with_shared_agent(cfg, Arc::clone(&agent)));
 
