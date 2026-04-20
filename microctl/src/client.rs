@@ -13,10 +13,15 @@ pub fn send(socket_path: &Path, cmd: Command) -> std::io::Result<Response> {
     let json = serde_json::to_string(&cmd).unwrap();
     writeln!(stream, "{}", json)?;
 
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let mut reader = reader;
-    reader.read_line(&mut line)?;
+    let bytes = reader.read_line(&mut line)?;
+    if bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "server closed connection before responding",
+        ));
+    }
 
     serde_json::from_str(&line)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
