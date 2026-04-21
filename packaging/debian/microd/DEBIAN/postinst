@@ -1,0 +1,42 @@
+#!/bin/sh
+# Post-install: systemd register + ensure runtime dirs + (re)start.
+
+set -e
+
+case "$1" in
+    configure)
+        # Create dirs the daemon writes into. RuntimeDirectory= in the
+        # systemd unit handles /run/microd at service-start time.
+        mkdir -p /var/lib/microd /var/log/microd
+        chmod 0755 /var/lib/microd /var/log/microd
+
+        # Register the unit + reload.
+        systemctl daemon-reload
+
+        # DON'T auto-enable or auto-start. Operator runs:
+        #   sudo systemctl enable microd
+        #   sudo systemctl start microd
+        # This avoids starting a service with still-CHANGEME creds.
+
+        # First install: point operators at the config they need to edit.
+        if [ -z "$2" ]; then
+            echo ""
+            echo "microd installed. Before first start:"
+            echo "  1. Edit /etc/microd/config.ini (replace CHANGEME creds)"
+            echo "  2. Place guest kernel at /var/lib/microd/vmlinux"
+            echo "  3. Place initrd at /var/lib/microd/initramfs.cpio.gz"
+            echo "  4. systemctl enable --now microd"
+            echo ""
+        else
+            # Upgrade: restart the service if it was active before.
+            # preinst stopped it; we start it again now that new
+            # binaries + config are in place.
+            if systemctl is-enabled --quiet microd 2>/dev/null; then
+                echo "microd: restarting service after upgrade"
+                systemctl start microd || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

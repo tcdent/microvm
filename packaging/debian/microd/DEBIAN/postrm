@@ -1,0 +1,22 @@
+#!/bin/sh
+# Post-remove: reload systemd after unit removal. Leave /var/lib/microd,
+# /var/log/microd, and config files — operators may want to keep state
+# (buckets, log history) across reinstall. Full purge handled by dpkg's
+# --purge path via the `purge` case.
+
+set -e
+
+case "$1" in
+    purge)
+        # Full purge: wipe state dirs and config.
+        rm -rf /var/lib/microd /var/log/microd
+        # /etc/microd/* conffiles are removed by dpkg itself on purge.
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        :
+        ;;
+esac
+
+systemctl daemon-reload || true
+
+exit 0

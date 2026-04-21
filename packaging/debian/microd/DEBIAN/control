@@ -1,0 +1,14 @@
+Package: microd
+Version: @VERSION@
+Section: admin
+Priority: optional
+Architecture: amd64
+Depends: iproute2, systemd
+Recommends: debootstrap
+Maintainer: microd maintainers <noreply@a10k.internal>
+Description: microVM orchestrator daemon
+ microd runs multiple KVM-backed microVMs under a single process,
+ with an S3-backed root filesystem and a transport-agnostic IPC
+ surface. Ships with the microctl CLI and golden-upload build tool.
+ .
+ See /usr/local/share/microd/README for deployment notes.

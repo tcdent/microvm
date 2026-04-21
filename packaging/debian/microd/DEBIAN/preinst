@@ -1,0 +1,20 @@
+#!/bin/sh
+# Pre-install: stop microd before binaries are replaced.
+#
+# dpkg invokes preinst BEFORE unpacking new files. For upgrade
+# ($1 == upgrade), we need to stop the running daemon cleanly so
+# systemd doesn't kill it mid-binary-swap. For fresh install
+# ($1 == install), nothing to stop.
+
+set -e
+
+case "$1" in
+    upgrade|configure)
+        if systemctl is-active --quiet microd; then
+            echo "microd: stopping service before upgrade"
+            systemctl stop microd || true
+        fi
+        ;;
+esac
+
+exit 0
