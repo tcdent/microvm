@@ -39,6 +39,9 @@ impl SharedContext {
         let _ = std::fs::create_dir_all(&config.log_dir);
         let _ = std::fs::create_dir_all(&config.ephemeral_root);
 
+        // Clean up stale tap devices from a previous unclean shutdown.
+        crate::tap::cleanup_stale();
+
         // Pre-load golden caches once for sharing across all VMs.
         //
         // Retry with exponential backoff on failure: production
