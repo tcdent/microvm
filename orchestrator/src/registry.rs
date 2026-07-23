@@ -27,6 +27,10 @@ pub struct VmEntry {
     /// Tap device name allocated by tap::allocate. None if the user
     /// provided an explicit net_ifname (skip release on stop).
     pub allocated_tap: Option<String>,
+    /// Write end of the console pipe. Writing `\npoweroff\n` here
+    /// sends the command to the guest's hvc0 console for graceful
+    /// shutdown.
+    pub console_writer: Option<std::os::unix::net::UnixStream>,
 }
 
 impl VmRegistry {
@@ -101,6 +105,13 @@ impl VmRegistry {
         self.entries.lock().unwrap()
             .get_mut(name_hash)
             .and_then(|e| e.thread.take())
+    }
+
+    /// Get the console writer for graceful shutdown injection.
+    pub fn console_writer(&self, name_hash: &str) -> Option<std::os::unix::net::UnixStream> {
+        self.entries.lock().unwrap()
+            .get_mut(name_hash)
+            .and_then(|e| e.console_writer.take())
     }
 
     /// Get the allocated tap name for cleanup on stop.

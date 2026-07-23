@@ -74,19 +74,52 @@ impl Orchestrator {
             VmState::Starting | VmState::Running => {}
         }
 
-        // Signal the VM to shut down.
         self.registry.transition_state(&hash, VmState::Stopping);
+
+        // Phase 1: graceful — send `poweroff` to the guest's hvc0
+        // console. The guest's autologin root shell runs the command,
+        // systemd shuts down services in order, syncs filesystems,
+        // and powers off. The VM thread exits on KVM_EXIT_SHUTDOWN.
+        if let Some(mut writer) = self.registry.console_writer(&hash) {
+            use std::io::Write;
+            let _ = writer.write_all(b"\npoweroff\n");
+            let _ = writer.flush();
+            drop(writer); // close write end so RX worker sees EOF after
+
+            // Wait up to 30s for graceful exit.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(info) = self.registry.inspect(name) {
+                    if info.state == VmState::Stopped || info.state == VmState::Crashed {
+                        break;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("stop_vm: graceful timeout for {}, hard-stopping", name);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+
+        // Phase 2: hard-stop — set the AtomicBool flag. If the guest
+        // already shut down gracefully, this is a no-op (thread
+        // already exited). If the guest hung, this breaks the vcpu
+        // loop at the next iteration.
+        // Note: stop_vm can take arbitrary time if the VM's vcpu is
+        // busy and KVM_RUN doesn't return until the next exit. For
+        // v0 this is acceptable; ACPI interrupt injection is a future
+        // improvement that would force a faster KVM_RUN return.
         if let Some(flag) = self.registry.shutdown_flag(&hash) {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Join the thread (blocks until vcpu loop exits).
+        // Join the thread.
         if let Some(handle) = self.registry.take_thread(&hash) {
             let _ = handle.join();
         }
 
-        // Thread's own cleanup transitions to Stopped/Crashed.
-        // If it didn't (e.g. join returned before transition), force it.
         self.registry.transition_state(&hash, VmState::Stopped);
 
         // Release the tap device if we allocated it.

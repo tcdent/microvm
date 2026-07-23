@@ -1,0 +1,51 @@
+[Unit]
+Description=microd VM orchestrator
+Documentation=https://github.com/tcdent/vm (research/15-orchestration-design.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as root by default. If you'd rather run as a dedicated user,
+# create one with CAP_NET_ADMIN:
+#   useradd -r -s /usr/sbin/nologin microd
+#   setcap cap_net_admin+ep /usr/local/bin/microd
+# then set User=microd and remove CAP_NET_ADMIN line below (setcap
+# on the binary supersedes per-service caps).
+User=root
+Group=root
+
+# Alternatively, drop root entirely via ambient capabilities:
+#   User=microd
+#   AmbientCapabilities=CAP_NET_ADMIN
+#   CapabilityBoundingSet=CAP_NET_ADMIN
+
+ExecStart=/usr/local/bin/microd --config /etc/microd/config.ini
+
+# Create runtime dirs on start. Socket path is /run/microd/... so
+# we need /run/microd to exist. systemd handles this via
+# RuntimeDirectory= below.
+RuntimeDirectory=microd
+RuntimeDirectoryMode=0755
+
+# Clean shutdown: SIGTERM tells microd to set the shutdown flag,
+# which tears down VMs gracefully before exiting. Give it some time.
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+
+# Restart policy. Restart on failure; DON'T restart on normal exit
+# (normal exit means operator asked for shutdown).
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits. microd is a long-running daemon holding many FDs
+# (one per VM virtio-fs, socket, log files, etc.). 8192 is generous.
+LimitNOFILE=8192
+
+# stdout/stderr go to the journal (journalctl -u microd).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

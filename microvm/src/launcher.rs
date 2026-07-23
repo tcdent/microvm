@@ -46,7 +46,6 @@ const VIRTIO_CONSOLE_IRQ: u32 = 7;
 /// This is what an orchestrator (or `main`) hands to the launcher.
 /// Kept as a plain struct; `Default` isn't meaningful here because
 /// `kernel_path` and `initrd_path` have no sensible defaults.
-#[derive(Debug, Clone)]
 pub struct LaunchConfig {
     /// Path to the kernel image (ELF vmlinux).
     pub kernel_path: String,
@@ -69,10 +68,13 @@ pub struct LaunchConfig {
     /// KVM_RUN. `None` means no external shutdown control (the
     /// standalone binary doesn't use this).
     pub shutdown: Option<Arc<AtomicBool>>,
-    /// Optional file path for serial console output. When set,
-    /// serial writes go to this file (append mode). When None,
-    /// serial writes go to stdout (standalone binary behavior).
+    /// Optional file path for serial console output.
     pub log_file: Option<std::path::PathBuf>,
+    /// Custom console input source. When set, the virtio-console RX
+    /// worker reads from this instead of stdin. Used by the
+    /// orchestrator to inject commands (e.g. `poweroff` for graceful
+    /// shutdown). None = stdin (standalone interactive mode).
+    pub console_input: Option<Box<dyn std::io::Read + Send>>,
 }
 
 // ── Filesystem bring-up ────────────────────────────────────────────────
@@ -208,7 +210,16 @@ impl System {
         let serial = serial::create(&vm, serial_output);
 
         // Virtio-console (hvc0): interactive post-boot console.
-        let console = VirtioConsole::stdio(VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_BASE);
+        // Orchestrator mode: reads from the pipe the orchestrator
+        // holds the write end of. Standalone: reads from stdin.
+        let console_input: Box<dyn std::io::Read + Send> =
+            cfg.console_input.unwrap_or_else(|| Box::new(std::io::stdin()));
+        let console = VirtioConsole::new(
+            VIRTIO_CONSOLE_IRQ,
+            VIRTIO_CONSOLE_BASE,
+            console_input,
+            Box::new(std::io::stdout()),
+        );
         vm.register_irqfd(console.mmio.irqfd_fd(), VIRTIO_CONSOLE_IRQ)?;
 
         // Virtio-fs (rootfs): backed by S3Fs via virtio-fs-transport worker.

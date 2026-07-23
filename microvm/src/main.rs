@@ -100,6 +100,7 @@ fn config_from_env() -> LaunchConfig {
         fs,
         shutdown: None,
         log_file: None,
+        console_input: None,
     }
 }
 

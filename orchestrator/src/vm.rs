@@ -94,8 +94,15 @@ pub fn spawn(
         }
     }
 
-    // 7. Build LaunchConfig with shared shutdown flag.
+    // 7. Build LaunchConfig with shared shutdown flag + console pipe.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    // Console pipe: orchestrator holds write end, VM thread's
+    // virtio-console RX reads from the read end. Used for graceful
+    // shutdown: write `\npoweroff\n` to the guest's hvc0 shell.
+    let (console_read, console_write) = std::os::unix::net::UnixStream::pair()
+        .map_err(|e| Error::Spawn(format!("console pipe: {e}")))?;
+
     let cfg = LaunchConfig {
         kernel_path: spec.kernel.as_ref()
             .unwrap_or(&shared.config.default_kernel)
@@ -111,6 +118,7 @@ pub fn spawn(
         fs,
         shutdown: Some(Arc::clone(&shutdown_flag)),
         log_file: Some(log_dir.join("serial.log")),
+        console_input: Some(Box::new(console_read)),
     };
 
     // 8. Insert into registry as Starting.
@@ -122,6 +130,7 @@ pub fn spawn(
         thread: None,
         shutdown_flag,
         allocated_tap: allocated_tap.clone(),
+        console_writer: Some(console_write),
     };
     registry.insert(entry)?;
 
