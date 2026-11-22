@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Mon, 12 Oct 2026 16:24:58 -0700
+Subject: [PATCH 36/38] fs: sharedfs: reclaim window space for page faults
+
+A fault that finds the window full cannot reclaim, as it holds its
+file's invalidate lock, so it backs off with EAGAIN and retries. Nothing
+guaranteed that anyone reclaimed meanwhile; a workload that only mmaps
+would retry forever. Such a fault now queues a reclaim work item, which
+holds no locks and frees a batch of idle chunks.
+
+Request completion and notification delivery become separate work
+items. Completion takes only the queue lock, so a request made while
+holding the mount lock (reclaim) or from inside notification delivery
+(an inode's last reference dropped by an event) is always answered;
+with one work item for both, it waited on itself.
+
+Chunk mapping failures other than EAGAIN are now logged: on a fault
+they become SIGBUS, and they left no trace.
+
+Reported-by: tablet.lead@a10k.internal
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ fs/sharedfs/data.rs     | 66 +++++++++++++++++++++++++++++++----------
+ fs/sharedfs/queue.rs    | 41 ++++++++++++++++++++++---
+ fs/sharedfs/sharedfs.rs |  2 +-
+ 3 files changed, 88 insertions(+), 21 deletions(-)
+
+diff --git a/fs/sharedfs/data.rs b/fs/sharedfs/data.rs
+index aae5b420a..c09368062 100644
+--- a/fs/sharedfs/data.rs
++++ b/fs/sharedfs/data.rs
+@@ -9,7 +9,7 @@
+ 
+ use kernel::{
+     alloc::KVec,
+-    fs::{dax, inode::INode, Offset},
++    fs::{dax, inode::INode, sb, Offset},
+     prelude::*,
+     rbtree::RBTree,
+     sync::MutexGuard,
+@@ -65,6 +65,11 @@ pub(crate) fn new(window_len: u64) -> Self {
+         }
+     }
+ 
++    /// Window space left to hand out without reclaiming.
++    fn free_chunks(&self) -> u64 {
++        self.free.len() as u64 + (self.limit - self.next) / CHUNK
++    }
++
+     fn alloc(&mut self) -> Option<u64> {
+         if let Some(w) = self.free.pop() {
+             return Some(w);
+@@ -240,7 +245,7 @@ fn ensure_chunk(&self, inode: &INode<SharedFs>, idx: u32, write: bool, fault: bo
+                     return Err(EAGAIN);
+                 }
+                 drop(maps);
+-                self.reclaim_one(inode)?;
++                self.reclaim_one(inode.super_block(), inode.ino())?;
+                 continue;
+             };
+             if let Err(e) = self.map(ino, node.generation, foff, woff, write) {
+@@ -259,13 +264,11 @@ fn ensure_chunk(&self, inode: &INode<SharedFs>, idx: u32, write: bool, fault: bo
+         }
+     }
+ 
+-    /// Frees the least recently used idle chunk. `current` is the inode asking for space; its
+-    /// own chunks are skipped since the caller holds its lock.
+-    fn reclaim_one(&self, current: &INode<SharedFs>) -> Result {
+-        let sb = current.super_block();
++    /// Frees the least recently used idle chunk, preferring one that is not `mine`'s: the inode
++    /// asking for space, whose lock the caller holds (0 when nobody does).
++    fn reclaim_one(&self, sb: &sb::SuperBlock<SharedFs>, mine: u64) -> Result {
+         let (key, chunk) = {
+             let mut maps = self.maps.lock();
+-            let mine = current.ino();
+             // Prefer another file's chunk; fall back to one of our own that is idle.
+             let pick = maps
+                 .tree
+@@ -283,20 +286,29 @@ fn reclaim_one(&self, current: &INode<SharedFs>) -> Result {
+         };
+         let start = u64::from(key.1) * CHUNK;
+         if let Some(inode) = sb.cached_inode(key.0) {
+-            if key.0 != current.ino() {
+-                // Nobody may keep pages of the range mapped once the window behind it moves.
+-                dax::break_layout(&inode, start as Offset, (start + CHUNK - 1) as Offset)?;
+-            } else {
+-                // Our own idle chunk: the caller holds the inode lock, so no mapping is being
+-                // set up; existing user mappings are torn down the same way.
+-                dax::break_layout(&inode, start as Offset, (start + CHUNK - 1) as Offset)?;
+-            }
++            // Nobody may keep pages of the range mapped once the window behind it moves.
++            dax::break_layout(&inode, start as Offset, (start + CHUNK - 1) as Offset)?;
+         }
+         let _ = self.unmap(chunk.woff);
+         self.maps.lock().release(chunk.woff);
+         Ok(())
+     }
+ 
++    /// Reclaim on behalf of page faults, which cannot reclaim themselves (a fault holds its
++    /// file's invalidate lock, which reclaim of another file's chunk could need). Runs from a
++    /// work item holding no locks, frees a batch of idle chunks, and lets the waiting faults
++    /// retry.
++    pub(crate) fn reclaim_for_faults(&self) {
++        const BATCH: u64 = 16;
++        let mount = self.mount.lock();
++        let Some(m) = mount.as_ref() else { return };
++        while self.maps.lock().free_chunks() < BATCH {
++            if self.reclaim_one(m.sb(), 0).is_err() {
++                break;
++            }
++        }
++    }
++
+     /// Gives back every chunk of a file. Called when its inode is destroyed, after the VFS has
+     /// already dropped its pages.
+     /// Forgets every window mapping ahead of a hibernation: the daemon that comes back will
+@@ -359,7 +371,29 @@ fn begin(inode: &INode<SharedFs>, pos: Offset, length: Offset, flags: u32) -> Re
+         }
+         let idx = u32::try_from(pos as u64 / CHUNK)?;
+         let start = u64::from(idx) * CHUNK;
+-        let woff = session.ensure_chunk(inode, idx, write, fault)?;
++        let woff = match session.ensure_chunk(inode, idx, write, fault) {
++            Ok(woff) => woff,
++            Err(e) if e == EAGAIN && fault => {
++                // The window is full and this fault cannot reclaim: have the worker do it.
++                session.kick_reclaim();
++                return Err(e);
++            }
++            Err(e) => {
++                // EAGAIN is the fault path's normal back-off; anything else fails the access,
++                // and on a fault that is a SIGBUS for the process.
++                if e != EAGAIN {
++                    pr_warn!(
++                        "inode {:#x} chunk {}: cannot map ({}{}): {:?}\n",
++                        inode.ino(),
++                        idx,
++                        if write { "write" } else { "read" },
++                        if fault { ", fault" } else { "" },
++                        e
++                    );
++                }
++                return Err(e);
++            }
++        };
+ 
+         let off = pos as u64 - start;
+         let mut len = length.min((start + CHUNK - pos as u64) as Offset);
+diff --git a/fs/sharedfs/queue.rs b/fs/sharedfs/queue.rs
+index a4119d915..3ee4b5d88 100644
+--- a/fs/sharedfs/queue.rs
++++ b/fs/sharedfs/queue.rs
+@@ -177,6 +177,15 @@ pub(crate) struct Session {
+     queue: Mutex<Queue>,
+     #[pin]
+     drain: Work<Session>,
++    /// Delivers host notifications. Separate from `drain`, which only completes requests and
++    /// takes no lock a request sender may hold, so that a request made while delivering (an
++    /// inode's last reference dropped by an event) or while holding the mount lock (reclaim)
++    /// is still answered.
++    #[pin]
++    notify: Work<Session, 2>,
++    /// Frees window space for page faults, which cannot reclaim themselves.
++    #[pin]
++    reclaim: Work<Session, 1>,
+     /// The mount using this session, while there is one. Notifications are delivered to it
+     /// under this lock, and the mount clears it under the same lock as it goes away.
+     #[pin]
+@@ -188,6 +197,8 @@ pub(crate) struct Session {
+ 
+ impl_has_work! {
+     impl HasWork<Self> for Session { self.drain }
++    impl HasWork<Self, 1> for Session { self.reclaim }
++    impl HasWork<Self, 2> for Session { self.notify }
+ }
+ 
+ /// What the waiter sleeps on, pinned on its stack for the life of one request.
+@@ -217,6 +228,8 @@ pub(crate) fn new(tag: KVec<u8>, index: Index, dax: Option<Dax>, vqs: Virtqueues
+                 maps <- kernel::new_mutex!(Maps::new(window_len)),
+                 queue <- kernel::new_mutex!(Queue { vqs: Some(Vqs(vqs)), next_unique: 1, notify_bufs }),
+                 drain <- new_work!("sharedfs::drain"),
++                reclaim <- new_work!("sharedfs::reclaim"),
++                notify <- new_work!("sharedfs::notify"),
+                 mount <- kernel::new_mutex!(None),
+                 open_files <- kernel::new_mutex!(RBTree::new()),
+             }),
+@@ -276,7 +289,13 @@ fn deliver(&self, buf: &[u8]) {
+     /// Called from the virtqueue callback, in interrupt context: hand completions to the drain
+     /// work item. Enqueueing while already queued is a no-op, which is the right coalescing.
+     pub(crate) fn kick_drain(self: &Arc<Self>) {
+-        let _ = workqueue::system_highpri().enqueue(self.clone());
++        let _ = workqueue::system_highpri().enqueue::<Arc<Self>, 0>(self.clone());
++        let _ = workqueue::system_highpri().enqueue::<Arc<Self>, 2>(self.clone());
++    }
++
++    /// Asks the reclaim worker for window space; repeated asks while it is queued coalesce.
++    pub(crate) fn kick_reclaim(self: &Arc<Self>) {
++        let _ = workqueue::system().enqueue::<Arc<Self>, 1>(self.clone());
+     }
+ 
+     /// Sends one request and waits for the response.
+@@ -347,11 +366,19 @@ pub(crate) fn request(&self, req: &[u8], resp_len: usize) -> Result<(KVec<u8>, u
+     }
+ }
+ 
++impl WorkItem<1> for Session {
++    type Pointer = Arc<Session>;
++
++    fn run(this: Arc<Session>) {
++        this.reclaim_for_faults();
++    }
++}
++
+ impl WorkItem for Session {
+     type Pointer = Arc<Session>;
+ 
+-    /// Drains completed requests and wakes their waiters, then delivers the notifications the
+-    /// host filled in. Runs in process context.
++    /// Completes finished requests and wakes their waiters. Runs in process context and takes
++    /// only the queue lock, which no one holds while waiting.
+     fn run(this: Arc<Session>) {
+         let q = this.queue.lock();
+         let Ok(vq) = q.vq() else { return };
+@@ -363,8 +390,14 @@ fn run(this: Arc<Session>) {
+             token.len.store(len, Relaxed);
+             token.done.complete_all();
+         }
+-        drop(q);
++    }
++}
+ 
++impl WorkItem<2> for Session {
++    type Pointer = Arc<Session>;
++
++    /// Delivers the notifications the host filled in.
++    fn run(this: Arc<Session>) {
+         // Each notification is copied out and its buffer reposted before the mount acts on it,
+         // so a slow fsnotify consumer never starves the device of buffers.
+         loop {
+diff --git a/fs/sharedfs/sharedfs.rs b/fs/sharedfs/sharedfs.rs
+index 991df6e8f..766696afc 100644
+--- a/fs/sharedfs/sharedfs.rs
++++ b/fs/sharedfs/sharedfs.rs
+@@ -298,7 +298,7 @@ unsafe impl Send for Mount {}
+     | notify::ISDIR;
+ 
+ impl Mount {
+-    fn sb(&self) -> &sb::SuperBlock<SharedFs> {
++    pub(crate) fn sb(&self) -> &sb::SuperBlock<SharedFs> {
+         // SAFETY: By the type invariants, the superblock is valid while `self` is reachable.
+         unsafe { self.sb.as_ref() }
+     }

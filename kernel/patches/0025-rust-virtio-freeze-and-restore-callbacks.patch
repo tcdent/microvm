@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 16:57:37 -0700
+Subject: [PATCH 25/38] rust: virtio: freeze and restore callbacks
+
+Add `Driver::freeze` and `Driver::restore`, wired to the `virtio_driver`
+callbacks under `CONFIG_PM_SLEEP`. A driver gives up its virtqueues in
+`freeze` and finds them again in `restore`; the core resets the device
+and negotiates features between the two, and marks it ready after.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/kernel/virtio.rs | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/rust/kernel/virtio.rs b/rust/kernel/virtio.rs
+index d425db344..63140cc7d 100644
+--- a/rust/kernel/virtio.rs
++++ b/rust/kernel/virtio.rs
+@@ -136,6 +136,23 @@ pub trait Driver: Send {
+     /// operations to gracefully tear down the device.
+     ///
+     /// Otherwise, release operations for driver resources should be performed in `Self::drop`.
++    /// Called when the system suspends or hibernates, after the core has disabled configuration
++    /// change callbacks. The device is about to lose its state: the driver drops its virtqueues
++    /// and whatever it assumed about the device, and picks both up again in [`Driver::restore`].
++    /// Implementing this callback is optional.
++    fn freeze(dev: &Device<crate::device::Core>, this: Pin<&Self>) -> Result {
++        _ = (dev, this);
++        Ok(())
++    }
++
++    /// Called on resume, after the core has reset the device and negotiated features again.
++    /// The driver finds its virtqueues again here; the core marks the device ready afterwards.
++    /// Implementing this callback is optional.
++    fn restore(dev: &Device<crate::device::Core>, this: Pin<&Self>) -> Result {
++        _ = (dev, this);
++        Ok(())
++    }
++
+     fn remove(dev: &Device<crate::device::Core>, this: Pin<&Self>) {
+         _ = (dev, this);
+     }
+@@ -331,6 +348,11 @@ unsafe fn register(
+             (*vdrv.get()).id_table = T::ID_TABLE.as_ptr();
+             (*vdrv.get()).probe = Some(Self::probe_callback);
+             (*vdrv.get()).remove = Some(Self::remove_callback);
++            #[cfg(CONFIG_PM_SLEEP)]
++            {
++                (*vdrv.get()).freeze = Some(Self::freeze_callback);
++                (*vdrv.get()).restore = Some(Self::restore_callback);
++            }
+         }
+ 
+         // SAFETY: `vdrv` is guaranteed to be a valid `DriverType`.
+@@ -384,6 +406,25 @@ extern "C" fn remove_callback(vdev: *mut bindings::virtio_device) {
+         T::remove(dev, data);
+         dev.reset();
+     }
++
++    #[cfg(CONFIG_PM_SLEEP)]
++    extern "C" fn freeze_callback(vdev: *mut bindings::virtio_device) -> c_int {
++        // SAFETY: The kernel only ever calls the freeze callback with a valid pointer to a `struct
++        // virtio_device` that is bound to this driver.
++        let dev = unsafe { &*vdev.cast::<Device<crate::device::CoreInternal>>() };
++        // SAFETY: A bound device had `Device::set_drvdata()` called in `probe_callback`.
++        let data = unsafe { dev.as_ref().drvdata_borrow::<T>() };
++        from_result(|| T::freeze(dev, data).map(|()| 0))
++    }
++
++    #[cfg(CONFIG_PM_SLEEP)]
++    extern "C" fn restore_callback(vdev: *mut bindings::virtio_device) -> c_int {
++        // SAFETY: As for `freeze_callback`.
++        let dev = unsafe { &*vdev.cast::<Device<crate::device::CoreInternal>>() };
++        // SAFETY: As for `freeze_callback`.
++        let data = unsafe { dev.as_ref().drvdata_borrow::<T>() };
++        from_result(|| T::restore(dev, data).map(|()| 0))
++    }
+ }
+ 
+ /// Any vendor

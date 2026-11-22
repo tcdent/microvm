@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 14:24:31 -0700
+Subject: [PATCH 20/38] rust: virtio: read device configuration space
+
+Add `Device::config_read`, a wrapper around `virtio_cread_bytes`, so a
+driver can read device-specific configuration such as a tag. Also put
+the doc comments for `has_feature` and `Adapter` back on the items they
+describe.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/helpers/virtio.c |  7 +++++++
+ rust/kernel/virtio.rs | 14 +++++++++++---
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/rust/helpers/virtio.c b/rust/helpers/virtio.c
+index 6eafc782d..cd58063e0 100644
+--- a/rust/helpers/virtio.c
++++ b/rust/helpers/virtio.c
+@@ -36,6 +36,13 @@ __rust_helper bool rust_helper_virtio_get_shm_region(struct virtio_device *vdev,
+ 	return virtio_get_shm_region(vdev, region, id);
+ }
+ 
++__rust_helper void rust_helper_virtio_cread_bytes(struct virtio_device *vdev,
++						  unsigned int offset,
++						  void *buf, size_t len)
++{
++	virtio_cread_bytes(vdev, offset, buf, len);
++}
++
+ __rust_helper bool
+ rust_helper_virtio_is_little_endian(struct virtio_device *vdev)
+ {
+diff --git a/rust/kernel/virtio.rs b/rust/kernel/virtio.rs
+index e9ea63325..d425db344 100644
+--- a/rust/kernel/virtio.rs
++++ b/rust/kernel/virtio.rs
+@@ -239,8 +239,6 @@ pub(crate) fn del_vqs(&self) {
+         }
+     }
+ 
+-    /// Checks if the device has a feature bit.
+-    #[inline]
+     /// A shared memory region the device exposes (virtio 1.2 §2.10), as guest-physical
+     /// address and length, or `None` if the device has no region with this id.
+     pub fn shm_region(&self, id: u8) -> Option<ShmRegion> {
+@@ -251,6 +249,16 @@ pub fn shm_region(&self, id: u8) -> Option<ShmRegion> {
+         found.then_some(ShmRegion { addr: region.addr, len: region.len })
+     }
+ 
++    /// Reads `buf.len()` bytes of device-specific configuration starting at `offset`.
++    #[doc(alias = "virtio_cread_bytes")]
++    pub fn config_read(&self, offset: u32, buf: &mut [u8]) {
++        // SAFETY: `as_raw` is a valid device for the lifetime of `self`; `buf` is valid for
++        // writes of `buf.len()` bytes for the duration of the call.
++        unsafe { bindings::virtio_cread_bytes(self.as_raw(), offset, buf.as_mut_ptr().cast(), buf.len()) }
++    }
++
++    /// Checks if the device has a feature bit.
++    #[inline]
+     pub fn has_feature(&self, fbit: c_uint) -> bool {
+         // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
+         // `struct virtio_device`.
+@@ -286,7 +294,6 @@ fn as_ref(&self) -> &crate::device::Device<Ctx> {
+     }
+ }
+ 
+-/// An adapter for the registration of virtio drivers.
+ /// A device-exposed shared memory region: guest-physical `addr` and `len` in bytes.
+ #[derive(Clone, Copy, Debug)]
+ pub struct ShmRegion {
+@@ -296,6 +303,7 @@ pub struct ShmRegion {
+     pub len: u64,
+ }
+ 
++/// An adapter for the registration of virtio drivers.
+ pub struct Adapter<T: Driver>(T);
+ 
+ // SAFETY:

@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 16:57:38 -0700
+Subject: [PATCH 26/38] fs: sharedfs: inode numbers carry the generation
+
+An inode number is the index slot plus the low half of the entry's
+generation. A slot reused for another file while the guest still holds
+the old inode now gets a distinct inode instead of ESTALE, and the host
+refuses a request that names a stale entry. Events about entries the
+guest has not opened instantiate them first, as `fsnotify_parent` has a
+child to report on: a non-dirent event delivered to the directory alone
+would arrive without its name.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ fs/sharedfs/data.rs     | 23 +++++++++++++-
+ fs/sharedfs/sharedfs.rs | 68 ++++++++++++++++++++++++++++-------------
+ 2 files changed, 69 insertions(+), 22 deletions(-)
+
+diff --git a/fs/sharedfs/data.rs b/fs/sharedfs/data.rs
+index ad0c5c2ab..ab50e6a8a 100644
+--- a/fs/sharedfs/data.rs
++++ b/fs/sharedfs/data.rs
+@@ -197,7 +197,8 @@ fn reclaim_one(&self, current: &INode<SharedFs>) -> Result {
+             }
+         };
+         let start = u64::from(key.1) * CHUNK;
+-        if let Some(inode) = sb.cached_inode(ino_of(key.0)) {
++        let cached = self.index.live(key.0).and_then(|e| sb.cached_inode(ino_of(key.0, e.generation)));
++        if let Some(inode) = cached {
+             if key.0 != current.data().slot {
+                 // Nobody may keep pages of the range mapped once the window behind it moves.
+                 dax::break_layout(&inode, start as Offset, (start + CHUNK - 1) as Offset)?;
+@@ -214,6 +215,26 @@ fn reclaim_one(&self, current: &INode<SharedFs>) -> Result {
+ 
+     /// Gives back every chunk of a file. Called when its inode is destroyed, after the VFS has
+     /// already dropped its pages.
++    /// Forgets every window mapping ahead of a hibernation: the daemon that comes back will
++    /// have mapped nothing, so processes must fault their pages in again. Each range is first
++    /// unmapped from every process, as reclaim does, so no stale page is ever touched.
++    pub(crate) fn drop_window(&self) {
++        let mount = self.mount.lock();
++        let mut maps = self.maps.lock();
++        if let Some(m) = mount.as_ref() {
++            let sb = m.sb();
++            for (key, _) in maps.tree.iter() {
++                let inode = self.index.live(key.0).and_then(|e| sb.cached_inode(ino_of(key.0, e.generation)));
++                if let Some(inode) = inode {
++                    let start = u64::from(key.1) * CHUNK;
++                    let _ = dax::break_layout(&inode, start as Offset, (start + CHUNK - 1) as Offset);
++                }
++            }
++        }
++        let limit = maps.limit;
++        *maps = Maps::new(limit);
++    }
++
+     pub(crate) fn release_slot(&self, slot: u32) {
+         let mut maps = self.maps.lock();
+         let keys: KVec<Key> = {
+diff --git a/fs/sharedfs/sharedfs.rs b/fs/sharedfs/sharedfs.rs
+index cebdc1ac2..d04ae81f3 100644
+--- a/fs/sharedfs/sharedfs.rs
++++ b/fs/sharedfs/sharedfs.rs
+@@ -83,15 +83,20 @@ struct SharedFsDriver {
+     driver.session.kick_drain();
+ }
+ 
++/// The two queues, in the order the device numbers them.
++fn vqs_info() -> [VirtqueueInfo; 2] {
++    [
++        VirtqueueInfo::new(c"requests", false, Some(queue_done)),
++        VirtqueueInfo::new(c"notifications", false, Some(queue_done)),
++    ]
++}
++
+ impl virtio::Driver for SharedFsDriver {
+     type IdInfo = ();
+     const ID_TABLE: virtio::IdTable<Self::IdInfo> = &SHAREDFS_TABLE;
+ 
+     fn probe(vdev: &virtio::Device<Core>) -> impl PinInit<Self, Error> {
+-        let vqs_info = [
+-            VirtqueueInfo::new(c"requests", false, Some(queue_done)),
+-            VirtqueueInfo::new(c"notifications", false, Some(queue_done)),
+-        ];
++        let vqs_info = vqs_info();
+         try_pin_init!(Self {
+             session: {
+                 let mut raw = [0u8; TAG_LEN];
+@@ -146,6 +151,22 @@ fn init(&self, _vdev: &virtio::Device<Bound>) -> Result {
+         Ok(())
+     }
+ 
++    /// Hibernation. The mount and its inodes survive in the image; the window mappings and the
++    /// queues do not, since the daemon on the other side will be a new one. It will have the same
++    /// index, so inode numbers stay valid, and it reports what changed while the guest was away.
++    fn freeze(_vdev: &virtio::Device<Core>, this: core::pin::Pin<&Self>) -> Result {
++        this.session.drop_window();
++        this.session.freeze_queues();
++        pr_info!("{}: frozen\n", core::str::from_utf8(&this.session.tag).unwrap_or("?"));
++        Ok(())
++    }
++
++    fn restore(vdev: &virtio::Device<Core>, this: core::pin::Pin<&Self>) -> Result {
++        this.session.restore_queues(vdev.find_vqs(&vqs_info())?)?;
++        pr_info!("{}: restored\n", core::str::from_utf8(&this.session.tag).unwrap_or("?"));
++        Ok(())
++    }
++
+     fn remove(_vdev: &virtio::Device<Core>, this: core::pin::Pin<&Self>) {
+         SESSIONS.lock().retain(|s| !Arc::ptr_eq(s, &this.session));
+         pr_info!("{}: unbound\n", core::str::from_utf8(&this.session.tag).unwrap_or("?"));
+@@ -179,14 +200,17 @@ fn drop(&mut self) {
+     }
+ }
+ 
++/// An inode number names an index slot and the low half of its generation, so a slot reused
++/// for another file gets a new inode rather than colliding with one still cached, and the host
++/// refuses a request that carries a stale number.
+ #[inline]
+-pub(crate) fn ino_of(slot: u32) -> u64 {
+-    u64::from(slot) + 1
++pub(crate) fn ino_of(slot: u32, generation: u64) -> u64 {
++    ((generation as u32 as u64) << 32) | (u64::from(slot) + 1)
+ }
+ 
+ #[inline]
+ fn slot_of(ino: u64) -> Option<u32> {
+-    u32::try_from(ino.checked_sub(1)?).ok()
++    (ino as u32).checked_sub(1)
+ }
+ 
+ /// Nanoseconds since the epoch, as the host stores times.
+@@ -302,19 +326,20 @@ pub(crate) fn on_event(
+             return;
+         }
+         let sb = self.sb();
+-        let dir = sb.cached_inode(ino_of(parent));
+-        let mut child = sb
+-            .cached_inode(ino_of(slot))
+-            .filter(|c| c.data().generation == generation);
++        let index = &sb.data().session.index;
++        let dir = index.live(parent).and_then(|p| sb.cached_inode(ino_of(parent, p.generation)));
++        let mut child = sb.cached_inode(ino_of(slot, generation));
++        if child.is_none() && dir.is_some() && mask & (notify::DELETE | notify::MOVED_FROM) == 0 {
++            // The entry is not cached but its directory is watched: instantiate it, so the event
++            // can be reported the way `fsnotify_parent` reports a child's, with its name. A
++            // non-dirent event reported on the directory alone would lose the name.
++            child = index
++                .live(slot)
++                .filter(|e| e.generation == generation)
++                .and_then(|e| SharedFs::iget(sb, slot, &e).ok());
++        }
+ 
+         if mask & (notify::CREATE | notify::MOVED_TO) != 0 {
+-            if child.is_none() && dir.is_some() {
+-                // A watched directory gained an entry: instantiate it so the event names it.
+-                child = index
+-                    .live(slot)
+-                    .filter(|e| e.generation == generation)
+-                    .and_then(|e| SharedFs::iget(sb, slot, &e).ok());
+-            }
+             if let Some(dir) = &dir {
+                 dir.notify_dirent(mask, name, child.as_deref(), cookie);
+             }
+@@ -395,7 +420,7 @@ fn simple(inode: &INode<Self>, req: &mut Req) -> Result {
+     }
+     /// Returns the inode for a live index entry, creating it on first use.
+     fn iget(sb: &sb::SuperBlock<Self>, slot: u32, e: &Entry) -> Result<ARef<INode<Self>>> {
+-        let mut new = match sb.get_or_create_inode(ino_of(slot))? {
++        let mut new = match sb.get_or_create_inode(ino_of(slot, e.generation))? {
+             inode::Found::Existing(existing) => {
+                 if existing.data().generation != e.generation {
+                     // The slot was reused while this inode was still cached. Its dentries fail
+@@ -781,7 +806,8 @@ fn read_dir(
+         }
+         if emitter.pos() == 1 {
+             let parent = if slot == ROOT_SLOT { slot } else { dir.parent };
+-            if !emitter.emit(b"..", ino_of(parent), file::DirEntryType::Dir) {
++            let parent_gen = index.live(parent).map_or(dir.generation, |p| p.generation);
++            if !emitter.emit(b"..", ino_of(parent, parent_gen), file::DirEntryType::Dir) {
+                 return Ok(());
+             }
+             emitter.set_pos(2);
+@@ -797,7 +823,7 @@ fn read_dir(
+             if e.parent != slot {
+                 break;
+             }
+-            if !emitter.emit(e.name(), ino_of(cur), dir_type_of(&e)) {
++            if !emitter.emit(e.name(), ino_of(cur, e.generation), dir_type_of(&e)) {
+                 return Ok(());
+             }
+             cur = e.next_sibling;

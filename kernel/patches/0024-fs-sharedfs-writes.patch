@@ -1,0 +1,469 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 15:03:02 -0700
+Subject: [PATCH 24/38] fs: sharedfs: writes
+
+Create, mkdir, symlink, unlink, rmdir, rename and setattr go to the host
+as requests; the host performs them on the directory and updates the
+index before answering, so the guest instantiates the new entry from
+the index and refreshes the affected inodes from it. A shrinking
+truncate breaks the DAX layout of the range being dropped before the
+host truncates, as truncation does on any DAX file system.
+
+Each inode type gets its own operations table, as C file systems do: a
+regular file must not carry `get_link`, since the dcache takes any
+non-directory inode with one for a symbolic link. Writes stamp the
+inode's times through `file_update_time`.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ fs/sharedfs/data.rs     |   8 +-
+ fs/sharedfs/queue.rs    |  66 ++++++++++--
+ fs/sharedfs/sharedfs.rs | 216 +++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 261 insertions(+), 29 deletions(-)
+
+diff --git a/fs/sharedfs/data.rs b/fs/sharedfs/data.rs
+index e83ca89f6..ad0c5c2ab 100644
+--- a/fs/sharedfs/data.rs
++++ b/fs/sharedfs/data.rs
+@@ -110,22 +110,22 @@ pub(crate) fn map(&self, ino: u64, generation: u64, foff: u64, woff: u64, writab
+             .u64(CHUNK)
+             .u64(woff)
+             .u32(flags);
+-        self.request(req.bytes(), HEADER_LEN).map(|_| ())
++        self.request(req.as_bytes(), HEADER_LEN).map(|_| ())
+     }
+ 
+     pub(crate) fn unmap(&self, woff: u64) -> Result {
+         let mut req = Req::new(op::UNMAP).u64(woff).u64(CHUNK);
+-        self.request(req.bytes(), HEADER_LEN).map(|_| ())
++        self.request(req.as_bytes(), HEADER_LEN).map(|_| ())
+     }
+ 
+     pub(crate) fn extend(&self, ino: u64, size: u64) -> Result {
+         let mut req = Req::new(op::EXTEND).u64(ino).u64(size);
+-        self.request(req.bytes(), HEADER_LEN).map(|_| ())
++        self.request(req.as_bytes(), HEADER_LEN).map(|_| ())
+     }
+ 
+     pub(crate) fn fsync(&self, ino: u64) -> Result {
+         let mut req = Req::new(op::FSYNC).u64(ino);
+-        self.request(req.bytes(), HEADER_LEN).map(|_| ())
++        self.request(req.as_bytes(), HEADER_LEN).map(|_| ())
+     }
+ 
+     /// Returns the window offset of chunk `idx` of the inode, mapped at least for reading, or
+diff --git a/fs/sharedfs/queue.rs b/fs/sharedfs/queue.rs
+index 9f58b11f1..c13eed78d 100644
+--- a/fs/sharedfs/queue.rs
++++ b/fs/sharedfs/queue.rs
+@@ -28,6 +28,13 @@
+ /// Request opcodes, shared with the host.
+ pub(crate) mod op {
+     pub const FSYNC: u32 = 5;
++    pub const CREATE: u32 = 6;
++    pub const MKDIR: u32 = 7;
++    pub const SYMLINK: u32 = 8;
++    pub const UNLINK: u32 = 9;
++    pub const RMDIR: u32 = 10;
++    pub const RENAME: u32 = 11;
++    pub const SETATTR: u32 = 12;
+     pub const READLINK: u32 = 13;
+     pub const STATFS: u32 = 14;
+     pub const MAP: u32 = 15;
+@@ -40,6 +47,19 @@ pub(crate) mod map {
+     pub const WRITE: u32 = 1 << 0;
+ }
+ 
++/// SETATTR `valid` bits, shared with the host.
++pub(crate) mod setattr {
++    pub const MODE: u32 = 1 << 0;
++    pub const UID: u32 = 1 << 1;
++    pub const GID: u32 = 1 << 2;
++    pub const SIZE: u32 = 1 << 3;
++    pub const ATIME: u32 = 1 << 4;
++    pub const MTIME: u32 = 1 << 5;
++}
++
++/// The longest request: a rename with two maximal names.
++const REQ_MAX: usize = HEADER_LEN + 8 + 2 + 255 + 8 + 2 + 255 + 4;
++
+ /// Bytes in a request or response header: `len: u32`, `opcode`/`error: u32`, `unique: u64`.
+ pub(crate) const HEADER_LEN: usize = 16;
+ 
+@@ -329,35 +349,59 @@ fn run(this: Arc<Session>) {
+     }
+ }
+ 
+-/// Builds request bodies.
++/// Builds request bodies. Names are at most `NAME_MAX` and symlink targets at most `PATH_MAX`
++/// by the time they reach the file system, so the longest request is bounded and the buffer
++/// lives on the stack.
+ pub(crate) struct Req {
+-    buf: [u8; 64],
++    buf: [u8; REQ_MAX],
+     len: usize,
+ }
+ 
+ impl Req {
+     pub(crate) fn new(opcode: u32) -> Self {
+         let mut r = Self {
+-            buf: [0; 64],
++            buf: [0; REQ_MAX],
+             len: HEADER_LEN,
+         };
+         r.buf[4..8].copy_from_slice(&opcode.to_le_bytes());
+         r
+     }
+ 
+-    pub(crate) fn u32(mut self, v: u32) -> Self {
+-        self.buf[self.len..self.len + 4].copy_from_slice(&v.to_le_bytes());
+-        self.len += 4;
++    fn put(mut self, v: &[u8]) -> Self {
++        // Over-long input is a caller bug: the VFS bounds names before any operation.
++        let end = self.len + v.len();
++        self.buf[self.len..end].copy_from_slice(v);
++        self.len = end;
+         self
+     }
+ 
+-    pub(crate) fn u64(mut self, v: u64) -> Self {
+-        self.buf[self.len..self.len + 8].copy_from_slice(&v.to_le_bytes());
+-        self.len += 8;
+-        self
++    pub(crate) fn u16(self, v: u16) -> Self {
++        self.put(&v.to_le_bytes())
++    }
++
++    pub(crate) fn u32(self, v: u32) -> Self {
++        self.put(&v.to_le_bytes())
++    }
++
++    pub(crate) fn u64(self, v: u64) -> Self {
++        self.put(&v.to_le_bytes())
++    }
++
++    pub(crate) fn i64(self, v: i64) -> Self {
++        self.put(&v.to_le_bytes())
++    }
++
++    /// A `u16`-length-prefixed name.
++    pub(crate) fn bytes(self, v: &[u8]) -> Self {
++        self.u16(v.len() as u16).put(v)
++    }
++
++    /// A `u32`-length-prefixed blob.
++    pub(crate) fn blob(self, v: &[u8]) -> Self {
++        self.u32(v.len() as u32).put(v)
+     }
+ 
+-    pub(crate) fn bytes(&mut self) -> &[u8] {
++    pub(crate) fn as_bytes(&mut self) -> &[u8] {
+         let len = self.len as u32;
+         self.buf[0..4].copy_from_slice(&len.to_le_bytes());
+         &self.buf[..self.len]
+diff --git a/fs/sharedfs/sharedfs.rs b/fs/sharedfs/sharedfs.rs
+index e883c6db1..cebdc1ac2 100644
+--- a/fs/sharedfs/sharedfs.rs
++++ b/fs/sharedfs/sharedfs.rs
+@@ -34,7 +34,11 @@
+ };
+ 
+ use index::{Entry, Index, NO_SLOT, ROOT_SLOT};
+-use queue::{op, Req, Resp, Session, HEADER_LEN};
++use queue::{op, setattr, Req, Resp, Session, HEADER_LEN};
++
++/// `RENAME_*` flags the VFS may pass. The host moves plainly; `RENAME_NOREPLACE` is already
++/// enforced by the VFS's exclusive lookup of the new name.
++const RENAME_NOREPLACE: u32 = 1;
+ 
+ /// Unassigned virtio device id used while the device is under development.
+ const DEVICE_ID: u32 = 0x5346;
+@@ -180,6 +184,16 @@ pub(crate) fn ino_of(slot: u32) -> u64 {
+     u64::from(slot) + 1
+ }
+ 
++#[inline]
++fn slot_of(ino: u64) -> Option<u32> {
++    u32::try_from(ino.checked_sub(1)?).ok()
++}
++
++/// Nanoseconds since the epoch, as the host stores times.
++fn nanos(t: fs::Timespec) -> i64 {
++    t.sec.saturating_mul(1_000_000_000).saturating_add(i64::from(t.nsec))
++}
++
+ /// Splits a host `dev_t` (glibc's 64-bit encoding) into major and minor.
+ fn host_dev(rdev: u64) -> (u32, u32) {
+     let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+@@ -339,7 +353,9 @@ pub(crate) fn on_event(
+     }
+ }
+ 
+-const INODE_OPS: inode::Ops<SharedFs> = inode::Ops::new::<SharedFs>();
++const DIR_IOPS: inode::Ops<SharedFs> = inode::Ops::new::<DirInodeOps>();
++const FILE_IOPS: inode::Ops<SharedFs> = inode::Ops::new::<FileInodeOps>();
++const LINK_IOPS: inode::Ops<SharedFs> = inode::Ops::new::<LinkInodeOps>();
+ const DIR_FOPS: file::Ops<SharedFs> = file::Ops::new::<DirOps>();
+ const FILE_FOPS: file::Ops<SharedFs> = file::Ops::new::<FileOps>();
+ const DENTRY_OPS: dentry::Ops<SharedFs> = dentry::Ops::new::<SharedFs>();
+@@ -349,6 +365,34 @@ pub(crate) fn on_event(
+ pub(crate) struct SharedFs;
+ 
+ impl SharedFs {
++    /// Refreshes an inode's attributes from its index entry, after an operation on it or on a
++    /// directory it is in has changed them on the host.
++    fn refresh(inode: &INode<Self>) {
++        let session = &inode.super_block().data().session;
++        let node = inode.data();
++        if let Some(e) = session.index.live(node.slot).filter(|e| e.generation == node.generation) {
++            inode.set_attr(&attr_of(&e));
++        }
++    }
++
++    /// Sends a request that creates an entry under `parent` and returns the new entry's inode.
++    fn create_entry(parent: &INode<Self>, req: &mut Req) -> Result<ARef<INode<Self>>> {
++        let sb = parent.super_block();
++        let session = &sb.data().session;
++        let (resp, n) = session.request(req.as_bytes(), HEADER_LEN + 16)?;
++        let mut body = Resp(&resp[HEADER_LEN..n]);
++        let ino = body.u64()?;
++        let generation = body.u64()?;
++        let slot = slot_of(ino).ok_or(EIO)?;
++        let e = session.index.live(slot).filter(|e| e.generation == generation).ok_or(EIO)?;
++        Self::refresh(parent);
++        Self::iget(sb, slot, &e)
++    }
++
++    /// Sends a request with an empty response.
++    fn simple(inode: &INode<Self>, req: &mut Req) -> Result {
++        inode.super_block().data().session.request(req.as_bytes(), HEADER_LEN).map(|_| ())
++    }
+     /// Returns the inode for a live index entry, creating it on first use.
+     fn iget(sb: &sb::SuperBlock<Self>, slot: u32, e: &Entry) -> Result<ARef<INode<Self>>> {
+         let mut new = match sb.get_or_create_inode(ino_of(slot))? {
+@@ -366,13 +410,13 @@ fn iget(sb: &sb::SuperBlock<Self>, slot: u32, e: &Entry) -> Result<ARef<INode<Se
+         let typ = type_of(e).ok_or(EIO)?;
+         match typ {
+             inode::Type::Dir => {
+-                new.set_iops(INODE_OPS).set_fops(DIR_FOPS);
++                new.set_iops(DIR_IOPS).set_fops(DIR_FOPS);
+             }
+             inode::Type::Reg => {
+-                new.set_fops(FILE_FOPS).set_aops(address_space::Ops::dax()).set_dax();
++                new.set_iops(FILE_IOPS).set_fops(FILE_FOPS).set_aops(address_space::Ops::dax()).set_dax();
+             }
+             inode::Type::Lnk => {
+-                new.set_iops(INODE_OPS);
++                new.set_iops(LINK_IOPS);
+             }
+             _ => {}
+         }
+@@ -418,7 +462,7 @@ fn init_root(sb: &sb::SuperBlock<Self>) -> Result<dentry::Root<Self>> {
+     fn statfs(dentry: &DEntry<Self>) -> Result<fs::Stat> {
+         let session = &dentry.super_block().data().session;
+         let mut req = Req::new(op::STATFS);
+-        let (resp, n) = session.request(req.bytes(), HEADER_LEN + 6 * 8 + 4)?;
++        let (resp, n) = session.request(req.as_bytes(), HEADER_LEN + 6 * 8 + 4)?;
+         let mut r = Resp(&resp[HEADER_LEN..n]);
+         let (bsize, blocks, bfree, bavail, files, ffree) =
+             (r.u64()?, r.u64()?, r.u64()?, r.u64()?, r.u64()?, r.u64()?);
+@@ -436,32 +480,170 @@ fn statfs(dentry: &DEntry<Self>) -> Result<fs::Stat> {
+     }
+ }
+ 
++/// Inode operations of directories: names come and go through the host.
++struct DirInodeOps;
++/// Inode operations of regular files: only attributes change here, data goes through the window.
++struct FileInodeOps;
++/// Inode operations of symbolic links.
++struct LinkInodeOps;
++
++impl SharedFs {
++    /// Attribute changes go to the host, which is the authority on them; the inode is then
++    /// refreshed from the index. A shrinking file first loses the guest's mappings beyond its
++    /// new end, as truncation does on any DAX file system.
++    fn setattr_impl(_dentry: &DEntry<SharedFs>, inode: &Locked<&INode<SharedFs>, inode::WriteSem>, attr: &inode::SetAttr) -> Result {
++        let mut valid = 0;
++        let old_size = inode.size();
++        let mode = attr.mode().inspect(|_| valid |= setattr::MODE).unwrap_or(0);
++        let uid = attr.uid().inspect(|_| valid |= setattr::UID).unwrap_or(0);
++        let gid = attr.gid().inspect(|_| valid |= setattr::GID).unwrap_or(0);
++        let size = attr.size().inspect(|_| valid |= setattr::SIZE).unwrap_or(0);
++        let atime = attr.atime().inspect(|_| valid |= setattr::ATIME).map_or(0, nanos);
++        let mtime = attr.mtime().inspect(|_| valid |= setattr::MTIME).map_or(0, nanos);
++        if valid & setattr::SIZE != 0 && size < old_size {
++            dax::break_layout(inode, size, old_size)?;
++        }
++        let mut req = Req::new(op::SETATTR)
++            .u64(inode.ino())
++            .u32(valid)
++            .u32(u32::from(mode))
++            .u32(uid)
++            .u32(gid)
++            .u64(size as u64)
++            .i64(atime)
++            .i64(mtime);
++        SharedFs::simple(inode, &mut req)?;
++        SharedFs::refresh(inode);
++        if valid & setattr::SIZE != 0 && size < old_size {
++            inode.truncate_pages(size);
++        }
++        Ok(())
++    }
++}
++
+ #[vtable]
+-impl inode::Operations for SharedFs {
+-    type FileSystem = Self;
++impl inode::Operations for DirInodeOps {
++    type FileSystem = SharedFs;
+ 
+     fn lookup(
+-        parent: &Locked<&INode<Self>, inode::ReadSem>,
+-        dentry: dentry::Unhashed<'_, Self>,
+-    ) -> Result<Option<ARef<DEntry<Self>>>> {
++        parent: &Locked<&INode<SharedFs>, inode::ReadSem>,
++        dentry: dentry::Unhashed<'_, SharedFs>,
++    ) -> Result<Option<ARef<DEntry<SharedFs>>>> {
+         let session = &parent.super_block().data().session;
+         match session.index.lookup(parent.data().slot, dentry.name()) {
+             Some((slot, e)) => {
+-                let inode = Self::iget(parent.super_block(), slot, &e)?;
++                let inode = SharedFs::iget(parent.super_block(), slot, &e)?;
+                 dentry.splice_alias(Some(inode))
+             }
+             None => dentry.splice_alias(None),
+         }
+     }
+ 
+-    fn get_link(dentry: Option<&DEntry<Self>>, inode: &INode<Self>) -> Result<CString> {
++    fn create(
++        parent: &Locked<&INode<SharedFs>, inode::WriteSem>,
++        dentry: dentry::Unhashed<'_, SharedFs>,
++        mode: u16,
++        _excl: bool,
++    ) -> Result<ARef<INode<SharedFs>>> {
++        let mut req = Req::new(op::CREATE).u64(parent.ino()).u32(u32::from(mode)).u32(0).bytes(dentry.name());
++        SharedFs::create_entry(parent, &mut req)
++    }
++
++    fn mkdir(
++        parent: &Locked<&INode<SharedFs>, inode::WriteSem>,
++        dentry: dentry::Unhashed<'_, SharedFs>,
++        mode: u16,
++    ) -> Result<ARef<INode<SharedFs>>> {
++        let mut req = Req::new(op::MKDIR).u64(parent.ino()).u32(u32::from(mode)).bytes(dentry.name());
++        SharedFs::create_entry(parent, &mut req)
++    }
++
++    fn symlink(
++        parent: &Locked<&INode<SharedFs>, inode::WriteSem>,
++        dentry: dentry::Unhashed<'_, SharedFs>,
++        target: &CStr,
++    ) -> Result<ARef<INode<SharedFs>>> {
++        if target.to_bytes().len() >= PATH_MAX {
++            return Err(ENAMETOOLONG);
++        }
++        let mut req = Req::new(op::SYMLINK).u64(parent.ino()).bytes(dentry.name()).blob(target.to_bytes());
++        SharedFs::create_entry(parent, &mut req)
++    }
++
++    fn unlink(parent: &Locked<&INode<SharedFs>, inode::WriteSem>, dentry: &DEntry<SharedFs>) -> Result {
++        let mut req = Req::new(op::UNLINK).u64(parent.ino()).bytes(dentry.name());
++        SharedFs::simple(parent, &mut req)?;
++        if let Some(victim) = dentry.inode() {
++            victim.clear_nlink();
++        }
++        SharedFs::refresh(parent);
++        Ok(())
++    }
++
++    fn rmdir(parent: &Locked<&INode<SharedFs>, inode::WriteSem>, dentry: &DEntry<SharedFs>) -> Result {
++        let mut req = Req::new(op::RMDIR).u64(parent.ino()).bytes(dentry.name());
++        SharedFs::simple(parent, &mut req)?;
++        if let Some(victim) = dentry.inode() {
++            victim.clear_nlink();
++        }
++        SharedFs::refresh(parent);
++        Ok(())
++    }
++
++    fn rename(
++        old_parent: &Locked<&INode<SharedFs>, inode::WriteSem>,
++        old: &DEntry<SharedFs>,
++        new_parent: &Locked<&INode<SharedFs>, inode::WriteSem>,
++        new: &DEntry<SharedFs>,
++        flags: u32,
++    ) -> Result {
++        if flags & !RENAME_NOREPLACE != 0 {
++            return Err(EINVAL);
++        }
++        let mut req = Req::new(op::RENAME)
++            .u64(old_parent.ino())
++            .bytes(old.name())
++            .u64(new_parent.ino())
++            .bytes(new.name())
++            .u32(0);
++        SharedFs::simple(old_parent, &mut req)?;
++        if let Some(victim) = new.inode() {
++            victim.clear_nlink();
++        }
++        if let Some(moved) = old.inode() {
++            SharedFs::refresh(moved);
++        }
++        SharedFs::refresh(old_parent);
++        SharedFs::refresh(new_parent);
++        Ok(())
++    }
++
++    fn setattr(dentry: &DEntry<SharedFs>, inode: &Locked<&INode<SharedFs>, inode::WriteSem>, attr: &inode::SetAttr) -> Result {
++        SharedFs::setattr_impl(dentry, inode, attr)
++    }
++}
++
++#[vtable]
++impl inode::Operations for FileInodeOps {
++    type FileSystem = SharedFs;
++
++    fn setattr(dentry: &DEntry<SharedFs>, inode: &Locked<&INode<SharedFs>, inode::WriteSem>, attr: &inode::SetAttr) -> Result {
++        SharedFs::setattr_impl(dentry, inode, attr)
++    }
++}
++
++#[vtable]
++impl inode::Operations for LinkInodeOps {
++    type FileSystem = SharedFs;
++
++    fn get_link(dentry: Option<&DEntry<SharedFs>>, inode: &INode<SharedFs>) -> Result<CString> {
+         if dentry.is_none() {
+             // RCU walk: asking the host sleeps, so have the VFS come back without RCU.
+             return Err(ECHILD);
+         }
+         let session = &inode.super_block().data().session;
+         let mut req = Req::new(op::READLINK).u64(inode.ino());
+-        let (resp, n) = session.request(req.bytes(), HEADER_LEN + 4 + PATH_MAX)?;
++        let (resp, n) = session.request(req.as_bytes(), HEADER_LEN + 4 + PATH_MAX)?;
+         let mut body = Resp(&resp[HEADER_LEN..n]);
+         let target = body.blob()?;
+         let mut buf = KVec::with_capacity(target.len() + 1, GFP_KERNEL)?;
+@@ -470,6 +652,10 @@ fn get_link(dentry: Option<&DEntry<Self>>, inode: &INode<Self>) -> Result<CStrin
+         let cstr = CStr::from_bytes_with_nul(&buf).map_err(|_| EIO)?;
+         Ok(CString::try_from(cstr)?)
+     }
++
++    fn setattr(dentry: &DEntry<SharedFs>, inode: &Locked<&INode<SharedFs>, inode::WriteSem>, attr: &inode::SetAttr) -> Result {
++        SharedFs::setattr_impl(dentry, inode, attr)
++    }
+ }
+ 
+ #[vtable]
+@@ -540,6 +726,8 @@ fn write_iter(
+             session.extend(inode.ino(), end as u64)?;
+             inode.set_size(end);
+         }
++        // SAFETY: The file is valid for the call; this stamps mtime and ctime as any write does.
++        kernel::error::to_result(unsafe { bindings::file_update_time(file.as_ptr()) })?;
+         let written = dax::write(iocb, iov, &IOMAP)?;
+         // SAFETY: The kiocb is live; this flushes if the file was opened with O_SYNC.
+         let synced = unsafe { bindings::generic_write_sync(iocb.as_raw(), written as isize) };

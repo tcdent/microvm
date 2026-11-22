@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: slomp <root@a10k-cap.com>
+Date: Sat, 10 Oct 2026 15:48:40 -0700
+Subject: [PATCH 08/38] rust: virtio: shared memory regions and raw device ids
+
+Device::shm_region() wraps virtio_get_shm_region() through a helper, since
+the C function is inline. DeviceId::from_raw() builds an id the VirtioID
+table does not list, for devices under development.
+
+Both are what a driver needs to bind an experimental device that exports
+a shared memory window alongside its virtqueues.
+---
+ rust/bindings/bindings_helper.h |  1 +
+ rust/helpers/virtio.c           |  7 +++++++
+ rust/kernel/virtio.rs           | 28 ++++++++++++++++++++++++++++
+ 3 files changed, 36 insertions(+)
+
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 40bb46992..0d3a6963d 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -167,6 +167,7 @@ const unsigned long RUST_CONST_HELPER_GPU_BUDDY_TRIM_DISABLE = GPU_BUDDY_TRIM_DI
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_VIRTIO)
++#include <linux/io.h>
+ #include <linux/virtio_config.h>
+ #include <uapi/linux/virtio_ids.h>
+ #endif /* IS_ENABLED(CONFIG_VIRTIO) */
+diff --git a/rust/helpers/virtio.c b/rust/helpers/virtio.c
+index 46aeeb063..6eafc782d 100644
+--- a/rust/helpers/virtio.c
++++ b/rust/helpers/virtio.c
+@@ -29,6 +29,13 @@ __rust_helper void rust_helper_virtio_device_ready(struct virtio_device *dev)
+ 	return virtio_device_ready(dev);
+ }
+ 
++__rust_helper bool rust_helper_virtio_get_shm_region(struct virtio_device *vdev,
++						    struct virtio_shm_region *region,
++						    u8 id)
++{
++	return virtio_get_shm_region(vdev, region, id);
++}
++
+ __rust_helper bool
+ rust_helper_virtio_is_little_endian(struct virtio_device *vdev)
+ {
+diff --git a/rust/kernel/virtio.rs b/rust/kernel/virtio.rs
+index 011573b18..dc8d728bb 100644
+--- a/rust/kernel/virtio.rs
++++ b/rust/kernel/virtio.rs
+@@ -48,6 +48,17 @@ unsafe impl RawDeviceId for DeviceId {
+ }
+ 
+ impl DeviceId {
++    /// A device id the [`VirtioID`] table does not know, any vendor. For devices under
++    /// development before an id is assigned.
++    #[inline]
++    pub const fn from_raw(device: u32) -> Self {
++        // SAFETY: `virtio_device_id` is plain data; all-zero is a valid value.
++        let mut ret: bindings::virtio_device_id = unsafe { core::mem::zeroed() };
++        ret.device = device;
++        ret.vendor = VIRTIO_DEV_ANY_ID;
++        Self(ret)
++    }
++
+     #[inline]
+     /// Create a new device id
+     pub const fn new(device: VirtioID) -> Self {
+@@ -230,6 +241,16 @@ pub(crate) fn del_vqs(&self) {
+ 
+     /// Checks if the device has a feature bit.
+     #[inline]
++    /// A shared memory region the device exposes (virtio 1.2 §2.10), as guest-physical
++    /// address and length, or `None` if the device has no region with this id.
++    pub fn shm_region(&self, id: u8) -> Option<ShmRegion> {
++        let mut region = bindings::virtio_shm_region { addr: 0, len: 0 };
++        // SAFETY: `as_raw` is a valid device for the lifetime of `self`; `region` is a valid
++        // out-pointer for the duration of the call.
++        let found = unsafe { bindings::virtio_get_shm_region(self.as_raw(), &mut region, id) };
++        found.then_some(ShmRegion { addr: region.addr, len: region.len })
++    }
++
+     pub fn has_feature(&self, fbit: c_uint) -> bool {
+         // SAFETY: By its type invariant `self.as_raw` is always a valid pointer to a
+         // `struct virtio_device`.
+@@ -266,6 +287,13 @@ fn as_ref(&self) -> &crate::device::Device<Ctx> {
+ }
+ 
+ /// An adapter for the registration of virtio drivers.
++/// A device-exposed shared memory region: guest-physical `addr` and `len` in bytes.
++#[derive(Clone, Copy, Debug)]
++pub struct ShmRegion {
++    pub addr: u64,
++    pub len: u64,
++}
++
+ pub struct Adapter<T: Driver>(T);
+ 
+ // SAFETY:

@@ -1,0 +1,2280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sat, 10 Oct 2026 17:47:08 -0700
+Subject: [PATCH 12/38] rust: fs: abstractions for implementing file systems
+
+Lets a file system be written in Rust: registration of a file system
+type, superblock setup with per-superblock data, inodes with per-inode
+data allocated from a dedicated slab cache, dentries, lookup and
+revalidate, directory iteration, seek, get_link, statfs, and read_folio
+into page-cache folios. Includes the folio wrapper and a kmem_cache
+wrapper (mem_cache) the inode code needs.
+
+Ported from Wedson Almeida Filho's "Rust abstractions for VFS" RFC v2
+(May 2024, 30 patches) onto the 7.2 kernel crate. Differences from the
+RFC: File is not parameterised by file system (callbacks take the
+untyped File plus a typed INode); block-device superblocks, the inode
+Mapper, xattrs and i_link storage are left out; get_link returns an
+owned CString; inode attributes live in inode::Attr and can be refreshed
+on a live inode; dentry::Operations with revalidate is new; const
+operation tables use ..zeroed() instead of spelling every field.
+
+This is one commit for now and will be split along the RFC's seams
+before posting.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/bindings/bindings_helper.h |  12 +
+ rust/helpers/folio.c            |  61 ++++
+ rust/helpers/fs.c               |  79 +++++
+ rust/helpers/helpers.c          |   1 +
+ rust/kernel/error.rs            |   2 +
+ rust/kernel/folio.rs            | 195 ++++++++++++
+ rust/kernel/fs.rs               | 412 ++++++++++++++++++++++++
+ rust/kernel/fs/address_space.rs |  75 +++++
+ rust/kernel/fs/dentry.rs        | 225 +++++++++++++
+ rust/kernel/fs/file.rs          | 255 ++++++++++++++-
+ rust/kernel/fs/inode.rs         | 541 ++++++++++++++++++++++++++++++++
+ rust/kernel/fs/sb.rs            | 153 +++++++++
+ rust/kernel/lib.rs              |   2 +
+ rust/kernel/mem_cache.rs        |  72 +++++
+ 14 files changed, 2083 insertions(+), 2 deletions(-)
+ create mode 100644 rust/helpers/folio.c
+ create mode 100644 rust/kernel/folio.rs
+ create mode 100644 rust/kernel/fs/address_space.rs
+ create mode 100644 rust/kernel/fs/dentry.rs
+ create mode 100644 rust/kernel/fs/inode.rs
+ create mode 100644 rust/kernel/fs/sb.rs
+ create mode 100644 rust/kernel/mem_cache.rs
+
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 0d3a6963d..d6f1a931e 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -60,7 +60,14 @@
+ #include <linux/fdtable.h>
+ #include <linux/file.h>
+ #include <linux/firmware.h>
++#include <linux/dcache.h>
+ #include <linux/fs.h>
++#include <linux/fs_context.h>
++#include <linux/highmem.h>
++#include <linux/namei.h>
++#include <linux/pagemap.h>
++#include <linux/scatterlist.h>
++#include <linux/statfs.h>
+ #include <linux/i2c.h>
+ #include <linux/interrupt.h>
+ #include <linux/io-pgtable.h>
+@@ -110,6 +117,11 @@
+ const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
+ const size_t RUST_CONST_HELPER_ARCH_KMALLOC_MINALIGN = ARCH_KMALLOC_MINALIGN;
+ const size_t RUST_CONST_HELPER_PAGE_SIZE = PAGE_SIZE;
++const unsigned long RUST_CONST_HELPER_SB_RDONLY = SB_RDONLY;
++const unsigned int RUST_CONST_HELPER_LOOKUP_RCU = LOOKUP_RCU;
++const loff_t RUST_CONST_HELPER_MAX_LFS_FILESIZE = MAX_LFS_FILESIZE;
++const slab_flags_t RUST_CONST_HELPER_SLAB_ACCOUNT = SLAB_ACCOUNT;
++const slab_flags_t RUST_CONST_HELPER_SLAB_RECLAIM_ACCOUNT = SLAB_RECLAIM_ACCOUNT;
+ const gfp_t RUST_CONST_HELPER_GFP_ATOMIC = GFP_ATOMIC;
+ const gfp_t RUST_CONST_HELPER_GFP_KERNEL = GFP_KERNEL;
+ const gfp_t RUST_CONST_HELPER_GFP_KERNEL_ACCOUNT = GFP_KERNEL_ACCOUNT;
+diff --git a/rust/helpers/folio.c b/rust/helpers/folio.c
+new file mode 100644
+index 000000000..327785702
+--- /dev/null
++++ b/rust/helpers/folio.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/cacheflush.h>
++#include <linux/highmem.h>
++#include <linux/mm.h>
++#include <linux/pagemap.h>
++
++__rust_helper void rust_helper_folio_get(struct folio *folio)
++{
++	folio_get(folio);
++}
++
++__rust_helper void rust_helper_folio_put(struct folio *folio)
++{
++	folio_put(folio);
++}
++
++__rust_helper struct page *rust_helper_folio_page(struct folio *folio, size_t n)
++{
++	return folio_page(folio, n);
++}
++
++__rust_helper loff_t rust_helper_folio_pos(struct folio *folio)
++{
++	return folio_pos(folio);
++}
++
++__rust_helper size_t rust_helper_folio_size(struct folio *folio)
++{
++	return folio_size(folio);
++}
++
++__rust_helper void rust_helper_folio_lock(struct folio *folio)
++{
++	folio_lock(folio);
++}
++
++__rust_helper bool rust_helper_folio_test_uptodate(struct folio *folio)
++{
++	return folio_test_uptodate(folio);
++}
++
++__rust_helper void rust_helper_folio_mark_uptodate(struct folio *folio)
++{
++	folio_mark_uptodate(folio);
++}
++
++__rust_helper bool rust_helper_folio_test_highmem(struct folio *folio)
++{
++	return folio_test_highmem(folio);
++}
++
++__rust_helper void rust_helper_flush_dcache_folio(struct folio *folio)
++{
++	flush_dcache_folio(folio);
++}
++
++__rust_helper void *rust_helper_kmap_local_folio(struct folio *folio, size_t offset)
++{
++	return kmap_local_folio(folio, offset);
++}
+diff --git a/rust/helpers/fs.c b/rust/helpers/fs.c
+index 789d60fb8..fa9ec2802 100644
+--- a/rust/helpers/fs.c
++++ b/rust/helpers/fs.c
+@@ -10,3 +10,82 @@ __rust_helper struct file *rust_helper_get_file(struct file *f)
+ {
+ 	return get_file(f);
+ }
++
++#include <linux/dcache.h>
++#include <linux/sched/mm.h>
++
++__rust_helper loff_t rust_helper_i_size_read(const struct inode *inode)
++{
++	return i_size_read(inode);
++}
++
++__rust_helper void rust_helper_i_size_write(struct inode *inode, loff_t i_size)
++{
++	i_size_write(inode, i_size);
++}
++
++__rust_helper void rust_helper_i_uid_write(struct inode *inode, uid_t uid)
++{
++	i_uid_write(inode, uid);
++}
++
++__rust_helper void rust_helper_i_gid_write(struct inode *inode, gid_t gid)
++{
++	i_gid_write(inode, gid);
++}
++
++__rust_helper void rust_helper_inode_lock_shared(struct inode *inode)
++{
++	inode_lock_shared(inode);
++}
++
++__rust_helper void rust_helper_inode_unlock_shared(struct inode *inode)
++{
++	inode_unlock_shared(inode);
++}
++
++__rust_helper enum inode_state_flags_enum
++rust_helper_inode_state_read_once(struct inode *inode)
++{
++	return inode_state_read_once(inode);
++}
++
++__rust_helper struct timespec64
++rust_helper_inode_set_atime_to_ts(struct inode *inode, struct timespec64 ts)
++{
++	return inode_set_atime_to_ts(inode, ts);
++}
++
++__rust_helper struct timespec64
++rust_helper_inode_set_mtime_to_ts(struct inode *inode, struct timespec64 ts)
++{
++	return inode_set_mtime_to_ts(inode, ts);
++}
++
++__rust_helper struct timespec64
++rust_helper_inode_set_ctime_to_ts(struct inode *inode, struct timespec64 ts)
++{
++	return inode_set_ctime_to_ts(inode, ts);
++}
++
++__rust_helper void *rust_helper_alloc_inode_sb(struct super_block *sb,
++					       struct kmem_cache *cache, gfp_t gfp)
++{
++	return alloc_inode_sb(sb, cache, gfp);
++}
++
++__rust_helper struct dentry *rust_helper_dget(struct dentry *dentry)
++{
++	return dget(dentry);
++}
++
++__rust_helper unsigned int rust_helper_MKDEV(unsigned int major, unsigned int minor)
++{
++	return MKDEV(major, minor);
++}
++
++__rust_helper void rust_helper_set_delayed_call(struct delayed_call *call,
++						void (*fn)(void *), void *arg)
++{
++	set_delayed_call(call, fn, arg);
++}
+diff --git a/rust/helpers/helpers.c b/rust/helpers/helpers.c
+index e0fabb754..d3cc5a4ab 100644
+--- a/rust/helpers/helpers.c
++++ b/rust/helpers/helpers.c
+@@ -66,6 +66,7 @@
+ #include "err.c"
+ #include "irq.c"
+ #include "fs.c"
++#include "folio.c"
+ #include "gpu.c"
+ #include "io.c"
+ #include "jump_label.c"
+diff --git a/rust/kernel/error.rs b/rust/kernel/error.rs
+index a56ba6309..472401e9b 100644
+--- a/rust/kernel/error.rs
++++ b/rust/kernel/error.rs
+@@ -79,6 +79,8 @@ macro_rules! declare_err {
+     declare_err!(ENOTSYNC, "Update synchronization mismatch.");
+     declare_err!(EBADCOOKIE, "Cookie is stale.");
+     declare_err!(ENOTSUPP, "Operation is not supported.");
++    declare_err!(ENOSYS, "Invalid system call number.");
++    declare_err!(ESTALE, "Stale file handle.");
+     declare_err!(ETOOSMALL, "Buffer or request is too small.");
+     declare_err!(ESERVERFAULT, "An untranslatable error occurred.");
+     declare_err!(EBADTYPE, "Type not supported by server.");
+diff --git a/rust/kernel/folio.rs b/rust/kernel/folio.rs
+new file mode 100644
+index 000000000..1d8eae5a4
+--- /dev/null
++++ b/rust/kernel/folio.rs
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Folios: groups of contiguous pages.
++//!
++//! C headers: [`include/linux/mm.h`](srctree/include/linux/mm.h)
++
++use crate::error::{code::*, Result};
++use crate::fs::{self, inode::INode, FileSystem};
++use crate::page::BorrowedPage;
++use crate::sync::aref::AlwaysRefCounted;
++use crate::sync::{Lockable, Locked};
++use crate::types::{Opaque, ScopeGuard};
++use core::{cmp::min, marker::PhantomData, ops::Deref, ptr};
++
++/// The kind of a [`Folio`] is unspecified.
++pub struct Unspecified;
++
++/// The [`Folio`] belongs to the page cache of a file system of type `T`.
++pub struct PageCache<T: FileSystem + ?Sized>(PhantomData<T>);
++
++/// A folio.
++///
++/// Wraps the kernel's `struct folio`. `S` says what kind of folio this is.
++///
++/// # Invariants
++///
++/// Instances are always ref-counted: a call to `folio_get` keeps the allocation valid at least
++/// until the matching `folio_put`.
++#[repr(transparent)]
++pub struct Folio<S = Unspecified>(pub(crate) Opaque<bindings::folio>, PhantomData<S>);
++
++// SAFETY: The type invariants guarantee that `Folio` is always ref-counted.
++unsafe impl<S> AlwaysRefCounted for Folio<S> {
++    fn inc_ref(&self) {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        unsafe { bindings::folio_get(self.0.get()) };
++    }
++
++    unsafe fn dec_ref(obj: ptr::NonNull<Self>) {
++        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
++        unsafe { bindings::folio_put(obj.as_ref().0.get()) }
++    }
++}
++
++impl<S> Folio<S> {
++    /// Creates a folio reference from a raw pointer.
++    ///
++    /// # Safety
++    ///
++    /// Callers must ensure that:
++    /// * `ptr` is valid and remains so for the lifetime of the returned reference.
++    /// * The folio is of kind `S`.
++    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::folio) -> &'a Self {
++        // SAFETY: The safety requirements guarantee that the cast below is ok.
++        unsafe { &*ptr.cast::<Self>() }
++    }
++
++    /// Returns the byte position of this folio in its file.
++    pub fn pos(&self) -> fs::Offset {
++        // SAFETY: The folio is valid because the shared reference implies a non-zero refcount.
++        unsafe { bindings::folio_pos(self.0.get()) }
++    }
++
++    /// Returns the byte size of this folio.
++    pub fn size(&self) -> usize {
++        // SAFETY: The folio is valid because the shared reference implies a non-zero refcount.
++        unsafe { bindings::folio_size(self.0.get()) }
++    }
++
++    /// Returns the first page of the folio.
++    ///
++    /// The pages of a folio are physically contiguous, so this page and [`Folio::size`] describe
++    /// the whole folio for callers that hand it to a device.
++    pub fn first_page(&self) -> BorrowedPage<'_> {
++        // SAFETY: The folio is valid and index 0 is always within it.
++        let page = unsafe { bindings::folio_page(self.0.get(), 0) };
++        // SAFETY: The page is part of the folio, which outlives the returned borrow.
++        unsafe { BorrowedPage::from_raw(ptr::NonNull::new_unchecked(page)) }
++    }
++
++    /// Flushes the data cache for the pages that make up the folio.
++    pub fn flush_dcache(&self) {
++        // SAFETY: The folio is valid because the shared reference implies a non-zero refcount.
++        unsafe { bindings::flush_dcache_folio(self.0.get()) }
++    }
++
++    /// Returns true if the folio is in highmem.
++    pub fn test_highmem(&self) -> bool {
++        // SAFETY: The folio is valid because the shared reference implies a non-zero refcount.
++        unsafe { bindings::folio_test_highmem(self.0.get()) }
++    }
++
++    /// Returns whether the folio is up to date.
++    pub fn test_uptodate(&self) -> bool {
++        // SAFETY: The folio is valid because the shared reference implies a non-zero refcount.
++        unsafe { bindings::folio_test_uptodate(self.0.get()) }
++    }
++}
++
++impl<T: FileSystem + ?Sized> Folio<PageCache<T>> {
++    /// Returns the inode whose data this folio holds.
++    pub fn inode(&self) -> &INode<T> {
++        // SAFETY: The type parameter guarantees that this is a page-cache folio, so `mapping`
++        // and its host are populated and outlive the folio.
++        unsafe {
++            INode::from_raw((*(*self.0.get()).__bindgen_anon_1.__bindgen_anon_1.mapping).host)
++        }
++    }
++}
++
++// SAFETY: `raw_lock` calls `folio_lock`, which locks the folio.
++unsafe impl<S> Lockable for Folio<S> {
++    fn raw_lock(&self) {
++        // SAFETY: The folio is valid because the shared reference implies a non-zero refcount.
++        unsafe { bindings::folio_lock(self.0.get()) }
++    }
++
++    unsafe fn unlock(&self) {
++        // SAFETY: The safety requirements guarantee that the folio is locked.
++        unsafe { bindings::folio_unlock(self.0.get()) }
++    }
++}
++
++impl<T: Deref<Target = Folio<S>>, S> Locked<T> {
++    /// Marks the folio as being up to date.
++    pub fn mark_uptodate(&mut self) {
++        // SAFETY: The folio is valid because the shared reference implies a non-zero refcount.
++        unsafe { bindings::folio_mark_uptodate(self.deref().0.get()) }
++    }
++
++    /// Runs `cb` over `len` bytes of the folio starting at `offset`, one mapping at a time.
++    ///
++    /// A folio in highmem is mapped one page at a time, so `cb` may run more than once.
++    fn for_each_page(
++        &mut self,
++        offset: usize,
++        len: usize,
++        mut cb: impl FnMut(&mut [u8]) -> Result,
++    ) -> Result {
++        let mut remaining = len;
++        let mut next_offset = offset;
++
++        if self.test_uptodate() {
++            return Err(EIO);
++        }
++
++        let end = offset.checked_add(len).ok_or(EDOM)?;
++        if end > self.deref().size() {
++            return Err(EINVAL);
++        }
++
++        while remaining > 0 {
++            let map_size = if self.test_highmem() {
++                bindings::PAGE_SIZE - (next_offset & (bindings::PAGE_SIZE - 1))
++            } else {
++                self.size() - next_offset
++            };
++            let usable = min(remaining, map_size);
++            // SAFETY: The folio is valid and `next_offset` is less than its size.
++            let ptr = unsafe { bindings::kmap_local_folio(self.deref().0.get(), next_offset) };
++
++            // SAFETY: `ptr` was just returned by `kmap_local_folio` above.
++            let _guard = ScopeGuard::new(|| unsafe { bindings::kunmap_local(ptr) });
++
++            // SAFETY: `kmap_local_folio` maps at least to the end of the page, which covers
++            // `usable` bytes. The folio is locked and not up to date, so nothing else reads it.
++            let s = unsafe { core::slice::from_raw_parts_mut(ptr.cast::<u8>(), usable) };
++            cb(s)?;
++
++            next_offset += usable;
++            remaining -= usable;
++        }
++
++        Ok(())
++    }
++
++    /// Writes the given slice into the folio.
++    pub fn write(&mut self, offset: usize, data: &[u8]) -> Result {
++        let mut remaining = data;
++
++        self.for_each_page(offset, data.len(), |s| {
++            s.copy_from_slice(&remaining[..s.len()]);
++            remaining = &remaining[s.len()..];
++            Ok(())
++        })
++    }
++
++    /// Writes zeroes into the folio.
++    pub fn zero_out(&mut self, offset: usize, len: usize) -> Result {
++        self.for_each_page(offset, len, |s| {
++            s.fill(0);
++            Ok(())
++        })
++    }
++}
+diff --git a/rust/kernel/fs.rs b/rust/kernel/fs.rs
+index 6ba6bdf14..8eafdf2c6 100644
+--- a/rust/kernel/fs.rs
++++ b/rust/kernel/fs.rs
+@@ -2,10 +2,422 @@
+ 
+ //! Kernel file systems.
+ //!
++//! This module lets Rust code use files and implement file systems.
++//!
+ //! C headers: [`include/linux/fs.h`](srctree/include/linux/fs.h)
+ 
++use crate::error::{code::*, from_result, to_result, Error, Result};
++use crate::types::{ForeignOwnable, Opaque};
++use crate::{bindings, mem_cache::MemCache, str::CStr, str::CStrExt, try_pin_init, ThisModule};
++use crate::ffi;
++use core::{mem::size_of, mem::ManuallyDrop, pin::Pin, ptr};
++use dentry::DEntry;
++use inode::INode;
++use pin_init::{pin_data, pinned_drop, PinInit};
++use sb::SuperBlock;
++
++pub mod address_space;
++pub mod dentry;
+ pub mod file;
++pub mod inode;
++pub mod sb;
+ pub use self::file::{File, LocalFile};
+ 
+ mod kiocb;
+ pub use self::kiocb::Kiocb;
++
++/// The offset of a file in a file system.
++///
++/// This is C's `loff_t`.
++pub use self::file::Offset;
++
++/// An index into the page cache.
++///
++/// This is C's `pgoff_t`.
++pub type PageOffset = usize;
++
++/// A point in time as seconds and nanoseconds since the Unix epoch.
++///
++/// This is C's `struct timespec64`.
++#[derive(Clone, Copy, Default, PartialEq, Eq)]
++pub struct Timespec {
++    /// Whole seconds.
++    pub sec: i64,
++    /// Nanoseconds within the second.
++    pub nsec: u32,
++}
++
++impl Timespec {
++    /// The Unix epoch.
++    pub const EPOCH: Self = Self { sec: 0, nsec: 0 };
++
++    /// Builds a timespec from nanoseconds since the epoch.
++    pub const fn from_nanos(ns: i64) -> Self {
++        Self {
++            sec: ns.div_euclid(1_000_000_000),
++            nsec: ns.rem_euclid(1_000_000_000) as u32,
++        }
++    }
++}
++
++impl From<Timespec> for bindings::timespec64 {
++    fn from(t: Timespec) -> Self {
++        Self {
++            tv_sec: t.sec,
++            tv_nsec: isize::try_from(t.nsec).unwrap_or(0),
++        }
++    }
++}
++
++/// Contains constants related to Linux file modes.
++pub mod mode {
++    /// A bitmask used to the file type from a mode value.
++    pub const S_IFMT: u16 = bindings::S_IFMT as u16;
++
++    /// File type constant for block devices.
++    pub const S_IFBLK: u16 = bindings::S_IFBLK as u16;
++
++    /// File type constant for char devices.
++    pub const S_IFCHR: u16 = bindings::S_IFCHR as u16;
++
++    /// File type constant for directories.
++    pub const S_IFDIR: u16 = bindings::S_IFDIR as u16;
++
++    /// File type constant for pipes.
++    pub const S_IFIFO: u16 = bindings::S_IFIFO as u16;
++
++    /// File type constant for symbolic links.
++    pub const S_IFLNK: u16 = bindings::S_IFLNK as u16;
++
++    /// File type constant for regular files.
++    pub const S_IFREG: u16 = bindings::S_IFREG as u16;
++
++    /// File type constant for sockets.
++    pub const S_IFSOCK: u16 = bindings::S_IFSOCK as u16;
++}
++
++/// Maximum size of an inode.
++pub const MAX_LFS_FILESIZE: Offset = bindings::MAX_LFS_FILESIZE;
++
++/// A file system type.
++pub trait FileSystem {
++    /// Data associated with each file system instance (super-block).
++    type Data: ForeignOwnable + Send + Sync;
++
++    /// Type of data associated with each inode.
++    type INodeData: Send + Sync;
++
++    /// The name of the file system type.
++    const NAME: &'static CStr;
++
++    /// Dentry operations installed on every dentry of the file system, if any.
++    const DENTRY_OPS: Option<dentry::Ops<Self>> = None;
++
++    /// Determines if an implementation doesn't specify the required types.
++    ///
++    /// This is meant for internal use only.
++    #[doc(hidden)]
++    const IS_UNSPECIFIED: bool = false;
++
++    /// Initialises the new superblock and returns the data to attach to it.
++    fn fill_super(sb: &mut SuperBlock<Self, sb::New>) -> Result<Self::Data>;
++
++    /// Initialises and returns the root inode of the given superblock.
++    ///
++    /// This is called during initialisation of a superblock after [`FileSystem::fill_super`] has
++    /// completed successfully.
++    fn init_root(sb: &SuperBlock<Self>) -> Result<dentry::Root<Self>>;
++
++    /// Get filesystem statistics.
++    fn statfs(_dentry: &DEntry<Self>) -> Result<Stat> {
++        Err(ENOSYS)
++    }
++}
++
++/// File system stats.
++///
++/// A subset of C's `kstatfs`.
++#[derive(Clone, Copy, Default)]
++pub struct Stat {
++    /// Magic number of the file system.
++    pub magic: usize,
++
++    /// The maximum length of a file name.
++    pub namelen: isize,
++
++    /// Block size.
++    pub bsize: isize,
++
++    /// Number of files in the file system.
++    pub files: u64,
++
++    /// Number of free files in the file system.
++    pub ffree: u64,
++
++    /// Number of blocks in the file system.
++    pub blocks: u64,
++
++    /// Number of free blocks in the file system.
++    pub bfree: u64,
++
++    /// Number of free blocks available to unprivileged users.
++    pub bavail: u64,
++}
++
++/// A file system that is unspecified.
++///
++/// Attempting to get super-block or inode data from it will result in a build error.
++pub struct UnspecifiedFS;
++
++impl FileSystem for UnspecifiedFS {
++    type Data = ();
++    type INodeData = ();
++    const NAME: &'static CStr = crate::c_str!("unspecified");
++    const IS_UNSPECIFIED: bool = true;
++
++    fn fill_super(_: &mut SuperBlock<Self, sb::New>) -> Result {
++        Err(ENOTSUPP)
++    }
++
++    fn init_root(_: &SuperBlock<Self>) -> Result<dentry::Root<Self>> {
++        Err(ENOTSUPP)
++    }
++}
++
++/// A registration of a file system.
++#[pin_data(PinnedDrop)]
++pub struct Registration {
++    #[pin]
++    fs: Opaque<bindings::file_system_type>,
++    inode_cache: Option<MemCache>,
++}
++
++// SAFETY: `Registration` doesn't provide any `&self` methods, so it is safe to pass references
++// to it around.
++unsafe impl Sync for Registration {}
++
++// SAFETY: Both registration and unregistration are implemented in C and safe to be performed
++// from any thread, so `Registration` is `Send`.
++unsafe impl Send for Registration {}
++
++impl Registration {
++    /// Creates the initialiser of a new file system registration.
++    pub fn new<T: FileSystem + ?Sized>(module: &'static ThisModule) -> impl PinInit<Self, Error> {
++        try_pin_init!(Self {
++            inode_cache: INode::<T>::new_cache()?,
++            fs <- Opaque::try_ffi_init(|fs_ptr: *mut bindings::file_system_type| {
++                // SAFETY: `try_ffi_init` guarantees that `fs_ptr` is valid for write.
++                unsafe { fs_ptr.write(pin_init::zeroed()) };
++
++                // SAFETY: `try_ffi_init` guarantees that `fs_ptr` is valid for write, and it has
++                // just been initialised above, so it's also valid for read.
++                let fs = unsafe { &mut *fs_ptr };
++                fs.owner = module.0;
++                fs.name = T::NAME.as_char_ptr();
++                fs.init_fs_context = Some(Self::init_fs_context_callback::<T>);
++                fs.kill_sb = Some(Self::kill_sb_callback::<T>);
++
++                // SAFETY: Pointers stored in `fs` are static so will live for as long as the
++                // registration is active (it is undone in `drop`).
++                to_result(unsafe { bindings::register_filesystem(fs_ptr) })
++            }),
++        })
++    }
++
++    unsafe extern "C" fn init_fs_context_callback<T: FileSystem + ?Sized>(
++        fc_ptr: *mut bindings::fs_context,
++    ) -> ffi::c_int {
++        from_result(|| {
++            // SAFETY: The C callback API guarantees that `fc_ptr` is valid.
++            let fc = unsafe { &mut *fc_ptr };
++            fc.ops = &Tables::<T>::CONTEXT;
++            Ok(0)
++        })
++    }
++
++    unsafe extern "C" fn kill_sb_callback<T: FileSystem + ?Sized>(
++        sb_ptr: *mut bindings::super_block,
++    ) {
++        // SAFETY: In `get_tree_callback` we always call `get_tree_nodev`, so `kill_anon_super`
++        // is the appropriate function to call for cleanup.
++        unsafe { bindings::kill_anon_super(sb_ptr) };
++
++        // SAFETY: The C API contract guarantees that `sb_ptr` is valid for read.
++        let ptr = unsafe { (*sb_ptr).s_fs_info };
++        if !ptr.is_null() {
++            // SAFETY: The only place where `s_fs_info` is assigned is `fill_super_callback`,
++            // where it's initialised with the result of an `into_foreign` call. We checked above
++            // that `ptr` is non-null because it would be null if we never reached the point where
++            // we init the field.
++            unsafe { drop(T::Data::from_foreign(ptr)) };
++        }
++    }
++}
++
++#[pinned_drop]
++impl PinnedDrop for Registration {
++    fn drop(self: Pin<&mut Self>) {
++        // SAFETY: If an instance of `Self` has been successfully created, a call to
++        // `register_filesystem` has necessarily succeeded. So it's ok to call
++        // `unregister_filesystem` on the previously registered fs.
++        unsafe { bindings::unregister_filesystem(self.fs.get()) };
++    }
++}
++
++struct Tables<T: FileSystem + ?Sized>(T);
++impl<T: FileSystem + ?Sized> Tables<T> {
++    const CONTEXT: bindings::fs_context_operations = bindings::fs_context_operations {
++        get_tree: Some(Self::get_tree_callback),
++        ..pin_init::zeroed()
++    };
++
++    unsafe extern "C" fn get_tree_callback(fc: *mut bindings::fs_context) -> ffi::c_int {
++        // SAFETY: `fc` is valid per the callback contract. `fill_super_callback` also has the
++        // right type and is a valid callback.
++        unsafe { bindings::get_tree_nodev(fc, Some(Self::fill_super_callback)) }
++    }
++
++    unsafe extern "C" fn fill_super_callback(
++        sb_ptr: *mut bindings::super_block,
++        _fc: *mut bindings::fs_context,
++    ) -> ffi::c_int {
++        from_result(|| {
++            // SAFETY: The callback contract guarantees that `sb_ptr` is a unique pointer to a
++            // newly-created superblock.
++            let new_sb = unsafe { SuperBlock::from_raw_mut(sb_ptr) };
++
++            // SAFETY: The callback contract guarantees that `sb_ptr`, from which `new_sb` is
++            // derived, is valid for write.
++            let sb = unsafe { &mut *new_sb.0.get() };
++            sb.s_op = &Tables::<T>::SUPER_BLOCK;
++            sb.s_flags |= bindings::SB_RDONLY;
++            sb.s_maxbytes = MAX_LFS_FILESIZE;
++            sb.s_blocksize = bindings::PAGE_SIZE as _;
++            sb.s_blocksize_bits = bindings::PAGE_SHIFT as _;
++            sb.s_time_gran = 1;
++
++            if let Some(dops) = T::DENTRY_OPS {
++                // SAFETY: `sb_ptr` is a new superblock and the table is a static.
++                unsafe { bindings::set_default_d_op(sb_ptr, dops.0) };
++            }
++
++            let data = T::fill_super(new_sb)?;
++
++            // N.B.: Even on failure, `kill_sb` is called and frees the data.
++            sb.s_fs_info = data.into_foreign();
++
++            // SAFETY: The callback contract guarantees that `sb_ptr` is a unique pointer to a
++            // newly-created (and initialised above) superblock. And we have just initialised
++            // `s_fs_info`.
++            let sb = unsafe { SuperBlock::from_raw(sb_ptr) };
++            let root = T::init_root(sb)?;
++
++            // Reject root inode if it belongs to a different superblock.
++            if !ptr::eq(root.super_block(), sb) {
++                return Err(EINVAL);
++            }
++
++            let dentry = ManuallyDrop::new(root).0.get();
++
++            // SAFETY: The callback contract guarantees that `sb_ptr` is a unique pointer to a
++            // newly-created (and initialised above) superblock.
++            unsafe { (*sb_ptr).s_root = dentry };
++
++            Ok(0)
++        })
++    }
++
++    const SUPER_BLOCK: bindings::super_operations = bindings::super_operations {
++        alloc_inode: if size_of::<T::INodeData>() != 0 {
++            Some(INode::<T>::alloc_inode_callback)
++        } else {
++            None
++        },
++        destroy_inode: Some(INode::<T>::destroy_inode_callback),
++        statfs: Some(Self::statfs_callback),
++        ..pin_init::zeroed()
++    };
++
++    unsafe extern "C" fn statfs_callback(
++        dentry_ptr: *mut bindings::dentry,
++        buf: *mut bindings::kstatfs,
++    ) -> ffi::c_int {
++        from_result(|| {
++            // SAFETY: The C API guarantees that `dentry_ptr` is a valid dentry.
++            let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++            let s = T::statfs(dentry)?;
++
++            // SAFETY: The C API guarantees that `buf` is valid for read and write.
++            let buf = unsafe { &mut *buf };
++            buf.f_type = s.magic as ffi::c_long;
++            buf.f_namelen = s.namelen as ffi::c_long;
++            buf.f_bsize = s.bsize as ffi::c_long;
++            buf.f_files = s.files;
++            buf.f_ffree = s.ffree;
++            buf.f_blocks = s.blocks;
++            buf.f_bfree = s.bfree;
++            buf.f_bavail = s.bavail;
++            Ok(0)
++        })
++    }
++}
++
++/// Declares a kernel module that exposes a single file system.
++///
++/// The `type` argument must be a type which implements the [`FileSystem`] trait. Also accepts
++/// various forms of kernel metadata.
++///
++/// # Examples
++///
++/// ```
++/// # mod module_fs_sample {
++/// use kernel::fs::{dentry, sb, sb::SuperBlock, self};
++/// use kernel::prelude::*;
++///
++/// kernel::module_fs! {
++///     type: MyFs,
++///     name: "myfs",
++///     authors: ["Rust for Linux Contributors"],
++///     description: "My Rust fs",
++///     license: "GPL",
++/// }
++///
++/// struct MyFs;
++/// impl fs::FileSystem for MyFs {
++///     type Data = ();
++///     type INodeData = ();
++///     const NAME: &'static CStr = kernel::c_str!("myfs");
++///     fn fill_super(_: &mut SuperBlock<Self, sb::New>) -> Result {
++///         todo!()
++///     }
++///     fn init_root(_sb: &SuperBlock<Self>) -> Result<dentry::Root<Self>> {
++///         todo!()
++///     }
++/// }
++/// # }
++/// ```
++#[macro_export]
++macro_rules! module_fs {
++    (type: $type:ty, $($f:tt)*) => {
++        #[::pin_init::pin_data]
++        struct ModuleType {
++            #[pin]
++            _fs: $crate::fs::Registration,
++        }
++
++        impl $crate::InPlaceModule for ModuleType {
++            fn init(
++                module: &'static $crate::ThisModule,
++            ) -> impl ::pin_init::PinInit<Self, $crate::error::Error> {
++                $crate::try_pin_init!(Self {
++                    _fs <- $crate::fs::Registration::new::<$type>(module),
++                })
++            }
++        }
++
++        $crate::macros::module! {
++            type: ModuleType,
++            $($f)*
++        }
++    }
++}
+diff --git a/rust/kernel/fs/address_space.rs b/rust/kernel/fs/address_space.rs
+new file mode 100644
+index 000000000..9497758de
+--- /dev/null
++++ b/rust/kernel/fs/address_space.rs
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! File system address spaces.
++//!
++//! This module allows Rust code implement address space operations.
++//!
++//! C headers: [`include/linux/fs.h`](srctree/include/linux/fs.h)
++
++use super::{file::File, FileSystem};
++use crate::error::{from_result, Result};
++use crate::sync::Locked;
++use crate::{bindings, folio::Folio, folio::PageCache};
++use core::marker::PhantomData;
++use macros::vtable;
++
++/// Operations implemented by address spaces.
++#[vtable]
++pub trait Operations {
++    /// File system that these operations are compatible with.
++    type FileSystem: FileSystem + ?Sized;
++
++    /// Reads the contents of the inode into the given folio.
++    ///
++    /// The folio arrives locked and not up to date. Implementations fill it, mark it up to date
++    /// and return; the lock is released when the guard is dropped.
++    fn read_folio(file: Option<&File>, folio: Locked<&Folio<PageCache<Self::FileSystem>>>) -> Result;
++}
++
++/// Represents address space operations.
++pub struct Ops<T: FileSystem + ?Sized>(
++    pub(crate) *const bindings::address_space_operations,
++    pub(crate) PhantomData<T>,
++);
++
++impl<T: FileSystem + ?Sized> Ops<T> {
++    /// Creates the address space operations from a type that implements the [`Operations`] trait.
++    pub const fn new<U: Operations<FileSystem = T> + ?Sized>() -> Self {
++        struct Table<T: Operations + ?Sized>(PhantomData<T>);
++        impl<T: Operations + ?Sized> Table<T> {
++            const TABLE: bindings::address_space_operations = bindings::address_space_operations {
++                read_folio: if T::HAS_READ_FOLIO {
++                    Some(Self::read_folio_callback)
++                } else {
++                    None
++                },
++                ..pin_init::zeroed()
++            };
++
++            unsafe extern "C" fn read_folio_callback(
++                file_ptr: *mut bindings::file,
++                folio_ptr: *mut bindings::folio,
++            ) -> i32 {
++                from_result(|| {
++                    let file = if file_ptr.is_null() {
++                        None
++                    } else {
++                        // SAFETY: The C API guarantees that `file_ptr` is a valid file if non-null,
++                        // and that it stays valid for the duration of the callback.
++                        Some(unsafe { File::from_raw_file(file_ptr) })
++                    };
++
++                    // SAFETY: The C API guarantees that `folio_ptr` is a valid page-cache folio of
++                    // this file system.
++                    let folio = unsafe { Folio::from_raw(folio_ptr) };
++
++                    // SAFETY: The C contract guarantees that the folio is valid and locked, with
++                    // ownership of the lock transferred to the callee (this function).
++                    T::read_folio(file, unsafe { Locked::new(folio) })?;
++                    Ok(0)
++                })
++            }
++        }
++        Self(&Table::<U>::TABLE, PhantomData)
++    }
++}
+diff --git a/rust/kernel/fs/dentry.rs b/rust/kernel/fs/dentry.rs
+new file mode 100644
+index 000000000..af1ce4cd7
+--- /dev/null
++++ b/rust/kernel/fs/dentry.rs
+@@ -0,0 +1,225 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! File system directory entries.
++//!
++//! This module allows Rust code to use dentries.
++//!
++//! C headers: [`include/linux/dcache.h`](srctree/include/linux/dcache.h)
++
++use super::{inode::INode, FileSystem, SuperBlock};
++use crate::bindings;
++use crate::error::{code::*, from_err_ptr, from_result, Result};
++use crate::sync::aref::{ARef, AlwaysRefCounted};
++use crate::types::Opaque;
++use core::{marker::PhantomData, mem::ManuallyDrop, ops::Deref, ptr};
++use macros::vtable;
++
++/// A directory entry.
++///
++/// Wraps the kernel's `struct dentry`.
++///
++/// # Invariants
++///
++/// Instances of this type are always ref-counted, that is, a call to `dget` ensures that the
++/// allocation remains valid at least until the matching call to `dput`.
++#[repr(transparent)]
++pub struct DEntry<T: FileSystem + ?Sized>(pub(crate) Opaque<bindings::dentry>, PhantomData<T>);
++
++// SAFETY: The type invariants guarantee that `DEntry` is always ref-counted.
++unsafe impl<T: FileSystem + ?Sized> AlwaysRefCounted for DEntry<T> {
++    fn inc_ref(&self) {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        unsafe { bindings::dget(self.0.get()) };
++    }
++
++    unsafe fn dec_ref(obj: ptr::NonNull<Self>) {
++        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
++        unsafe { bindings::dput(obj.as_ref().0.get()) }
++    }
++}
++
++impl<T: FileSystem + ?Sized> DEntry<T> {
++    /// Creates a new [`DEntry`] from a raw C pointer.
++    ///
++    /// # Safety
++    ///
++    /// * `ptr` must be valid for at least the lifetime of the returned reference.
++    /// * `ptr` has the correct file system type, or `T` is [`super::UnspecifiedFS`].
++    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::dentry) -> &'a Self {
++        // SAFETY: The safety requirements guarantee that the reference is and remains valid.
++        unsafe { &*ptr.cast::<Self>() }
++    }
++
++    /// Returns the superblock of the dentry.
++    pub fn super_block(&self) -> &SuperBlock<T> {
++        // SAFETY: `d_sb` is immutable, so it's safe to read it.
++        unsafe { SuperBlock::from_raw((*self.0.get()).d_sb) }
++    }
++
++    /// Returns the inode the dentry points to, if it is a positive dentry.
++    pub fn inode(&self) -> Option<&INode<T>> {
++        // SAFETY: The dentry is valid. `d_inode` is read once, which is what the C side does in
++        // paths that may race with the dentry being made negative or positive.
++        let ptr = unsafe { ptr::read_volatile(ptr::addr_of!((*self.0.get()).d_inode)) };
++        if ptr.is_null() {
++            None
++        } else {
++            // SAFETY: A dentry keeps its inode alive for as long as it points to it.
++            Some(unsafe { INode::from_raw(ptr) })
++        }
++    }
++}
++
++/// A dentry that is known to be unhashed.
++pub struct Unhashed<'a, T: FileSystem + ?Sized>(pub(crate) &'a DEntry<T>);
++
++impl<T: FileSystem + ?Sized> Unhashed<'_, T> {
++    /// Splices a disconnected dentry into the tree if one exists.
++    pub fn splice_alias(self, inode: Option<ARef<INode<T>>>) -> Result<Option<ARef<DEntry<T>>>> {
++        let inode_ptr = if let Some(i) = inode {
++            // Reject inode if it belongs to a different superblock.
++            if !ptr::eq(i.super_block(), self.0.super_block()) {
++                return Err(EINVAL);
++            }
++
++            ManuallyDrop::new(i).0.get()
++        } else {
++            ptr::null_mut()
++        };
++
++        // SAFETY: Both inode and dentry are known to be valid.
++        let ptr = from_err_ptr(unsafe { bindings::d_splice_alias(inode_ptr, self.0 .0.get()) })?;
++
++        // SAFETY: The C API guarantees that if a dentry is returned, the refcount has been
++        // incremented.
++        Ok(ptr::NonNull::new(ptr).map(|v| unsafe { ARef::from_raw(v.cast::<DEntry<T>>()) }))
++    }
++
++    /// Returns the name of the dentry.
++    ///
++    /// Being unhashed guarantees that the name won't change.
++    pub fn name(&self) -> &[u8] {
++        // SAFETY: The name is immutable, so it is ok to read it.
++        let name = unsafe { &*ptr::addr_of!((*self.0 .0.get()).__bindgen_anon_1.d_name) };
++        // SAFETY: The name is immutable, so it is ok to read it.
++        unsafe { qstr_bytes(name) }
++    }
++}
++
++/// Returns the bytes of a `qstr`.
++///
++/// # Safety
++///
++/// `name` must be valid and must not change while the returned slice is in use.
++pub(crate) unsafe fn qstr_bytes<'a>(name: &'a bindings::qstr) -> &'a [u8] {
++    // This ensures that a `u32` is representable in `usize`. If it isn't, we'll get a build
++    // break.
++    const _: usize = 0xffffffff;
++
++    // SAFETY: The union just allows an easy way to get the `hash` and `len` at once. `len` is
++    // always valid.
++    let len = unsafe { name.__bindgen_anon_1.__bindgen_anon_1.len } as usize;
++
++    // SAFETY: The caller guarantees the name is valid and stable.
++    unsafe { core::slice::from_raw_parts(name.name, len) }
++}
++
++impl<T: FileSystem + ?Sized> Deref for Unhashed<'_, T> {
++    type Target = DEntry<T>;
++
++    fn deref(&self) -> &Self::Target {
++        self.0
++    }
++}
++
++/// A dentry that is meant to be used as the root of a file system.
++pub struct Root<T: FileSystem + ?Sized>(ARef<DEntry<T>>);
++
++impl<T: FileSystem + ?Sized> Root<T> {
++    /// Creates a root dentry.
++    pub fn try_new(inode: ARef<INode<T>>) -> Result<Root<T>> {
++        // SAFETY: `d_make_root` requires that `inode` be valid and referenced, which is the
++        // case for this call.
++        //
++        // It takes over the inode, even on failure, so we don't need to clean it up.
++        let dentry_ptr = unsafe { bindings::d_make_root(ManuallyDrop::new(inode).0.get()) };
++        let dentry = ptr::NonNull::new(dentry_ptr).ok_or(ENOMEM)?;
++
++        // SAFETY: `dentry` is valid and referenced. It reference ownership is transferred to
++        // `ARef`.
++        Ok(Root(unsafe { ARef::from_raw(dentry.cast::<DEntry<T>>()) }))
++    }
++}
++
++impl<T: FileSystem + ?Sized> Deref for Root<T> {
++    type Target = DEntry<T>;
++
++    fn deref(&self) -> &Self::Target {
++        &self.0
++    }
++}
++
++/// Operations implemented by dentries.
++#[vtable]
++pub trait Operations {
++    /// File system that these operations are compatible with.
++    type FileSystem: FileSystem + ?Sized;
++
++    /// Decides whether a cached dentry still describes the file system.
++    ///
++    /// `parent` is the directory the dentry was found in and `name` its name there. Returns
++    /// `Ok(true)` to keep the dentry and `Ok(false)` to have the VFS drop it and look the name up
++    /// again. Called with the RCU read-side lock held when `rcu` is true; implementations that
++    /// would have to sleep return `Err(ECHILD)` in that case to be called again without it.
++    fn revalidate(
++        _parent: &INode<Self::FileSystem>,
++        _name: &[u8],
++        _dentry: &DEntry<Self::FileSystem>,
++        _rcu: bool,
++    ) -> Result<bool> {
++        Ok(true)
++    }
++}
++
++/// Represents dentry operations.
++pub struct Ops<T: FileSystem + ?Sized>(
++    pub(crate) *const bindings::dentry_operations,
++    PhantomData<T>,
++);
++
++impl<T: FileSystem + ?Sized> Ops<T> {
++    /// Creates the dentry operations from a type that implements the [`Operations`] trait.
++    pub const fn new<U: Operations<FileSystem = T> + ?Sized>() -> Self {
++        struct Table<T: Operations + ?Sized>(PhantomData<T>);
++        impl<T: Operations + ?Sized> Table<T> {
++            const TABLE: bindings::dentry_operations = bindings::dentry_operations {
++                d_revalidate: if T::HAS_REVALIDATE {
++                    Some(Self::revalidate_callback)
++                } else {
++                    None
++                },
++                ..pin_init::zeroed()
++            };
++
++            unsafe extern "C" fn revalidate_callback(
++                parent_ptr: *mut bindings::inode,
++                name_ptr: *const bindings::qstr,
++                dentry_ptr: *mut bindings::dentry,
++                flags: u32,
++            ) -> core::ffi::c_int {
++                from_result(|| {
++                    // SAFETY: The C API guarantees that `parent_ptr` is a valid inode.
++                    let parent = unsafe { INode::from_raw(parent_ptr) };
++                    // SAFETY: The C API guarantees that `name_ptr` is valid and stable for the
++                    // duration of the call.
++                    let name = unsafe { qstr_bytes(&*name_ptr) };
++                    // SAFETY: The C API guarantees that `dentry_ptr` is a valid dentry.
++                    let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++                    let rcu = flags & bindings::LOOKUP_RCU != 0;
++                    Ok(T::revalidate(parent, name, dentry, rcu)?.into())
++                })
++            }
++        }
++        Self(&Table::<U>::TABLE, PhantomData)
++    }
++}
+diff --git a/rust/kernel/fs/file.rs b/rust/kernel/fs/file.rs
+index 23ee689bd..184141a6f 100644
+--- a/rust/kernel/fs/file.rs
++++ b/rust/kernel/fs/file.rs
+@@ -7,15 +7,18 @@
+ //! C headers: [`include/linux/fs.h`](srctree/include/linux/fs.h) and
+ //! [`include/linux/file.h`](srctree/include/linux/file.h)
+ 
++use super::{inode, inode::INode, inode::Ino, FileSystem};
+ use crate::{
+     bindings,
+     cred::Credential,
+-    error::{code::*, to_result, Error, Result},
++    error::{code::*, from_result, to_result, Error, Result},
+     fmt,
+     sync::aref::{ARef, AlwaysRefCounted},
++    sync::Locked,
+     types::{NotThreadSafe, Opaque},
+ };
+-use core::ptr;
++use core::{marker::PhantomData, mem::ManuallyDrop, ptr};
++use macros::vtable;
+ 
+ /// Primitive type representing the offset within a [`File`].
+ ///
+@@ -471,3 +474,251 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f.pad("EBADF")
+     }
+ }
++
++/// Operations implemented by files.
++#[vtable]
++pub trait Operations {
++    /// File system that these operations are compatible with.
++    type FileSystem: FileSystem + ?Sized;
++
++    /// Seeks the file to the given offset.
++    fn seek(_file: &File, _offset: Offset, _whence: Whence) -> Result<Offset> {
++        Err(EINVAL)
++    }
++
++    /// Reads directory entries from directory files.
++    ///
++    /// [`DirEmitter::pos`] holds the current position of the directory reader.
++    fn read_dir(
++        _file: &File,
++        _inode: &Locked<&INode<Self::FileSystem>, inode::ReadSem>,
++        _emitter: &mut DirEmitter,
++    ) -> Result {
++        Err(EINVAL)
++    }
++}
++
++/// Represents file operations.
++pub struct Ops<T: FileSystem + ?Sized>(pub(crate) *const bindings::file_operations, PhantomData<T>);
++
++impl<T: FileSystem + ?Sized> Ops<T> {
++    /// Returns file operations for page-cache-based read-only regular files.
++    pub fn generic_ro_file() -> Self {
++        // SAFETY: This is a constant in C, it never changes.
++        Self(unsafe { &bindings::generic_ro_fops }, PhantomData)
++    }
++
++    /// Creates file operations from a type that implements the [`Operations`] trait.
++    pub const fn new<U: Operations<FileSystem = T> + ?Sized>() -> Self {
++        struct Table<T: Operations + ?Sized>(PhantomData<T>);
++        impl<T: Operations + ?Sized> Table<T> {
++            const TABLE: bindings::file_operations = bindings::file_operations {
++                llseek: if T::HAS_SEEK {
++                    Some(Self::seek_callback)
++                } else {
++                    None
++                },
++                iterate_shared: if T::HAS_READ_DIR {
++                    Some(Self::read_dir_callback)
++                } else {
++                    None
++                },
++                ..pin_init::zeroed()
++            };
++
++            unsafe extern "C" fn seek_callback(
++                file_ptr: *mut bindings::file,
++                offset: bindings::loff_t,
++                whence: i32,
++            ) -> bindings::loff_t {
++                from_result(|| {
++                    // SAFETY: The C API guarantees that `file` is valid for the duration of the
++                    // callback and that position accesses are serialised.
++                    let file = unsafe { File::from_raw_file(file_ptr) };
++                    T::seek(file, offset, whence.try_into()?)
++                })
++            }
++
++            unsafe extern "C" fn read_dir_callback(
++                file_ptr: *mut bindings::file,
++                ctx_ptr: *mut bindings::dir_context,
++            ) -> core::ffi::c_int {
++                from_result(|| {
++                    // SAFETY: The C API guarantees that `file` is valid for the duration of the
++                    // callback and that position accesses are serialised.
++                    let file = unsafe { File::from_raw_file(file_ptr) };
++
++                    // SAFETY: The file belongs to file system `T`, so its inode does too, and it
++                    // stays valid for as long as the file does.
++                    let inode = unsafe { INode::<T::FileSystem>::from_raw((*file_ptr).f_inode) };
++
++                    // SAFETY: The C API guarantees that this is the only reference to the
++                    // `dir_context` instance.
++                    let emitter = unsafe { &mut *ctx_ptr.cast::<DirEmitter>() };
++                    let orig_pos = emitter.pos();
++
++                    // SAFETY: The C API guarantees that the inode's rw semaphore is locked in read
++                    // mode. It does not expect callees to unlock it, so we make the locked object
++                    // manually dropped to avoid unlocking it.
++                    let locked = ManuallyDrop::new(unsafe { Locked::new(inode) });
++
++                    // Call the module implementation. We ignore errors if directory entries have
++                    // been successfully emitted: this is because we want users to see them before
++                    // the error.
++                    match T::read_dir(file, &locked, emitter) {
++                        Ok(_) => Ok(0),
++                        Err(e) => {
++                            if emitter.pos() == orig_pos {
++                                Err(e)
++                            } else {
++                                Ok(0)
++                            }
++                        }
++                    }
++                })
++            }
++        }
++        Self(&Table::<U>::TABLE, PhantomData)
++    }
++}
++
++/// Indicates how to interpret the `offset` argument in [`Operations::seek`].
++#[repr(u32)]
++pub enum Whence {
++    /// `offset` bytes from the start of the file.
++    Set = bindings::SEEK_SET,
++
++    /// `offset` bytes from the end of the file.
++    End = bindings::SEEK_END,
++
++    /// `offset` bytes from the current location.
++    Cur = bindings::SEEK_CUR,
++
++    /// The next location greater than or equal to `offset` that contains data.
++    Data = bindings::SEEK_DATA,
++
++    /// The next location greater than or equal to `offset` that contains a hole.
++    Hole = bindings::SEEK_HOLE,
++}
++
++impl TryFrom<i32> for Whence {
++    type Error = crate::error::Error;
++
++    fn try_from(v: i32) -> Result<Self> {
++        match v {
++            v if v == Self::Set as i32 => Ok(Self::Set),
++            v if v == Self::End as i32 => Ok(Self::End),
++            v if v == Self::Cur as i32 => Ok(Self::Cur),
++            v if v == Self::Data as i32 => Ok(Self::Data),
++            v if v == Self::Hole as i32 => Ok(Self::Hole),
++            _ => Err(EDOM),
++        }
++    }
++}
++
++/// Generic implementation of [`Operations::seek`].
++pub fn generic_seek(file: &File, offset: Offset, whence: Whence) -> Result<Offset> {
++    // SAFETY: The file is valid because the shared reference guarantees a nonzero refcount.
++    let n = unsafe { bindings::generic_file_llseek(file.as_ptr(), offset, whence as i32) };
++    if n < 0 {
++        Err(Error::from_errno(n.try_into()?))
++    } else {
++        Ok(n)
++    }
++}
++
++/// The types of directory entries reported by [`Operations::read_dir`].
++#[repr(u32)]
++#[derive(Copy, Clone)]
++pub enum DirEntryType {
++    /// Unknown type.
++    Unknown = bindings::DT_UNKNOWN,
++
++    /// Named pipe (first-in, first-out) type.
++    Fifo = bindings::DT_FIFO,
++
++    /// Character device type.
++    Chr = bindings::DT_CHR,
++
++    /// Directory type.
++    Dir = bindings::DT_DIR,
++
++    /// Block device type.
++    Blk = bindings::DT_BLK,
++
++    /// Regular file type.
++    Reg = bindings::DT_REG,
++
++    /// Symbolic link type.
++    Lnk = bindings::DT_LNK,
++
++    /// Named unix-domain socket type.
++    Sock = bindings::DT_SOCK,
++
++    /// White-out type.
++    Wht = bindings::DT_WHT,
++}
++
++impl From<inode::Type> for DirEntryType {
++    fn from(value: inode::Type) -> Self {
++        match value {
++            inode::Type::Fifo => DirEntryType::Fifo,
++            inode::Type::Chr(_, _) => DirEntryType::Chr,
++            inode::Type::Dir => DirEntryType::Dir,
++            inode::Type::Blk(_, _) => DirEntryType::Blk,
++            inode::Type::Reg => DirEntryType::Reg,
++            inode::Type::Lnk => DirEntryType::Lnk,
++            inode::Type::Sock => DirEntryType::Sock,
++        }
++    }
++}
++
++/// Directory entry emitter.
++///
++/// This is used in [`Operations::read_dir`] implementations to report the directory entry.
++#[repr(transparent)]
++pub struct DirEmitter(bindings::dir_context);
++
++impl DirEmitter {
++    /// Returns the current position of the emitter.
++    pub fn pos(&self) -> Offset {
++        self.0.pos
++    }
++
++    /// Sets the position of the emitter.
++    ///
++    /// The position is what a later [`Operations::read_dir`] call resumes from, so it should
++    /// identify the next entry to emit in a way that survives changes to the directory.
++    pub fn set_pos(&mut self, pos: Offset) {
++        self.0.pos = pos;
++    }
++
++    /// Emits a directory entry at the current position.
++    ///
++    /// `name` is the name of the entry, `ino` its inode number and `etype` its type.
++    ///
++    /// Returns `false` when the entry could not be emitted, possibly because the user-provided
++    /// buffer is full. The position is left alone; callers advance it with [`DirEmitter::set_pos`]
++    /// once an entry has been accepted.
++    pub fn emit(&mut self, name: &[u8], ino: Ino, etype: DirEntryType) -> bool {
++        let Ok(name_len) = i32::try_from(name.len()) else {
++            return false;
++        };
++
++        let Some(actor) = self.0.actor else {
++            return false;
++        };
++
++        // SAFETY: `name` is valid at least for the duration of the `actor` call.
++        unsafe {
++            actor(
++                &mut self.0,
++                name.as_ptr().cast::<crate::ffi::c_char>(),
++                name_len,
++                self.0.pos,
++                ino,
++                etype as _,
++            )
++        }
++    }
++}
+diff --git a/rust/kernel/fs/inode.rs b/rust/kernel/fs/inode.rs
+new file mode 100644
+index 000000000..de0415de4
+--- /dev/null
++++ b/rust/kernel/fs/inode.rs
+@@ -0,0 +1,541 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! File system inodes.
++//!
++//! This module allows Rust code to implement inodes.
++//!
++//! C headers: [`include/linux/fs.h`](srctree/include/linux/fs.h)
++
++use super::{
++    address_space, dentry, dentry::DEntry, file, mode, sb::SuperBlock, FileSystem, Offset,
++    Timespec, UnspecifiedFS,
++};
++use crate::alloc::KBox;
++use crate::error::{code::*, Result};
++use crate::sync::aref::{ARef, AlwaysRefCounted};
++use crate::sync::{Lockable, Locked};
++use crate::types::{ForeignOwnable, Opaque};
++use crate::{bindings, build_error, container_of, mem_cache::MemCache, str::CStrExt, str::CString};
++use core::mem::{size_of, ManuallyDrop, MaybeUninit};
++use core::{marker::PhantomData, ptr};
++use macros::vtable;
++
++/// The number of an inode.
++pub type Ino = u64;
++
++/// Operations implemented by inodes.
++#[vtable]
++pub trait Operations {
++    /// File system that these operations are compatible with.
++    type FileSystem: FileSystem + ?Sized;
++
++    /// Returns the path a symbolic link inode points to.
++    ///
++    /// When `dentry` is `None`, `get_link` is called with the RCU read-side lock held, so it may
++    /// not sleep. Implementations must return `Err(ECHILD)` for it to be called again without
++    /// holding the RCU lock.
++    fn get_link(
++        _dentry: Option<&DEntry<Self::FileSystem>>,
++        _inode: &INode<Self::FileSystem>,
++    ) -> Result<CString> {
++        Err(ENOTSUPP)
++    }
++
++    /// Returns the inode corresponding to the directory entry with the given name.
++    fn lookup(
++        _parent: &Locked<&INode<Self::FileSystem>, ReadSem>,
++        _dentry: dentry::Unhashed<'_, Self::FileSystem>,
++    ) -> Result<Option<ARef<DEntry<Self::FileSystem>>>> {
++        Err(ENOTSUPP)
++    }
++}
++
++/// A node (inode) in the file index.
++///
++/// Wraps the kernel's `struct inode`.
++///
++/// # Invariants
++///
++/// Instances of this type are always ref-counted, that is, a call to `ihold` ensures that the
++/// allocation remains valid at least until the matching call to `iput`.
++#[repr(transparent)]
++pub struct INode<T: FileSystem + ?Sized = UnspecifiedFS>(
++    pub(crate) Opaque<bindings::inode>,
++    PhantomData<T>,
++);
++
++impl<T: FileSystem + ?Sized> INode<T> {
++    /// Creates a new inode reference from the given raw pointer.
++    ///
++    /// # Safety
++    ///
++    /// Callers must ensure that:
++    ///
++    /// * `ptr` is valid and remains so for the lifetime of the returned object.
++    /// * `ptr` has the correct file system type, or `T` is [`super::UnspecifiedFS`].
++    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::inode) -> &'a Self {
++        // SAFETY: The safety requirements guarantee that the cast below is ok.
++        unsafe { &*ptr.cast::<Self>() }
++    }
++
++    /// Returns the number of the inode.
++    pub fn ino(&self) -> Ino {
++        // SAFETY: `i_ino` is immutable, and `self` is guaranteed to be valid by the existence of a
++        // shared reference (&self) to it.
++        unsafe { (*self.0.get()).i_ino }
++    }
++
++    /// Returns the super-block that owns the inode.
++    pub fn super_block(&self) -> &SuperBlock<T> {
++        // SAFETY: `i_sb` is immutable, and `self` is guaranteed to be valid by the existence of a
++        // shared reference (&self) to it.
++        unsafe { SuperBlock::from_raw((*self.0.get()).i_sb) }
++    }
++
++    /// Returns the data associated with the inode.
++    pub fn data(&self) -> &T::INodeData {
++        if T::IS_UNSPECIFIED {
++            build_error!("inode data type is unspecified");
++        }
++        // SAFETY: `self` is guaranteed to be valid by the existence of a shared reference
++        // (`&self`) to it, and every inode of this file system is embedded in a `WithData`.
++        let outerp = unsafe { container_of!(self.0.get(), WithData<T::INodeData>, inode) };
++        // SAFETY: We know `T::INodeData` is always initialised in an `INode`.
++        unsafe { &*(*outerp).data.as_ptr() }
++    }
++
++    /// Returns the size of the inode contents.
++    pub fn size(&self) -> Offset {
++        // SAFETY: `self` is guaranteed to be valid by the existence of a shared reference.
++        unsafe { bindings::i_size_read(self.0.get()) }
++    }
++
++    /// Returns the mode of the inode, type bits included.
++    pub fn mode(&self) -> u16 {
++        // SAFETY: `self` is valid; `i_mode` is read with no particular ordering, like C does.
++        unsafe { ptr::read_volatile(ptr::addr_of!((*self.0.get()).i_mode)) }
++    }
++
++    /// Replaces the attributes of an existing inode.
++    ///
++    /// The type bits of the mode are left alone: an inode never changes type.
++    pub fn set_attr(&self, attr: &Attr) {
++        let inode = self.0.get();
++        // SAFETY: The inode is valid. These are the same unlocked field writes a C file system
++        // performs when it refreshes an inode from its backing store.
++        unsafe {
++            let typ = (*inode).i_mode & mode::S_IFMT;
++            (*inode).i_mode = typ | (attr.mode & 0o7777);
++            bindings::i_size_write(inode, attr.size);
++            (*inode).i_blocks = attr.blocks;
++            bindings::set_nlink(inode, attr.nlink);
++            bindings::i_uid_write(inode, attr.uid);
++            bindings::i_gid_write(inode, attr.gid);
++            bindings::inode_set_atime_to_ts(inode, attr.atime.into());
++            bindings::inode_set_mtime_to_ts(inode, attr.mtime.into());
++            bindings::inode_set_ctime_to_ts(inode, attr.ctime.into());
++        }
++    }
++
++    pub(crate) fn new_cache() -> Result<Option<MemCache>> {
++        Ok(if size_of::<T::INodeData>() == 0 {
++            None
++        } else {
++            Some(MemCache::try_new::<WithData<T::INodeData>>(
++                T::NAME,
++                Some(Self::inode_init_once_callback),
++            )?)
++        })
++    }
++
++    unsafe extern "C" fn inode_init_once_callback(outer_inode: *mut crate::ffi::c_void) {
++        let ptr = outer_inode.cast::<WithData<T::INodeData>>();
++
++        // SAFETY: This is only used in `new_cache`, so we know that we have a valid
++        // `inode::WithData` instance whose inode part can be initialised.
++        unsafe { bindings::inode_init_once(ptr::addr_of_mut!((*ptr).inode)) };
++    }
++
++    pub(crate) unsafe extern "C" fn alloc_inode_callback(
++        sb: *mut bindings::super_block,
++    ) -> *mut bindings::inode {
++        // SAFETY: The callback contract guarantees that `sb` is valid for read.
++        let super_type = unsafe { (*sb).s_type };
++
++        // SAFETY: This callback is only used in `Registration`, so `super_type` is necessarily
++        // embedded in a `Registration`, which is guaranteed to be valid because it has a
++        // superblock associated to it.
++        let reg = unsafe { &*container_of!(Opaque::cast_from(super_type), super::Registration, fs) };
++
++        // SAFETY: `sb` and `cache` are guaranteed to be valid by the callback contract and by
++        // the existence of a superblock respectively.
++        let ptr = unsafe {
++            bindings::alloc_inode_sb(sb, MemCache::ptr(&reg.inode_cache), bindings::GFP_KERNEL)
++        }
++        .cast::<WithData<T::INodeData>>();
++        if ptr.is_null() {
++            return ptr::null_mut();
++        }
++
++        // SAFETY: `ptr` was just allocated, so it is valid for dereferencing.
++        unsafe { ptr::addr_of_mut!((*ptr).inode) }
++    }
++
++    pub(crate) unsafe extern "C" fn destroy_inode_callback(inode: *mut bindings::inode) {
++        // SAFETY: By the C contract, `inode` is a valid pointer.
++        let is_bad = unsafe { bindings::is_bad_inode(inode) };
++
++        // SAFETY: The inode is guaranteed to be valid by the callback contract. Additionally, the
++        // superblock is also guaranteed to still be valid by the inode existence.
++        let super_type = unsafe { (*(*inode).i_sb).s_type };
++
++        // SAFETY: This callback is only used in `Registration`, so `super_type` is necessarily
++        // embedded in a `Registration`, which is guaranteed to be valid because it has a
++        // superblock associated to it.
++        let reg = unsafe { &*container_of!(Opaque::cast_from(super_type), super::Registration, fs) };
++        // SAFETY: Every inode of this file system is embedded in a `WithData`.
++        let ptr = unsafe { container_of!(inode, WithData<T::INodeData>, inode) };
++
++        if !is_bad {
++            // SAFETY: The code either initialises the data or marks the inode as bad. Since the
++            // inode is not bad, the data is initialised, and thus safe to drop.
++            unsafe { ptr::drop_in_place((*ptr).data.as_mut_ptr()) };
++        }
++
++        if size_of::<T::INodeData>() == 0 {
++            // SAFETY: When the size of `INodeData` is zero, we don't use a separate mem_cache, so
++            // it is allocated from the regular mem_cache, which is what `free_inode_nonrcu` uses
++            // to free the inode.
++            unsafe { bindings::free_inode_nonrcu(inode) };
++        } else {
++            // SAFETY: The callback contract guarantees that the inode was previously allocated via
++            // the `alloc_inode_callback` callback, so it is safe to free it back to the cache.
++            unsafe {
++                bindings::kmem_cache_free(
++                    MemCache::ptr(&reg.inode_cache),
++                    ptr.cast::<crate::ffi::c_void>(),
++                )
++            };
++        }
++    }
++}
++
++// SAFETY: The type invariants guarantee that `INode` is always ref-counted.
++unsafe impl<T: FileSystem + ?Sized> AlwaysRefCounted for INode<T> {
++    fn inc_ref(&self) {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        unsafe { bindings::ihold(self.0.get()) };
++    }
++
++    unsafe fn dec_ref(obj: ptr::NonNull<Self>) {
++        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
++        unsafe { bindings::iput(obj.as_ref().0.get()) }
++    }
++}
++
++/// Indicates that the an inode's rw semapahore is locked in read (shared) mode.
++pub struct ReadSem;
++
++// SAFETY: `raw_lock` calls `inode_lock_shared` which locks the inode in shared mode.
++unsafe impl<T: FileSystem + ?Sized> Lockable<ReadSem> for INode<T> {
++    fn raw_lock(&self) {
++        // SAFETY: Since there's a reference to the inode, it must be valid.
++        unsafe { bindings::inode_lock_shared(self.0.get()) };
++    }
++
++    unsafe fn unlock(&self) {
++        // SAFETY: Since there's a reference to the inode, it must be valid. Additionally, the
++        // safety requirements of this function require that the inode be locked in read mode.
++        unsafe { bindings::inode_unlock_shared(self.0.get()) };
++    }
++}
++
++struct WithData<T> {
++    data: MaybeUninit<T>,
++    inode: bindings::inode,
++}
++
++/// The result of looking an inode up by number: either one already in the cache, or a new one
++/// that still has to be initialised.
++pub enum Found<T: FileSystem + ?Sized> {
++    /// The inode was in the cache.
++    Existing(ARef<INode<T>>),
++    /// A new, locked inode was allocated.
++    New(New<T>),
++}
++
++/// An inode that is locked and hasn't been initialised yet.
++///
++/// # Invariants
++///
++/// The inode is a new one, locked, and valid for write.
++pub struct New<T: FileSystem + ?Sized>(
++    pub(crate) ptr::NonNull<bindings::inode>,
++    pub(crate) PhantomData<T>,
++);
++
++impl<T: FileSystem + ?Sized> New<T> {
++    /// Initialises the new inode with the given parameters.
++    pub fn init(self, params: Params<T::INodeData>) -> Result<ARef<INode<T>>> {
++        // SAFETY: Every inode of this file system is embedded in a `WithData`.
++        let outerp = unsafe { container_of!(self.0.as_ptr(), WithData<T::INodeData>, inode) };
++
++        // SAFETY: This is a newly-created inode. No other references to it exist, so it is
++        // safe to mutably dereference it.
++        let outer = unsafe { &mut *outerp };
++
++        // N.B. We must always write this to a newly allocated inode because the free callback
++        // expects the data to be initialised and drops it.
++        outer.data.write(params.value);
++
++        let inode = &mut outer.inode;
++        let mode = match params.typ {
++            Type::Dir => bindings::S_IFDIR,
++            Type::Reg => bindings::S_IFREG,
++            Type::Lnk => bindings::S_IFLNK,
++            Type::Fifo => {
++                // SAFETY: `inode` is valid for write as it's a new inode.
++                unsafe { bindings::init_special_inode(inode, bindings::S_IFIFO as _, 0) };
++                bindings::S_IFIFO
++            }
++            Type::Sock => {
++                // SAFETY: `inode` is valid for write as it's a new inode.
++                unsafe { bindings::init_special_inode(inode, bindings::S_IFSOCK as _, 0) };
++                bindings::S_IFSOCK
++            }
++            Type::Chr(major, minor) => {
++                // SAFETY: `inode` is valid for write as it's a new inode.
++                unsafe {
++                    bindings::init_special_inode(
++                        inode,
++                        bindings::S_IFCHR as _,
++                        bindings::MKDEV(major, minor & bindings::MINORMASK),
++                    )
++                };
++                bindings::S_IFCHR
++            }
++            Type::Blk(major, minor) => {
++                // SAFETY: `inode` is valid for write as it's a new inode.
++                unsafe {
++                    bindings::init_special_inode(
++                        inode,
++                        bindings::S_IFBLK as _,
++                        bindings::MKDEV(major, minor & bindings::MINORMASK),
++                    )
++                };
++                bindings::S_IFBLK
++            }
++        };
++
++        inode.i_mode = u16::try_from(mode)?;
++
++        // SAFETY: inode is a new inode, so it is valid for write.
++        unsafe { INode::<T>::from_raw(inode).set_attr(&params.attr) };
++
++        // SAFETY: inode is a new inode, so it is valid for write.
++        unsafe { bindings::unlock_new_inode(inode) };
++
++        let manual = ManuallyDrop::new(self);
++        // SAFETY: We transferred ownership of the refcount to `ARef` by preventing `drop` from
++        // being called with the `ManuallyDrop` instance created above.
++        Ok(unsafe { ARef::from_raw(manual.0.cast::<INode<T>>()) })
++    }
++
++    /// Sets the inode operations on this new inode.
++    pub fn set_iops(&mut self, iops: Ops<T>) -> &mut Self {
++        // SAFETY: By the type invariants, it's ok to modify the inode.
++        let inode = unsafe { self.0.as_mut() };
++        inode.i_op = iops.0;
++        self
++    }
++
++    /// Sets the file operations on this new inode.
++    pub fn set_fops(&mut self, fops: file::Ops<T>) -> &mut Self {
++        // SAFETY: By the type invariants, it's ok to modify the inode.
++        let inode = unsafe { self.0.as_mut() };
++        inode.__bindgen_anon_3.i_fop = fops.0;
++        self
++    }
++
++    /// Sets the address space operations on this new inode.
++    pub fn set_aops(&mut self, aops: address_space::Ops<T>) -> &mut Self {
++        // SAFETY: By the type invariants, it's ok to modify the inode.
++        let inode = unsafe { self.0.as_mut() };
++        inode.i_data.a_ops = aops.0;
++        self
++    }
++}
++
++impl<T: FileSystem + ?Sized> Drop for New<T> {
++    fn drop(&mut self) {
++        // SAFETY: The new inode failed to be turned into an initialised inode, so it's safe (and
++        // in fact required) to call `iget_failed` on it.
++        unsafe { bindings::iget_failed(self.0.as_ptr()) };
++    }
++}
++
++/// The type of an inode.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub enum Type {
++    /// Named pipe (first-in, first-out) type.
++    Fifo,
++
++    /// Character device type.
++    Chr(u32, u32),
++
++    /// Directory type.
++    Dir,
++
++    /// Block device type.
++    Blk(u32, u32),
++
++    /// Regular file type.
++    Reg,
++
++    /// Symbolic link type.
++    Lnk,
++
++    /// Named unix-domain socket type.
++    Sock,
++}
++
++/// The attributes of an inode other than its type.
++#[derive(Clone, Copy, Default)]
++pub struct Attr {
++    /// The permission bits, including setuid, setgid and sticky.
++    pub mode: u16,
++
++    /// Size of the contents of the inode.
++    ///
++    /// Its maximum value is [`super::MAX_LFS_FILESIZE`].
++    pub size: Offset,
++
++    /// Number of 512-byte blocks.
++    pub blocks: u64,
++
++    /// Number of links to the inode.
++    pub nlink: u32,
++
++    /// User id.
++    pub uid: u32,
++
++    /// Group id.
++    pub gid: u32,
++
++    /// Last status change time.
++    pub ctime: Timespec,
++
++    /// Last modification time.
++    pub mtime: Timespec,
++
++    /// Last access time.
++    pub atime: Timespec,
++}
++
++/// Required inode parameters.
++///
++/// This is used when creating new inodes.
++pub struct Params<T> {
++    /// Type of inode.
++    pub typ: Type,
++
++    /// Everything else about the inode.
++    pub attr: Attr,
++
++    /// Value to attach to this node.
++    pub value: T,
++}
++
++/// Represents inode operations.
++pub struct Ops<T: FileSystem + ?Sized>(*const bindings::inode_operations, PhantomData<T>);
++
++impl<T: FileSystem + ?Sized> Ops<T> {
++    /// Creates the inode operations from a type that implements the [`Operations`] trait.
++    pub const fn new<U: Operations<FileSystem = T> + ?Sized>() -> Self {
++        struct Table<T: Operations + ?Sized>(PhantomData<T>);
++        impl<T: Operations + ?Sized> Table<T> {
++            const TABLE: bindings::inode_operations = bindings::inode_operations {
++                lookup: if T::HAS_LOOKUP {
++                    Some(Self::lookup_callback)
++                } else {
++                    None
++                },
++                get_link: if T::HAS_GET_LINK {
++                    Some(Self::get_link_callback)
++                } else {
++                    None
++                },
++                ..pin_init::zeroed()
++            };
++
++            unsafe extern "C" fn lookup_callback(
++                parent_ptr: *mut bindings::inode,
++                dentry_ptr: *mut bindings::dentry,
++                _flags: u32,
++            ) -> *mut bindings::dentry {
++                // SAFETY: The C API guarantees that `parent_ptr` is a valid inode.
++                let parent = unsafe { INode::from_raw(parent_ptr) };
++
++                // SAFETY: The C API guarantees that `dentry_ptr` is a valid dentry.
++                let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++
++                // SAFETY: The C API guarantees that the inode's rw semaphore is locked at least in
++                // read mode. It does not expect callees to unlock it, so we make the locked object
++                // manually dropped to avoid unlocking it.
++                let locked = ManuallyDrop::new(unsafe { Locked::new(parent) });
++
++                match T::lookup(&locked, dentry::Unhashed(dentry)) {
++                    Err(e) => e.to_ptr(),
++                    Ok(None) => ptr::null_mut(),
++                    Ok(Some(ret)) => ManuallyDrop::new(ret).0.get(),
++                }
++            }
++
++            unsafe extern "C" fn get_link_callback(
++                dentry_ptr: *mut bindings::dentry,
++                inode_ptr: *mut bindings::inode,
++                delayed_call: *mut bindings::delayed_call,
++            ) -> *const crate::ffi::c_char {
++                unsafe extern "C" fn drop_link(ptr: *mut crate::ffi::c_void) {
++                    // SAFETY: The argument came from a previous call to `into_foreign` below.
++                    unsafe { drop(KBox::<CString>::from_foreign(ptr)) };
++                }
++
++                let dentry = if dentry_ptr.is_null() {
++                    None
++                } else {
++                    // SAFETY: The C API guarantees that `dentry_ptr` is a valid dentry when it's
++                    // non-null.
++                    Some(unsafe { DEntry::from_raw(dentry_ptr) })
++                };
++
++                // SAFETY: The C API guarantees that `inode_ptr` is a valid inode.
++                let inode = unsafe { INode::from_raw(inode_ptr) };
++
++                let link = match T::get_link(dentry, inode) {
++                    Err(e) => return e.to_ptr::<crate::ffi::c_char>(),
++                    Ok(link) => link,
++                };
++
++                // The link is handed to the VFS, which frees it through `delayed_call` once the
++                // path walk no longer needs it. `GFP_ATOMIC` because this may run under RCU.
++                let boxed = match KBox::new(link, crate::alloc::flags::GFP_ATOMIC) {
++                    Ok(b) => b,
++                    Err(_) => return ENOMEM.to_ptr::<crate::ffi::c_char>(),
++                };
++                let name = boxed.as_char_ptr();
++                // SAFETY: `delayed_call` is valid per the callback contract; the pointer passed is
++                // the one `drop_link` expects.
++                unsafe {
++                    bindings::set_delayed_call(
++                        delayed_call,
++                        Some(drop_link),
++                        KBox::into_foreign(boxed),
++                    )
++                };
++                name
++            }
++        }
++        Self(&Table::<U>::TABLE, PhantomData)
++    }
++}
+diff --git a/rust/kernel/fs/sb.rs b/rust/kernel/fs/sb.rs
+new file mode 100644
+index 000000000..e7786ea4c
+--- /dev/null
++++ b/rust/kernel/fs/sb.rs
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! File system super blocks.
++//!
++//! This module allows Rust code to use superblocks.
++//!
++//! C headers: [`include/linux/fs.h`](srctree/include/linux/fs.h)
++
++use super::inode::{self, INode, Ino};
++use super::FileSystem;
++use crate::error::{code::*, Result};
++use crate::sync::aref::ARef;
++use crate::types::{ForeignOwnable, Opaque};
++use crate::{bindings, build_error};
++use core::{marker::PhantomData, ptr};
++
++/// A typestate for [`SuperBlock`] that indicates that it's a new one, so not fully initialized
++/// yet.
++pub struct New;
++
++/// A typestate for [`SuperBlock`] that indicates that it's ready to be used.
++pub struct Ready;
++
++// SAFETY: Instances of `SuperBlock<T, Ready>` are only created after initialising the data.
++unsafe impl DataInited for Ready {}
++
++/// Indicates that a superblock in this typestate has data initialized.
++///
++/// # Safety
++///
++/// Implementers must ensure that `s_fs_info` is properly initialised in this state.
++#[doc(hidden)]
++pub unsafe trait DataInited {}
++
++/// A file system super block.
++///
++/// Wraps the kernel's `struct super_block`.
++#[repr(transparent)]
++pub struct SuperBlock<T: FileSystem + ?Sized, S = Ready>(
++    pub(crate) Opaque<bindings::super_block>,
++    PhantomData<(S, T)>,
++);
++
++impl<T: FileSystem + ?Sized, S> SuperBlock<T, S> {
++    /// Creates a new superblock reference from the given raw pointer.
++    ///
++    /// # Safety
++    ///
++    /// Callers must ensure that:
++    ///
++    /// * `ptr` is valid and remains so for the lifetime of the returned object.
++    /// * `ptr` has the correct file system type, or `T` is [`super::UnspecifiedFS`].
++    /// * `ptr` in the right typestate.
++    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::super_block) -> &'a Self {
++        // SAFETY: The safety requirements guarantee that the cast below is ok.
++        unsafe { &*ptr.cast::<Self>() }
++    }
++
++    /// Creates a new superblock mutable reference from the given raw pointer.
++    ///
++    /// # Safety
++    ///
++    /// Callers must ensure that:
++    ///
++    /// * `ptr` is valid and remains so for the lifetime of the returned object.
++    /// * `ptr` has the correct file system type, or `T` is [`super::UnspecifiedFS`].
++    /// * `ptr` in the right typestate.
++    /// * `ptr` is the only active pointer to the superblock.
++    pub(crate) unsafe fn from_raw_mut<'a>(ptr: *mut bindings::super_block) -> &'a mut Self {
++        // SAFETY: The safety requirements guarantee that the cast below is ok.
++        unsafe { &mut *ptr.cast::<Self>() }
++    }
++
++    /// Returns whether the superblock is mounted in read-only mode.
++    pub fn rdonly(&self) -> bool {
++        // SAFETY: `s_flags` only changes during init, so it is safe to read it.
++        unsafe { (*self.0.get()).s_flags & bindings::SB_RDONLY != 0 }
++    }
++}
++
++impl<T: FileSystem + ?Sized> SuperBlock<T, New> {
++    /// Sets the magic number of the superblock.
++    pub fn set_magic(&mut self, magic: usize) -> &mut Self {
++        // SAFETY: This is a new superblock that is being initialised, so it's ok to write to its
++        // fields.
++        unsafe { (*self.0.get()).s_magic = magic as crate::ffi::c_ulong };
++        self
++    }
++}
++
++impl<T: FileSystem + ?Sized, S: DataInited> SuperBlock<T, S> {
++    /// Returns the data associated with the superblock.
++    pub fn data(&self) -> <T::Data as ForeignOwnable>::Borrowed<'_> {
++        if T::IS_UNSPECIFIED {
++            build_error!("super block data type is unspecified");
++        }
++
++        // SAFETY: This method is only available if the typestate implements `DataInited`, whose
++        // safety requirements include `s_fs_info` being properly initialised.
++        let ptr = unsafe { (*self.0.get()).s_fs_info };
++        // SAFETY: `s_fs_info` holds the result of `into_foreign` and is only consumed in
++        // `kill_sb`, after the last use of the superblock.
++        unsafe { T::Data::borrow(ptr) }
++    }
++
++    /// Tries to get an existing inode or create a new one if it doesn't exist yet.
++    ///
++    /// This method is not callable from a superblock where data isn't inited yet because it would
++    /// allow one to get access to the uninited data via `inode::New::init()` ->
++    /// `INode::super_block()` -> `SuperBlock::data()`.
++    pub fn get_or_create_inode(&self, ino: Ino) -> Result<inode::Found<T>> {
++        // SAFETY: All superblock-related state needed by `iget_locked` is initialised by C code
++        // before calling `fill_super_callback`, or by `fill_super_callback` itself before calling
++        // `fill_super`, which is the first function to see a new superblock.
++        let inode =
++            ptr::NonNull::new(unsafe { bindings::iget_locked(self.0.get(), ino.try_into()?) }).ok_or(ENOMEM)?;
++
++        // SAFETY: `inode` is a valid pointer returned by `iget_locked`.
++        let state = unsafe { bindings::inode_state_read_once(inode.as_ptr()) };
++
++        if state & bindings::inode_state_flags_enum_I_NEW == 0 {
++            // The inode is cached. Just return it.
++            //
++            // SAFETY: `inode` had its refcount incremented by `iget_locked`; this increment is now
++            // owned by `ARef`.
++            Ok(inode::Found::Existing(unsafe { ARef::from_raw(inode.cast()) }))
++        } else {
++            // SAFETY: The new inode is valid but not fully initialised yet, so it's ok to create a
++            // `inode::New`.
++            Ok(inode::Found::New(inode::New(inode, PhantomData)))
++        }
++    }
++
++    /// Creates an inode with the given inode number.
++    ///
++    /// Fails with `EEXIST` if an inode with the given number already exists.
++    pub fn create_inode(&self, ino: Ino) -> Result<inode::New<T>> {
++        match self.get_or_create_inode(ino)? {
++            inode::Found::New(new) => Ok(new),
++            inode::Found::Existing(_) => Err(EEXIST),
++        }
++    }
++}
++
++impl<T: FileSystem + ?Sized> SuperBlock<T> {
++    /// Returns the inode with the given number if it is cached.
++    pub fn cached_inode(&self, ino: Ino) -> Option<ARef<INode<T>>> {
++        // SAFETY: The superblock is valid; `ilookup` takes a reference on success.
++        let ptr = ptr::NonNull::new(unsafe { bindings::ilookup(self.0.get(), ino.try_into().ok()?) })?;
++        // SAFETY: `ilookup` returned a referenced inode; the reference is now owned by `ARef`.
++        Some(unsafe { ARef::from_raw(ptr.cast()) })
++    }
++}
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index ab08d182e..a457a1751 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -71,6 +71,7 @@
+ pub mod faux;
+ #[cfg(CONFIG_RUST_FW_LOADER_ABSTRACTIONS)]
+ pub mod firmware;
++pub mod folio;
+ pub mod fmt;
+ pub mod fs;
+ #[cfg(CONFIG_GPU_BUDDY = "y")]
+@@ -92,6 +93,7 @@
+ pub mod kunit;
+ pub mod list;
+ pub mod maple_tree;
++pub mod mem_cache;
+ pub mod miscdevice;
+ pub mod mm;
+ pub mod module_param;
+diff --git a/rust/kernel/mem_cache.rs b/rust/kernel/mem_cache.rs
+new file mode 100644
+index 000000000..e6690d0c0
+--- /dev/null
++++ b/rust/kernel/mem_cache.rs
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Slab caches for objects of one size.
++//!
++//! C headers: [`include/linux/slab.h`](srctree/include/linux/slab.h)
++
++use crate::error::{code::*, Result};
++use crate::{bindings, str::CStr, str::CStrExt};
++use core::{ffi, mem::align_of, mem::size_of, ptr::NonNull};
++
++/// A `kmem_cache` sized for `T`.
++///
++/// # Invariants
++///
++/// `ptr` is a cache returned by `__kmem_cache_create_args` that is destroyed only in `drop`.
++pub struct MemCache {
++    ptr: NonNull<bindings::kmem_cache>,
++}
++
++// SAFETY: Caches are allocated from and freed to from any thread; the C API serialises itself.
++unsafe impl Send for MemCache {}
++
++// SAFETY: See above.
++unsafe impl Sync for MemCache {}
++
++impl MemCache {
++    /// Creates a cache for objects of type `T`.
++    ///
++    /// `init` runs once when an object is first carved out of a slab, before any allocation
++    /// hands it out, and is the place for state that must survive free and reuse, such as
++    /// `inode_init_once`.
++    pub fn try_new<T>(
++        name: &'static CStr,
++        init: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
++    ) -> Result<Self> {
++        let mut args: bindings::kmem_cache_args = pin_init::zeroed();
++        args.align = align_of::<T>().try_into()?;
++        args.ctor = init;
++        let flags = bindings::SLAB_RECLAIM_ACCOUNT | bindings::SLAB_ACCOUNT;
++
++        // SAFETY: `name` outlives the cache, `args` is fully initialised and only read during
++        // the call.
++        let ptr = unsafe {
++            bindings::__kmem_cache_create_args(
++                name.as_char_ptr(),
++                size_of::<T>().try_into()?,
++                &mut args,
++                flags,
++            )
++        };
++
++        // INVARIANT: The cache was just created and nothing else destroys it.
++        Ok(Self {
++            ptr: NonNull::new(ptr).ok_or(ENOMEM)?,
++        })
++    }
++
++    /// Returns the raw cache, or null when there is none.
++    pub(crate) fn ptr(c: &Option<Self>) -> *mut bindings::kmem_cache {
++        match c {
++            Some(c) => c.ptr.as_ptr(),
++            None => core::ptr::null_mut(),
++        }
++    }
++}
++
++impl Drop for MemCache {
++    fn drop(&mut self) {
++        // SAFETY: By the type invariants, `ptr` is a live cache that nothing else destroys.
++        unsafe { bindings::kmem_cache_destroy(self.ptr.as_ptr()) };
++    }
++}

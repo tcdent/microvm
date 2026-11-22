@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sat, 10 Oct 2026 17:47:08 -0700
+Subject: [PATCH 13/38] samples: rust: add read-only file system sample
+
+A four-entry in-memory file system exercising registration, lookup,
+readdir, read_folio and get_link. Adapted from the RFC's rust_rofs.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ samples/rust/Kconfig      |  10 ++
+ samples/rust/Makefile     |   1 +
+ samples/rust/rust_rofs.rs | 204 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 215 insertions(+)
+ create mode 100644 samples/rust/rust_rofs.rs
+
+diff --git a/samples/rust/Kconfig b/samples/rust/Kconfig
+index 96a16aecc..2026f4a90 100644
+--- a/samples/rust/Kconfig
++++ b/samples/rust/Kconfig
+@@ -179,6 +179,16 @@ config SAMPLE_RUST_HOSTPROGS
+ 
+ 	  If unsure, say N.
+ 
++config SAMPLE_RUST_ROFS
++	tristate "Read-only file system"
++	help
++	  This option builds the Rust read-only file system sample.
++
++	  To compile this as a module, choose M here:
++	  the module will be called rust_rofs.
++
++	  If unsure, say N.
++
+ config SAMPLE_RUST_VIRTIO_RTC
+ 	tristate "Rust Virtio RTC driver"
+ 	depends on VIRTIO
+diff --git a/samples/rust/Makefile b/samples/rust/Makefile
+index 0142fd865..2c9bc7b16 100644
+--- a/samples/rust/Makefile
++++ b/samples/rust/Makefile
+@@ -16,6 +16,7 @@ obj-$(CONFIG_SAMPLE_RUST_DRIVER_FAUX)		+= rust_driver_faux.o
+ obj-$(CONFIG_SAMPLE_RUST_DRIVER_AUXILIARY)	+= rust_driver_auxiliary.o
+ obj-$(CONFIG_SAMPLE_RUST_CONFIGFS)		+= rust_configfs.o
+ obj-$(CONFIG_SAMPLE_RUST_SOC)			+= rust_soc.o
++obj-$(CONFIG_SAMPLE_RUST_ROFS)			+= rust_rofs.o
+ obj-$(CONFIG_SAMPLE_RUST_VIRTIO_RTC)		+= rust_virtio_rtc.o
+ 
+ rust_print-y := rust_print_main.o rust_print_events.o
+diff --git a/samples/rust/rust_rofs.rs b/samples/rust/rust_rofs.rs
+new file mode 100644
+index 000000000..5d92f0ef8
+--- /dev/null
++++ b/samples/rust/rust_rofs.rs
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Rust read-only file system sample.
++
++use kernel::fs::{
++    address_space, dentry, dentry::DEntry, file, file::File, inode, inode::INode, sb, Offset,
++    Timespec,
++};
++use kernel::prelude::*;
++use kernel::str::CString;
++use kernel::sync::aref::ARef;
++use kernel::sync::Locked;
++use kernel::{c_str, folio::Folio, folio::PageCache, fs};
++
++kernel::module_fs! {
++    type: RoFs,
++    name: "rust_rofs",
++    authors: ["Rust for Linux Contributors"],
++    description: "Rust read-only file system sample",
++    license: "GPL",
++}
++
++struct Entry {
++    name: &'static [u8],
++    ino: u64,
++    etype: inode::Type,
++    contents: &'static [u8],
++}
++
++const ENTRIES: [Entry; 4] = [
++    Entry {
++        name: b".",
++        ino: 1,
++        etype: inode::Type::Dir,
++        contents: b"",
++    },
++    Entry {
++        name: b"..",
++        ino: 1,
++        etype: inode::Type::Dir,
++        contents: b"",
++    },
++    Entry {
++        name: b"test.txt",
++        ino: 2,
++        etype: inode::Type::Reg,
++        contents: b"hello world\n",
++    },
++    Entry {
++        name: b"link.txt",
++        ino: 3,
++        etype: inode::Type::Lnk,
++        contents: b"./test.txt\0",
++    },
++];
++
++const DIR_FOPS: file::Ops<RoFs> = file::Ops::new::<RoFs>();
++const DIR_IOPS: inode::Ops<RoFs> = inode::Ops::new::<RoFs>();
++const FILE_AOPS: address_space::Ops<RoFs> = address_space::Ops::new::<RoFs>();
++
++struct RoFs;
++
++impl RoFs {
++    fn iget(sb: &sb::SuperBlock<Self>, e: &'static Entry) -> Result<ARef<INode<Self>>> {
++        let mut new = match sb.get_or_create_inode(e.ino)? {
++            inode::Found::Existing(existing) => return Ok(existing),
++            inode::Found::New(new) => new,
++        };
++
++        let (mode, nlink, size) = match e.etype {
++            inode::Type::Dir => {
++                new.set_iops(DIR_IOPS).set_fops(DIR_FOPS);
++                (0o555, 2, ENTRIES.len().try_into()?)
++            }
++            inode::Type::Reg => {
++                new.set_fops(file::Ops::generic_ro_file())
++                    .set_aops(FILE_AOPS);
++                (0o444, 1, e.contents.len().try_into()?)
++            }
++            inode::Type::Lnk => {
++                new.set_iops(DIR_IOPS);
++                (0o444, 1, (e.contents.len() - 1).try_into()?)
++            }
++            _ => return Err(ENOENT),
++        };
++
++        new.init(inode::Params {
++            typ: e.etype,
++            attr: inode::Attr {
++                mode,
++                size,
++                blocks: (u64::try_from(size)? + 511) / 512,
++                nlink,
++                uid: 0,
++                gid: 0,
++                atime: Timespec::EPOCH,
++                ctime: Timespec::EPOCH,
++                mtime: Timespec::EPOCH,
++            },
++            value: e,
++        })
++    }
++}
++
++impl fs::FileSystem for RoFs {
++    type Data = ();
++    type INodeData = &'static Entry;
++    const NAME: &'static CStr = c_str!("rust_rofs");
++
++    fn fill_super(sb: &mut sb::SuperBlock<Self, sb::New>) -> Result {
++        sb.set_magic(0x52555354);
++        Ok(())
++    }
++
++    fn init_root(sb: &sb::SuperBlock<Self>) -> Result<dentry::Root<Self>> {
++        let inode = Self::iget(sb, &ENTRIES[0])?;
++        dentry::Root::try_new(inode)
++    }
++}
++
++#[vtable]
++impl inode::Operations for RoFs {
++    type FileSystem = Self;
++
++    fn lookup(
++        parent: &Locked<&INode<Self>, inode::ReadSem>,
++        dentry: dentry::Unhashed<'_, Self>,
++    ) -> Result<Option<ARef<DEntry<Self>>>> {
++        if parent.ino() != 1 {
++            return dentry.splice_alias(None);
++        }
++
++        let name = dentry.name();
++        for e in &ENTRIES {
++            if name == e.name {
++                let inode = Self::iget(parent.super_block(), e)?;
++                return dentry.splice_alias(Some(inode));
++            }
++        }
++
++        dentry.splice_alias(None)
++    }
++
++    fn get_link(_: Option<&DEntry<Self>>, inode: &INode<Self>) -> Result<CString> {
++        let target = CStr::from_bytes_with_nul(inode.data().contents).map_err(|_| EINVAL)?;
++        Ok(CString::try_from(target)?)
++    }
++}
++
++#[vtable]
++impl address_space::Operations for RoFs {
++    type FileSystem = Self;
++
++    fn read_folio(_: Option<&File>, mut folio: Locked<&Folio<PageCache<Self>>>) -> Result {
++        let data = folio.inode().data().contents;
++        let pos = usize::try_from(folio.pos()).unwrap_or(usize::MAX);
++        let copied = if pos >= data.len() {
++            0
++        } else {
++            let to_copy = core::cmp::min(data.len() - pos, folio.size());
++            folio.write(0, &data[pos..][..to_copy])?;
++            to_copy
++        };
++
++        folio.zero_out(copied, folio.size() - copied)?;
++        folio.mark_uptodate();
++        folio.flush_dcache();
++
++        Ok(())
++    }
++}
++
++#[vtable]
++impl file::Operations for RoFs {
++    type FileSystem = Self;
++
++    fn seek(file: &File, offset: Offset, whence: file::Whence) -> Result<Offset> {
++        file::generic_seek(file, offset, whence)
++    }
++
++    fn read_dir(
++        _file: &File,
++        inode: &Locked<&INode<Self>, inode::ReadSem>,
++        emitter: &mut file::DirEmitter,
++    ) -> Result {
++        if inode.ino() != 1 {
++            return Ok(());
++        }
++
++        let pos = emitter.pos();
++        if pos >= ENTRIES.len().try_into()? {
++            return Ok(());
++        }
++
++        for (i, e) in ENTRIES.iter().enumerate().skip(pos.try_into()?) {
++            if !emitter.emit(e.name, e.ino, e.etype.into()) {
++                break;
++            }
++            emitter.set_pos((i + 1).try_into()?);
++        }
++
++        Ok(())
++    }
++}

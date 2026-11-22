@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Mon, 12 Oct 2026 14:30:03 -0700
+Subject: [PATCH 32/38] fs: sharedfs: break the DAX layout before a host-side
+ shrink
+
+When the host shrinks a file the guest has cached, unmap the range
+beyond the new end from processes before truncating its pages, as a
+local truncate does.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ fs/sharedfs/sharedfs.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/sharedfs/sharedfs.rs b/fs/sharedfs/sharedfs.rs
+index 865b6beff..8d403abad 100644
+--- a/fs/sharedfs/sharedfs.rs
++++ b/fs/sharedfs/sharedfs.rs
+@@ -369,6 +369,9 @@ pub(crate) fn on_event(
+                 let old_size = child.size();
+                 child.set_attr(&attr);
+                 if attr.size < old_size {
++                    // The host shrank the file. Its window chunks beyond the new end must be
++                    // unmapped from processes before the pages go, as on a local truncate.
++                    let _ = dax::break_layout(child, attr.size, old_size);
+                     child.truncate_pages(attr.size);
+                 }
+             }

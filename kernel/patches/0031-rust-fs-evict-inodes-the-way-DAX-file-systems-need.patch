@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Mon, 12 Oct 2026 14:30:02 -0700
+Subject: [PATCH 31/38] rust: fs: evict inodes the way DAX file systems need
+
+Install an evict_inode that does what evict() does without one, after
+first calling dax_break_layout_final(): a DAX mapping must have its
+entries removed before truncate_inode_pages_final(), which warns about
+any it finds ("WARNING: mm/truncate.c:89 at
+truncate_folio_batch_exceptionals"). ext4, XFS and FUSE do the same. For
+a file system without DAX the extra call returns at once.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/kernel/fs.rs | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/rust/kernel/fs.rs b/rust/kernel/fs.rs
+index bddcffa4d..0517c79fe 100644
+--- a/rust/kernel/fs.rs
++++ b/rust/kernel/fs.rs
+@@ -372,10 +372,24 @@ impl<T: FileSystem + ?Sized> Tables<T> {
+             None
+         },
+         destroy_inode: Some(INode::<T>::destroy_inode_callback),
++        evict_inode: Some(Self::evict_inode_callback),
+         statfs: Some(Self::statfs_callback),
+         ..pin_init::zeroed()
+     };
+ 
++    /// What `evict()` does without an `evict_inode`, plus what a DAX file needs first: its DAX
++    /// entries removed, waiting for pages still in use, before the page cache is truncated.
++    /// `truncate_inode_pages_final` warns about any it finds. Same as ext4, XFS and FUSE.
++    unsafe extern "C" fn evict_inode_callback(inode: *mut bindings::inode) {
++        // SAFETY: The VFS passes an inode being evicted; nothing else uses it any more.
++        unsafe {
++            #[cfg(CONFIG_FS_DAX)]
++            bindings::dax_break_layout_final(inode);
++            bindings::truncate_inode_pages_final(&mut (*inode).i_data);
++            bindings::clear_inode(inode);
++        }
++    }
++
+     unsafe extern "C" fn statfs_callback(
+         dentry_ptr: *mut bindings::dentry,
+         buf: *mut bindings::kstatfs,

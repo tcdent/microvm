@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 15:03:02 -0700
+Subject: [PATCH 23/38] rust: fs: mutating inode operations
+
+Add create, mkdir, symlink, unlink, rmdir, rename and setattr to
+`inode::Operations`, each handed the directory the VFS locked and the
+dentry it named, with the parent lock modelled as `Locked<_, WriteSem>`
+that is not released on return. The creating operations return the new
+inode and the callback instantiates the dentry with it; `mkdir` returns
+null to the VFS to say the passed dentry is the one to use. `setattr`
+runs `setattr_prepare` first and hands the request over as `SetAttr`,
+an accessor view of `struct iattr`.
+
+`FileSystem::READ_ONLY` replaces the unconditional `SB_RDONLY`: a file
+system without mutating operations, like the sample, sets it.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/kernel/error.rs      |   1 +
+ rust/kernel/fs.rs         |   8 +-
+ rust/kernel/fs/dentry.rs  |  28 +++-
+ rust/kernel/fs/inode.rs   | 331 +++++++++++++++++++++++++++++++++++++-
+ samples/rust/rust_rofs.rs |   1 +
+ 5 files changed, 364 insertions(+), 5 deletions(-)
+
+diff --git a/rust/kernel/error.rs b/rust/kernel/error.rs
+index 472401e9b..2daf06df0 100644
+--- a/rust/kernel/error.rs
++++ b/rust/kernel/error.rs
+@@ -81,6 +81,7 @@ macro_rules! declare_err {
+     declare_err!(ENOTSUPP, "Operation is not supported.");
+     declare_err!(ENOSYS, "Invalid system call number.");
+     declare_err!(ESTALE, "Stale file handle.");
++    declare_err!(ENAMETOOLONG, "File name too long.");
+     declare_err!(ETOOSMALL, "Buffer or request is too small.");
+     declare_err!(ESERVERFAULT, "An untranslatable error occurred.");
+     declare_err!(EBADTYPE, "Type not supported by server.");
+diff --git a/rust/kernel/fs.rs b/rust/kernel/fs.rs
+index 799780b7a..bddcffa4d 100644
+--- a/rust/kernel/fs.rs
++++ b/rust/kernel/fs.rs
+@@ -139,6 +139,10 @@ pub trait FileSystem {
+     /// Dentry operations installed on every dentry of the file system, if any.
+     const DENTRY_OPS: Option<dentry::Ops<Self>> = None;
+ 
++    /// Whether every mount of this file system is read-only. A file system that implements no
++    /// mutating inode operations sets this so the VFS refuses writes before reaching it.
++    const READ_ONLY: bool = false;
++
+     /// Determines if an implementation doesn't specify the required types.
+     ///
+     /// This is meant for internal use only.
+@@ -319,7 +323,9 @@ impl<T: FileSystem + ?Sized> Tables<T> {
+             // derived, is valid for write.
+             let sb = unsafe { &mut *new_sb.0.get() };
+             sb.s_op = &Tables::<T>::SUPER_BLOCK;
+-            sb.s_flags |= bindings::SB_RDONLY;
++            if T::READ_ONLY {
++                sb.s_flags |= bindings::SB_RDONLY;
++            }
+             sb.s_maxbytes = MAX_LFS_FILESIZE;
+             sb.s_blocksize = bindings::PAGE_SIZE as _;
+             sb.s_blocksize_bits = bindings::PAGE_SHIFT as _;
+diff --git a/rust/kernel/fs/dentry.rs b/rust/kernel/fs/dentry.rs
+index af1ce4cd7..cbde07f57 100644
+--- a/rust/kernel/fs/dentry.rs
++++ b/rust/kernel/fs/dentry.rs
+@@ -95,13 +95,35 @@ pub fn splice_alias(self, inode: Option<ARef<INode<T>>>) -> Result<Option<ARef<D
+         Ok(ptr::NonNull::new(ptr).map(|v| unsafe { ARef::from_raw(v.cast::<DEntry<T>>()) }))
+     }
+ 
++    /// Binds a new inode to this dentry and hashes it, as a file system does at the end of
++    /// `create`, `mkdir` or `symlink`. The inode reference moves into the dentry.
++    pub fn instantiate(self, inode: ARef<INode<T>>) -> Result {
++        if !ptr::eq(inode.super_block(), self.0.super_block()) {
++            return Err(EINVAL);
++        }
++        let inode_ptr = ManuallyDrop::new(inode).0.get();
++        // SAFETY: Both are valid; `d_instantiate` takes over the inode reference.
++        unsafe { bindings::d_instantiate(self.0 .0.get(), inode_ptr) };
++        Ok(())
++    }
++
+     /// Returns the name of the dentry.
+     ///
+     /// Being unhashed guarantees that the name won't change.
+     pub fn name(&self) -> &[u8] {
+-        // SAFETY: The name is immutable, so it is ok to read it.
+-        let name = unsafe { &*ptr::addr_of!((*self.0 .0.get()).__bindgen_anon_1.d_name) };
+-        // SAFETY: The name is immutable, so it is ok to read it.
++        self.0.name()
++    }
++}
++
++impl<T: FileSystem + ?Sized> DEntry<T> {
++    /// Returns the name of the dentry.
++    ///
++    /// The name of a hashed dentry can change under a rename; callers hold the parent
++    /// directory's lock, as every inode operation that is handed a dentry does.
++    pub fn name(&self) -> &[u8] {
++        // SAFETY: The dentry is valid; the caller holds the lock that keeps the name stable.
++        let name = unsafe { &*ptr::addr_of!((*self.0.get()).__bindgen_anon_1.d_name) };
++        // SAFETY: As above.
+         unsafe { qstr_bytes(name) }
+     }
+ }
+diff --git a/rust/kernel/fs/inode.rs b/rust/kernel/fs/inode.rs
+index 2158a8e83..44924e2c7 100644
+--- a/rust/kernel/fs/inode.rs
++++ b/rust/kernel/fs/inode.rs
+@@ -15,7 +15,11 @@
+ use crate::sync::aref::{ARef, AlwaysRefCounted};
+ use crate::sync::{Lockable, Locked};
+ use crate::types::{ForeignOwnable, Opaque};
+-use crate::{bindings, build_error, container_of, mem_cache::MemCache, str::CStrExt, str::CString};
++use crate::error::{from_result, to_result};
++use crate::{
++    bindings, build_error, container_of, ffi, mem_cache::MemCache, str::CStr, str::CStrExt,
++    str::CString,
++};
+ use core::mem::{size_of, ManuallyDrop, MaybeUninit};
+ use core::{marker::PhantomData, ptr};
+ use macros::vtable;
+@@ -48,6 +52,151 @@ fn lookup(
+     ) -> Result<Option<ARef<DEntry<Self::FileSystem>>>> {
+         Err(ENOTSUPP)
+     }
++
++    /// Creates a regular file named by `dentry` in `parent` and returns its inode, which the
++    /// VFS binds to the dentry. `mode` carries the permission bits; `excl` is `O_EXCL`.
++    fn create(
++        _parent: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _dentry: dentry::Unhashed<'_, Self::FileSystem>,
++        _mode: u16,
++        _excl: bool,
++    ) -> Result<ARef<INode<Self::FileSystem>>> {
++        Err(ENOTSUPP)
++    }
++
++    /// Creates a directory named by `dentry` in `parent` and returns its inode.
++    fn mkdir(
++        _parent: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _dentry: dentry::Unhashed<'_, Self::FileSystem>,
++        _mode: u16,
++    ) -> Result<ARef<INode<Self::FileSystem>>> {
++        Err(ENOTSUPP)
++    }
++
++    /// Creates a symbolic link to `target` named by `dentry` in `parent` and returns its inode.
++    fn symlink(
++        _parent: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _dentry: dentry::Unhashed<'_, Self::FileSystem>,
++        _target: &CStr,
++    ) -> Result<ARef<INode<Self::FileSystem>>> {
++        Err(ENOTSUPP)
++    }
++
++    /// Removes the name `dentry` from `parent`. The VFS drops the dentry afterwards; the
++    /// implementation accounts for the inode's lost link.
++    fn unlink(
++        _parent: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _dentry: &DEntry<Self::FileSystem>,
++    ) -> Result {
++        Err(ENOTSUPP)
++    }
++
++    /// Removes the empty directory `dentry` from `parent`.
++    fn rmdir(
++        _parent: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _dentry: &DEntry<Self::FileSystem>,
++    ) -> Result {
++        Err(ENOTSUPP)
++    }
++
++    /// Moves `old` in `old_parent` to the name `new` in `new_parent`, replacing whatever `new`
++    /// names. Both directories are locked; when they are the same directory, both arguments
++    /// refer to it. `flags` are the `RENAME_*` flags, which the implementation must check.
++    fn rename(
++        _old_parent: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _old: &DEntry<Self::FileSystem>,
++        _new_parent: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _new: &DEntry<Self::FileSystem>,
++        _flags: u32,
++    ) -> Result {
++        Err(ENOTSUPP)
++    }
++
++    /// Changes the attributes of `inode`, named by `dentry`, to those in `attr`. Permission
++    /// checks have been done; a size change also means truncating or extending the contents.
++    fn setattr(
++        _dentry: &DEntry<Self::FileSystem>,
++        _inode: &Locked<&INode<Self::FileSystem>, WriteSem>,
++        _attr: &SetAttr,
++    ) -> Result {
++        Err(ENOTSUPP)
++    }
++}
++
++/// The attribute changes a `setattr` call asks for.
++///
++/// Wraps the kernel's `struct iattr`: each accessor returns `Some` only for an attribute the
++/// caller is changing. Times are as the VFS filled them in, so a `touch` reads as the current
++/// time.
++#[repr(transparent)]
++pub struct SetAttr(Opaque<bindings::iattr>);
++
++impl SetAttr {
++    /// # Safety
++    ///
++    /// `ptr` must be valid for the lifetime of the returned reference.
++    unsafe fn from_raw<'a>(ptr: *mut bindings::iattr) -> &'a Self {
++        // SAFETY: Per the safety requirements; `SetAttr` is a transparent wrapper.
++        unsafe { &*ptr.cast() }
++    }
++
++    fn raw(&self) -> &bindings::iattr {
++        // SAFETY: The wrapped struct is valid and only read while this reference lives.
++        unsafe { &*self.0.get() }
++    }
++
++    fn has(&self, bit: u32) -> bool {
++        self.raw().ia_valid & bit != 0
++    }
++
++    /// The `ATTR_*` bits of the change.
++    pub fn valid(&self) -> u32 {
++        self.raw().ia_valid
++    }
++
++    /// New permission bits, type bits excluded.
++    pub fn mode(&self) -> Option<u16> {
++        self.has(bindings::ATTR_MODE).then(|| self.raw().ia_mode & 0o7777)
++    }
++
++    /// New owner.
++    pub fn uid(&self) -> Option<u32> {
++        // SAFETY: Both halves of the union hold the same value.
++        self.has(bindings::ATTR_UID).then(|| unsafe { self.raw().__bindgen_anon_1.ia_uid.val })
++    }
++
++    /// New group.
++    pub fn gid(&self) -> Option<u32> {
++        // SAFETY: Both halves of the union hold the same value.
++        self.has(bindings::ATTR_GID).then(|| unsafe { self.raw().__bindgen_anon_2.ia_gid.val })
++    }
++
++    /// New size.
++    pub fn size(&self) -> Option<Offset> {
++        self.has(bindings::ATTR_SIZE).then(|| self.raw().ia_size)
++    }
++
++    /// New access time.
++    pub fn atime(&self) -> Option<Timespec> {
++        self.has(bindings::ATTR_ATIME).then(|| ts(&self.raw().ia_atime))
++    }
++
++    /// New modification time.
++    pub fn mtime(&self) -> Option<Timespec> {
++        self.has(bindings::ATTR_MTIME).then(|| ts(&self.raw().ia_mtime))
++    }
++
++    /// The change time the VFS assigned to this change.
++    pub fn ctime(&self) -> Timespec {
++        ts(&self.raw().ia_ctime)
++    }
++}
++
++fn ts(t: &bindings::timespec64) -> Timespec {
++    Timespec {
++        sec: t.tv_sec,
++        nsec: u32::try_from(t.tv_nsec).unwrap_or(0),
++    }
+ }
+ 
+ /// A node (inode) in the file index.
+@@ -583,9 +732,189 @@ impl<T: Operations + ?Sized> Table<T> {
+                 } else {
+                     None
+                 },
++                create: if T::HAS_CREATE {
++                    Some(Self::create_callback)
++                } else {
++                    None
++                },
++                mkdir: if T::HAS_MKDIR {
++                    Some(Self::mkdir_callback)
++                } else {
++                    None
++                },
++                symlink: if T::HAS_SYMLINK {
++                    Some(Self::symlink_callback)
++                } else {
++                    None
++                },
++                unlink: if T::HAS_UNLINK {
++                    Some(Self::unlink_callback)
++                } else {
++                    None
++                },
++                rmdir: if T::HAS_RMDIR {
++                    Some(Self::rmdir_callback)
++                } else {
++                    None
++                },
++                rename: if T::HAS_RENAME {
++                    Some(Self::rename_callback)
++                } else {
++                    None
++                },
++                setattr: if T::HAS_SETATTR {
++                    Some(Self::setattr_callback)
++                } else {
++                    None
++                },
+                 ..pin_init::zeroed()
+             };
+ 
++            /// The directory the VFS locked exclusively before calling a mutating operation.
++            ///
++            /// # Safety
++            ///
++            /// `dir` must be a valid inode whose rw semaphore is held exclusively.
++            unsafe fn locked_dir<'a>(
++                dir: *mut bindings::inode,
++            ) -> ManuallyDrop<Locked<&'a INode<T::FileSystem>, WriteSem>> {
++                // SAFETY: Per the safety requirements.
++                let parent = unsafe { INode::from_raw(dir) };
++                // SAFETY: The VFS holds the lock and expects it to be held on return, hence
++                // the `ManuallyDrop`.
++                ManuallyDrop::new(unsafe { Locked::new(parent) })
++            }
++
++            unsafe extern "C" fn create_callback(
++                _idmap: *mut bindings::mnt_idmap,
++                dir: *mut bindings::inode,
++                dentry_ptr: *mut bindings::dentry,
++                mode: bindings::umode_t,
++                excl: bool,
++            ) -> ffi::c_int {
++                from_result(|| {
++                    // SAFETY: The VFS passes a valid, exclusively locked directory.
++                    let parent = unsafe { Self::locked_dir(dir) };
++                    // SAFETY: The VFS passes a valid, unhashed dentry.
++                    let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++                    let inode = T::create(&parent, dentry::Unhashed(dentry), mode & 0o7777, excl)?;
++                    dentry::Unhashed(dentry).instantiate(inode)?;
++                    Ok(0)
++                })
++            }
++
++            unsafe extern "C" fn mkdir_callback(
++                _idmap: *mut bindings::mnt_idmap,
++                dir: *mut bindings::inode,
++                dentry_ptr: *mut bindings::dentry,
++                mode: bindings::umode_t,
++            ) -> *mut bindings::dentry {
++                let result = (|| {
++                    // SAFETY: The VFS passes a valid, exclusively locked directory.
++                    let parent = unsafe { Self::locked_dir(dir) };
++                    // SAFETY: The VFS passes a valid, unhashed dentry.
++                    let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++                    let inode = T::mkdir(&parent, dentry::Unhashed(dentry), mode & 0o7777)?;
++                    dentry::Unhashed(dentry).instantiate(inode)
++                })();
++                match result {
++                    // Null tells the VFS the dentry it passed is the one to use.
++                    Ok(()) => ptr::null_mut(),
++                    Err(e) => e.to_ptr(),
++                }
++            }
++
++            unsafe extern "C" fn symlink_callback(
++                _idmap: *mut bindings::mnt_idmap,
++                dir: *mut bindings::inode,
++                dentry_ptr: *mut bindings::dentry,
++                target: *const ffi::c_char,
++            ) -> ffi::c_int {
++                from_result(|| {
++                    // SAFETY: The VFS passes a valid, exclusively locked directory.
++                    let parent = unsafe { Self::locked_dir(dir) };
++                    // SAFETY: The VFS passes a valid, unhashed dentry.
++                    let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++                    // SAFETY: The VFS passes a NUL-terminated target that outlives the call.
++                    let target = unsafe { CStr::from_char_ptr(target) };
++                    let inode = T::symlink(&parent, dentry::Unhashed(dentry), target)?;
++                    dentry::Unhashed(dentry).instantiate(inode)?;
++                    Ok(0)
++                })
++            }
++
++            unsafe extern "C" fn unlink_callback(
++                dir: *mut bindings::inode,
++                dentry_ptr: *mut bindings::dentry,
++            ) -> ffi::c_int {
++                from_result(|| {
++                    // SAFETY: The VFS passes a valid, exclusively locked directory.
++                    let parent = unsafe { Self::locked_dir(dir) };
++                    // SAFETY: The VFS passes a valid dentry.
++                    let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++                    T::unlink(&parent, dentry)?;
++                    Ok(0)
++                })
++            }
++
++            unsafe extern "C" fn rmdir_callback(
++                dir: *mut bindings::inode,
++                dentry_ptr: *mut bindings::dentry,
++            ) -> ffi::c_int {
++                from_result(|| {
++                    // SAFETY: The VFS passes a valid, exclusively locked directory.
++                    let parent = unsafe { Self::locked_dir(dir) };
++                    // SAFETY: The VFS passes a valid dentry.
++                    let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++                    T::rmdir(&parent, dentry)?;
++                    Ok(0)
++                })
++            }
++
++            unsafe extern "C" fn rename_callback(
++                _idmap: *mut bindings::mnt_idmap,
++                old_dir: *mut bindings::inode,
++                old_ptr: *mut bindings::dentry,
++                new_dir: *mut bindings::inode,
++                new_ptr: *mut bindings::dentry,
++                flags: ffi::c_uint,
++            ) -> ffi::c_int {
++                from_result(|| {
++                    // SAFETY: The VFS locked both directories (once, if they are the same)
++                    // before calling and unlocks them after.
++                    let old_parent = unsafe { Self::locked_dir(old_dir) };
++                    // SAFETY: As above.
++                    let new_parent = unsafe { Self::locked_dir(new_dir) };
++                    // SAFETY: The VFS passes valid dentries.
++                    let old = unsafe { DEntry::from_raw(old_ptr) };
++                    // SAFETY: As above.
++                    let new = unsafe { DEntry::from_raw(new_ptr) };
++                    T::rename(&old_parent, old, &new_parent, new, flags)?;
++                    Ok(0)
++                })
++            }
++
++            unsafe extern "C" fn setattr_callback(
++                idmap: *mut bindings::mnt_idmap,
++                dentry_ptr: *mut bindings::dentry,
++                attr: *mut bindings::iattr,
++            ) -> ffi::c_int {
++                from_result(|| {
++                    // SAFETY: All three pointers are valid per the callback contract. This is
++                    // the generic permission check every file system runs first.
++                    to_result(unsafe { bindings::setattr_prepare(idmap, dentry_ptr, attr) })?;
++                    // SAFETY: The VFS passes a valid dentry.
++                    let dentry = unsafe { DEntry::from_raw(dentry_ptr) };
++                    let inode = dentry.inode().ok_or(EINVAL)?;
++                    // SAFETY: The VFS holds the inode's rw semaphore exclusively around
++                    // `setattr` and expects it held on return.
++                    let locked = ManuallyDrop::new(unsafe { Locked::<_, WriteSem>::new(inode) });
++                    // SAFETY: `attr` is valid for the call.
++                    T::setattr(dentry, &locked, unsafe { SetAttr::from_raw(attr) })?;
++                    Ok(0)
++                })
++            }
++
+             unsafe extern "C" fn lookup_callback(
+                 parent_ptr: *mut bindings::inode,
+                 dentry_ptr: *mut bindings::dentry,
+diff --git a/samples/rust/rust_rofs.rs b/samples/rust/rust_rofs.rs
+index 72421c189..706b2a746 100644
+--- a/samples/rust/rust_rofs.rs
++++ b/samples/rust/rust_rofs.rs
+@@ -106,6 +106,7 @@ impl fs::FileSystem for RoFs {
+     type Data = ();
+     type INodeData = &'static Entry;
+     const NAME: &'static CStr = c_str!("rust_rofs");
++    const READ_ONLY: bool = true;
+ 
+     fn fill_super(sb: &mut sb::SuperBlock<Self, sb::New>, _source: Option<&CStr>) -> Result {
+         sb.set_magic(0x52555354);

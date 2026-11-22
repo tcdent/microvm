@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 14:24:31 -0700
+Subject: [PATCH 21/38] rust: fs: hand fill_super the mount source
+
+A file system type that serves several instances, one per device, needs
+to know which one a mount is for. Pass `fs_context::source` to
+`FileSystem::fill_super` as an `Option<&CStr>`; the sample ignores it.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/kernel/fs.rs         | 16 +++++++++++-----
+ samples/rust/rust_rofs.rs |  2 +-
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/rust/kernel/fs.rs b/rust/kernel/fs.rs
+index 8e6e2fb84..799780b7a 100644
+--- a/rust/kernel/fs.rs
++++ b/rust/kernel/fs.rs
+@@ -146,7 +146,10 @@ pub trait FileSystem {
+     const IS_UNSPECIFIED: bool = false;
+ 
+     /// Initialises the new superblock and returns the data to attach to it.
+-    fn fill_super(sb: &mut SuperBlock<Self, sb::New>) -> Result<Self::Data>;
++    ///
++    /// `source` is the mount's source string (the first argument to `mount(8)`), if one was
++    /// given; file systems that serve several instances pick theirs by it.
++    fn fill_super(sb: &mut SuperBlock<Self, sb::New>, source: Option<&CStr>) -> Result<Self::Data>;
+ 
+     /// Initialises and returns the root inode of the given superblock.
+     ///
+@@ -201,7 +204,7 @@ impl FileSystem for UnspecifiedFS {
+     const NAME: &'static CStr = crate::c_str!("unspecified");
+     const IS_UNSPECIFIED: bool = true;
+ 
+-    fn fill_super(_: &mut SuperBlock<Self, sb::New>) -> Result {
++    fn fill_super(_: &mut SuperBlock<Self, sb::New>, _: Option<&CStr>) -> Result {
+         Err(ENOTSUPP)
+     }
+ 
+@@ -305,7 +308,7 @@ impl<T: FileSystem + ?Sized> Tables<T> {
+ 
+     unsafe extern "C" fn fill_super_callback(
+         sb_ptr: *mut bindings::super_block,
+-        _fc: *mut bindings::fs_context,
++        fc: *mut bindings::fs_context,
+     ) -> ffi::c_int {
+         from_result(|| {
+             // SAFETY: The callback contract guarantees that `sb_ptr` is a unique pointer to a
+@@ -327,7 +330,10 @@ impl<T: FileSystem + ?Sized> Tables<T> {
+                 unsafe { bindings::set_default_d_op(sb_ptr, dops.0) };
+             }
+ 
+-            let data = T::fill_super(new_sb)?;
++            // SAFETY: `fc` is valid per the callback contract; `source` is either null or a
++            // NUL-terminated string the context owns for longer than this call.
++            let source = unsafe { (*fc).source.as_ref().map(|p| CStr::from_char_ptr(p)) };
++            let data = T::fill_super(new_sb, source)?;
+ 
+             // N.B.: Even on failure, `kill_sb` is called and frees the data.
+             sb.s_fs_info = data.into_foreign();
+@@ -413,7 +419,7 @@ impl<T: FileSystem + ?Sized> Tables<T> {
+ ///     type Data = ();
+ ///     type INodeData = ();
+ ///     const NAME: &'static CStr = kernel::c_str!("myfs");
+-///     fn fill_super(_: &mut SuperBlock<Self, sb::New>) -> Result {
++///     fn fill_super(_: &mut SuperBlock<Self, sb::New>, _: Option<&CStr>) -> Result {
+ ///         todo!()
+ ///     }
+ ///     fn init_root(_sb: &SuperBlock<Self>) -> Result<dentry::Root<Self>> {
+diff --git a/samples/rust/rust_rofs.rs b/samples/rust/rust_rofs.rs
+index 5d92f0ef8..72421c189 100644
+--- a/samples/rust/rust_rofs.rs
++++ b/samples/rust/rust_rofs.rs
+@@ -107,7 +107,7 @@ impl fs::FileSystem for RoFs {
+     type INodeData = &'static Entry;
+     const NAME: &'static CStr = c_str!("rust_rofs");
+ 
+-    fn fill_super(sb: &mut sb::SuperBlock<Self, sb::New>) -> Result {
++    fn fill_super(sb: &mut sb::SuperBlock<Self, sb::New>, _source: Option<&CStr>) -> Result {
+         sb.set_magic(0x52555354);
+         Ok(())
+     }

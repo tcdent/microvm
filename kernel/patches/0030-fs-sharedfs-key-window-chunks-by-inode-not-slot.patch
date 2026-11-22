@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Mon, 12 Oct 2026 14:19:35 -0700
+Subject: [PATCH 30/38] fs: sharedfs: key window chunks by inode, not slot
+
+The chunk table keyed chunks by index slot alone. A file unlinked while
+still mmapped keeps its guest inode, but the host frees its slot at once,
+and the next file created can reuse it. That file's writes then found the
+old file's chunk and went into the unlinked file's pages: they read back
+until the old mapping was torn down, after which the new file held zeros.
+The old inode's teardown also released every chunk under the slot, the
+new file's included, and reclaim found "the inode behind a chunk" through
+the slot's current generation, missing the old file's mappings. Writes
+that needed more space than the old file had mapped spun in
+dax_iomap_rw.
+
+Chunks are now keyed by inode number, which carries the generation, and
+the inode behind a chunk is looked up by that number directly.
+
+Reported-by: tablet.kernel@a10k.internal
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ fs/sharedfs/data.rs     | 34 ++++++++++++++--------------------
+ fs/sharedfs/sharedfs.rs |  3 +--
+ 2 files changed, 15 insertions(+), 22 deletions(-)
+
+diff --git a/fs/sharedfs/data.rs b/fs/sharedfs/data.rs
+index 1e243f7e9..d2ef42977 100644
+--- a/fs/sharedfs/data.rs
++++ b/fs/sharedfs/data.rs
+@@ -16,7 +16,7 @@
+ };
+ 
+ use crate::queue::{map, op, Req, Session, HEADER_LEN};
+-use crate::{ino_of, SharedFs};
++use crate::SharedFs;
+ 
+ /// Mapping granularity, matching the host.
+ pub(crate) const CHUNK: u64 = 2 << 20;
+@@ -39,7 +39,10 @@ struct Chunk {
+ }
+ 
+ /// Key: index slot and chunk index within the file.
+-type Key = (u32, u32);
++/// A chunk of a file: the file's inode number and the chunk's index within it. The inode
++/// number carries the entry's generation, so a file unlinked while still mapped keeps its
++/// chunks apart from those of a new file that reuses its slot.
++type Key = (u64, u32);
+ 
+ pub(crate) struct Maps {
+     tree: RBTree<Key, Chunk>,
+@@ -92,13 +95,6 @@ fn take_victim(&mut self) -> Option<(Key, Chunk)> {
+     }
+ }
+ 
+-fn encode_key(key: Key) -> usize {
+-    ((key.0 as usize) << 32) | key.1 as usize
+-}
+-
+-fn decode_key(private: usize) -> Key {
+-    ((private >> 32) as u32, private as u32)
+-}
+ 
+ /// A file the guest has open for writing; the daemon holds one write handle for it.
+ pub(crate) struct Writer {
+@@ -211,7 +207,7 @@ pub(crate) fn fsync(&self, ino: u64) -> Result {
+     /// for writing when `write`, and counts the caller as a user of it.
+     fn ensure_chunk(&self, inode: &INode<SharedFs>, idx: u32, write: bool, fault: bool) -> Result<u64> {
+         let node = inode.data();
+-        let key = (node.slot, idx);
++        let key = (inode.ino(), idx);
+         let ino = inode.ino();
+         let foff = u64::from(idx) * CHUNK;
+         loop {
+@@ -259,7 +255,7 @@ fn reclaim_one(&self, current: &INode<SharedFs>) -> Result {
+         let sb = current.super_block();
+         let (key, chunk) = {
+             let mut maps = self.maps.lock();
+-            let mine = current.data().slot;
++            let mine = current.ino();
+             // Prefer another file's chunk; fall back to one of our own that is idle.
+             let pick = maps
+                 .tree
+@@ -276,9 +272,8 @@ fn reclaim_one(&self, current: &INode<SharedFs>) -> Result {
+             }
+         };
+         let start = u64::from(key.1) * CHUNK;
+-        let cached = self.index.live(key.0).and_then(|e| sb.cached_inode(ino_of(key.0, e.generation)));
+-        if let Some(inode) = cached {
+-            if key.0 != current.data().slot {
++        if let Some(inode) = sb.cached_inode(key.0) {
++            if key.0 != current.ino() {
+                 // Nobody may keep pages of the range mapped once the window behind it moves.
+                 dax::break_layout(&inode, start as Offset, (start + CHUNK - 1) as Offset)?;
+             } else {
+@@ -303,8 +298,7 @@ pub(crate) fn drop_window(&self) {
+         if let Some(m) = mount.as_ref() {
+             let sb = m.sb();
+             for (key, _) in maps.tree.iter() {
+-                let inode = self.index.live(key.0).and_then(|e| sb.cached_inode(ino_of(key.0, e.generation)));
+-                if let Some(inode) = inode {
++                if let Some(inode) = sb.cached_inode(key.0) {
+                     let start = u64::from(key.1) * CHUNK;
+                     let _ = dax::break_layout(&inode, start as Offset, (start + CHUNK - 1) as Offset);
+                 }
+@@ -314,11 +308,11 @@ pub(crate) fn drop_window(&self) {
+         *maps = Maps::new(limit);
+     }
+ 
+-    pub(crate) fn release_slot(&self, slot: u32) {
++    pub(crate) fn release_file(&self, ino: u64) {
+         let mut maps = self.maps.lock();
+         let keys: KVec<Key> = {
+             let mut v = KVec::new();
+-            for k in maps.tree.keys().filter(|k| k.0 == slot) {
++            for k in maps.tree.keys().filter(|k| k.0 == ino) {
+                 let _ = v.push(*k, GFP_KERNEL);
+             }
+             v
+@@ -369,11 +363,11 @@ fn begin(inode: &INode<SharedFs>, pos: Offset, length: Offset, flags: u32) -> Re
+             device: dax,
+             window_offset: woff + off,
+             length: len,
+-            private: encode_key((inode.data().slot, idx)),
++            private: idx as usize,
+         })
+     }
+ 
+     fn end(inode: &INode<SharedFs>, _pos: Offset, _length: Offset, _written: isize, _flags: u32, private: usize) {
+-        inode.super_block().data().session.put_chunk(decode_key(private));
++        inode.super_block().data().session.put_chunk((inode.ino(), private as u32));
+     }
+ }
+diff --git a/fs/sharedfs/sharedfs.rs b/fs/sharedfs/sharedfs.rs
+index ba64a0515..865b6beff 100644
+--- a/fs/sharedfs/sharedfs.rs
++++ b/fs/sharedfs/sharedfs.rs
+@@ -199,7 +199,7 @@ pub(crate) struct Node {
+ impl Drop for Node {
+     fn drop(&mut self) {
+         // The VFS has already dropped the inode's pages; give its window chunks back.
+-        self.session.release_slot(self.slot);
++        self.session.release_file(ino_of(self.slot, self.generation));
+     }
+ }
+ 
+@@ -329,7 +329,6 @@ pub(crate) fn on_event(
+             return;
+         }
+         let sb = self.sb();
+-        let index = &sb.data().session.index;
+         let dir = index.live(parent).and_then(|p| sb.cached_inode(ino_of(parent, p.generation)));
+         let mut child = sb.cached_inode(ino_of(slot, generation));
+         if child.is_none() && dir.is_some() && mask & (notify::DELETE | notify::MOVED_FROM) == 0 {

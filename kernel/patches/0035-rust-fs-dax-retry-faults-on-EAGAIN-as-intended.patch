@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Mon, 12 Oct 2026 16:24:58 -0700
+Subject: [PATCH 35/38] rust: fs: dax: retry faults on EAGAIN as intended
+
+The fault handler retried when the iomap error equalled
+`-EAGAIN.to_errno()`, but `to_errno` is already negative, so the
+comparison never held and every EAGAIN from `begin` became SIGBUS for
+the faulting process.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/kernel/fs/dax.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/rust/kernel/fs/dax.rs b/rust/kernel/fs/dax.rs
+index 898aec3c1..25bee9bef 100644
+--- a/rust/kernel/fs/dax.rs
++++ b/rust/kernel/fs/dax.rs
+@@ -371,7 +371,8 @@ fn serve_fault(vmf: *mut bindings::vm_fault, order: u32, write: bool) -> binding
+             let ret = unsafe { bindings::dax_iomap_fault(vmf, order, &mut pfn, &mut err, &Self::TABLE) };
+             // SAFETY: Taken above.
+             unsafe { bindings::filemap_invalidate_unlock_shared(mapping) };
+-            if ret & VM_FAULT_ERROR != 0 && err == -EAGAIN.to_errno() {
++            // `to_errno` is already negative, as `err` is.
++            if ret & VM_FAULT_ERROR != 0 && err == EAGAIN.to_errno() {
+                 // The window is full and a fault cannot reclaim: give reclaim a moment.
+                 // SAFETY: Process context; sleeping is allowed in a fault handler.
+                 unsafe { bindings::msleep(1) };

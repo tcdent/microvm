@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: slomp <root@a10k-cap.com>
+Date: Sat, 10 Oct 2026 15:43:58 -0700
+Subject: [PATCH 07/38] rust: virtio: forward-port RFC v3 to the 7.2 driver
+ model
+
+The series predates two driver-model changes: DriverLayout::DriverData
+became a generic associated type, and the drvdata accessors moved to the
+core device context. Match the GAT, and give virtio::Device<Bound> a
+crate-backed drvdata() so virtqueue callbacks can reach their driver, as
+the sample does.
+---
+ rust/kernel/device.rs           |  2 +-
+ rust/kernel/virtio.rs           | 18 +++++++++++++++++-
+ samples/rust/rust_virtio_rtc.rs |  7 +++----
+ 3 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/rust/kernel/device.rs b/rust/kernel/device.rs
+index 9ff898d85..3e23b4f5f 100644
+--- a/rust/kernel/device.rs
++++ b/rust/kernel/device.rs
+@@ -260,7 +260,7 @@ impl Device<Bound> {
+     ///   the device is fully unbound.
+     /// - The type `T` must match the type of the `ForeignOwnable` previously stored by
+     ///   [`Device::set_drvdata`].
+-    unsafe fn drvdata_unchecked<T>(&self) -> Pin<&T> {
++    pub(crate) unsafe fn drvdata_unchecked<T>(&self) -> Pin<&T> {
+         // SAFETY: By the type invariants, `self.as_raw()` is a valid pointer to a `struct device`.
+         let ptr = unsafe { bindings::dev_get_drvdata(self.as_raw()) };
+ 
+diff --git a/rust/kernel/virtio.rs b/rust/kernel/virtio.rs
+index a5a4e2cfe..011573b18 100644
+--- a/rust/kernel/virtio.rs
++++ b/rust/kernel/virtio.rs
+@@ -237,6 +237,22 @@ pub fn has_feature(&self, fbit: c_uint) -> bool {
+     }
+ }
+ 
++impl Device<crate::device::Bound> {
++    /// Borrow the driver's private data from a bound device.
++    ///
++    /// Virtqueue callbacks receive only the virtqueue; this is how they reach the driver that
++    /// owns it. Mirrors what the subsystem adapters do internally.
++    ///
++    /// # Safety
++    ///
++    /// `T` must be the driver type whose [`Driver::probe`] bound this device.
++    pub unsafe fn drvdata<T: Driver>(&self) -> Pin<&T> {
++        // SAFETY: by the caller's contract the stored drvdata is a `T`, and a `Bound` device
++        // guarantees it is still alive.
++        unsafe { self.as_ref().drvdata_unchecked::<T>() }
++    }
++}
++
+ impl<Ctx: crate::device::DeviceContext> AsRef<crate::device::Device<Ctx>> for Device<Ctx> {
+     #[inline]
+     fn as_ref(&self) -> &crate::device::Device<Ctx> {
+@@ -259,7 +275,7 @@ fn as_ref(&self) -> &crate::device::Device<Ctx> {
+ // - `DEVICE_DRIVER_OFFSET` is the correct byte offset to the embedded `struct device_driver`.
+ unsafe impl<T: Driver + 'static> crate::driver::DriverLayout for Adapter<T> {
+     type DriverType = bindings::virtio_driver;
+-    type DriverData = T;
++    type DriverData<'bound> = T;
+     const DEVICE_DRIVER_OFFSET: usize = core::mem::offset_of!(Self::DriverType, driver);
+ }
+ 
+diff --git a/samples/rust/rust_virtio_rtc.rs b/samples/rust/rust_virtio_rtc.rs
+index 81f8b377f..2f7fe8c27 100644
+--- a/samples/rust/rust_virtio_rtc.rs
++++ b/samples/rust/rust_virtio_rtc.rs
+@@ -222,10 +222,9 @@ extern "C" fn vq_requestq_callback(vq: *mut kernel::bindings::virtqueue) {
+     // pointer
+     let vq = unsafe { Virtqueue::from_raw(vq) };
+     let dev: &virtio::Device<Bound> = vq.dev().expect("Could not get device");
+-    let data = dev
+-        .as_ref()
+-        .drvdata::<VirtioRtcDriver>()
+-        .expect("Could not borrow drvdata");
++    // SAFETY: this callback only runs while the device is bound, after `probe_callback`
++    // stored the driver as drvdata.
++    let data = unsafe { dev.drvdata::<VirtioRtcDriver>() };
+     data.process_requestq();
+ }
+ 

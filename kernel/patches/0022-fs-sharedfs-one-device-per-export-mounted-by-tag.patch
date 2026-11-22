@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 14:24:32 -0700
+Subject: [PATCH 22/38] fs: sharedfs: one device per export, mounted by tag
+
+A guest may carry several exports: the project tree and the host's
+configuration directory, for instance. Each is its own virtio device
+with its own index, window and queues, and carries a tag NUL-padded at
+the start of its configuration space, laid out as virtio-fs lays out
+its tag. The driver keeps the bound sessions in a list keyed by tag,
+refuses a second device with the same tag, and a mount names the tag as
+its source: `mount -t sharedfs config /home/user/.config`.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ fs/sharedfs/queue.rs    |  5 ++++-
+ fs/sharedfs/sharedfs.rs | 48 ++++++++++++++++++++++++++++-------------
+ 2 files changed, 37 insertions(+), 16 deletions(-)
+
+diff --git a/fs/sharedfs/queue.rs b/fs/sharedfs/queue.rs
+index b20f0be13..9f58b11f1 100644
+--- a/fs/sharedfs/queue.rs
++++ b/fs/sharedfs/queue.rs
+@@ -137,6 +137,8 @@ fn notify_buf_index(&self, token: NonNull<u8>) -> Option<usize> {
+ /// every mount of the file system.
+ #[pin_data]
+ pub(crate) struct Session {
++    /// The export's tag, from the device's configuration space; a mount names it as its source.
++    pub(crate) tag: KVec<u8>,
+     pub(crate) index: Index,
+     /// The data window and its DAX device, when the device offers a window.
+     pub(crate) dax: Option<Dax>,
+@@ -167,7 +169,7 @@ struct Token {
+ }
+ 
+ impl Session {
+-    pub(crate) fn new(index: Index, dax: Option<Dax>, vqs: Virtqueues) -> Result<Arc<Self>> {
++    pub(crate) fn new(tag: KVec<u8>, index: Index, dax: Option<Dax>, vqs: Virtqueues) -> Result<Arc<Self>> {
+         if vqs.len() != 2 {
+             return Err(EINVAL);
+         }
+@@ -178,6 +180,7 @@ pub(crate) fn new(index: Index, dax: Option<Dax>, vqs: Virtqueues) -> Result<Arc
+         let window_len = dax.as_ref().map_or(0, |d| d.window().len());
+         Arc::pin_init(
+             try_pin_init!(Self {
++                tag,
+                 index,
+                 dax,
+                 maps <- kernel::new_mutex!(Maps::new(window_len)),
+diff --git a/fs/sharedfs/sharedfs.rs b/fs/sharedfs/sharedfs.rs
+index 077c31c5f..e883c6db1 100644
+--- a/fs/sharedfs/sharedfs.rs
++++ b/fs/sharedfs/sharedfs.rs
+@@ -9,8 +9,8 @@
+ //! Mutations and mapping requests go over a virtqueue; host-side changes come back on a second
+ //! one and are raised as fsnotify events in the guest.
+ //!
+-//! One kernel module binds the virtio device and registers the file system type. A mount takes
+-//! the session of the bound device.
++//! One kernel module binds the virtio devices and registers the file system type. Each device is
++//! one export and carries a tag in its configuration space; a mount names the tag as its source.
+ 
+ mod data;
+ mod index;
+@@ -33,7 +33,6 @@
+     virtio::virtqueue::{Virtqueue, VirtqueueInfo},
+ };
+ 
+-use data::Dax;
+ use index::{Entry, Index, NO_SLOT, ROOT_SLOT};
+ use queue::{op, Req, Resp, Session, HEADER_LEN};
+ 
+@@ -46,11 +45,18 @@
+ /// Shared memory region ids the device exposes.
+ const SHM_INDEX: u8 = 0;
+ const SHM_WINDOW: u8 = 1;
++/// The export tag: NUL-padded at the start of the device configuration space, as virtio-fs does.
++const TAG_LEN: usize = 36;
+ 
+ kernel::sync::global_lock! {
+     // SAFETY: Initialised in `SharedFsModule::init`, before the device driver or the file system
+     // type is registered.
+-    unsafe(uninit) static SESSION: Mutex<Option<Arc<Session>>> = None;
++    unsafe(uninit) static SESSIONS: Mutex<KVec<Arc<Session>>> = KVec::new();
++}
++
++/// The bound session whose tag is `tag`.
++fn session_by_tag(tag: &[u8]) -> Option<Arc<Session>> {
++    SESSIONS.lock().iter().find(|s| s.tag.as_slice() == tag).cloned()
+ }
+ 
+ // ---------------------------------------------------------------------------------------------
+@@ -84,12 +90,26 @@ fn probe(vdev: &virtio::Device<Core>) -> impl PinInit<Self, Error> {
+         ];
+         try_pin_init!(Self {
+             session: {
++                let mut raw = [0u8; TAG_LEN];
++                vdev.config_read(0, &mut raw);
++                let end = raw.iter().position(|&b| b == 0).unwrap_or(TAG_LEN);
++                if end == 0 {
++                    pr_err!("device has no tag\n");
++                    return Err(EINVAL);
++                }
++                let mut tag = KVec::new();
++                tag.extend_from_slice(&raw[..end], GFP_KERNEL)?;
++                if session_by_tag(&tag).is_some() {
++                    pr_err!("tag {} already bound\n", core::str::from_utf8(&tag).unwrap_or("?"));
++                    return Err(EEXIST);
++                }
+                 let region = vdev.shm_region(SHM_INDEX).ok_or(ENODEV)?;
+                 // SAFETY: The region was reported by the device for this driver.
+                 let index = unsafe { Index::map(region.addr, region.len) }?;
+                 let h = index.header();
+                 pr_info!(
+-                    "index {} MiB at {:#x}: {} slots ({} live), table {}\n",
++                    "{}: index {} MiB at {:#x}: {} slots ({} live), table {}\n",
++                    core::str::from_utf8(&tag).unwrap_or("?"),
+                     index.len() >> 20,
+                     region.addr,
+                     h.entry_cap,
+@@ -109,8 +129,8 @@ fn probe(vdev: &virtio::Device<Core>) -> impl PinInit<Self, Error> {
+                         None
+                     }
+                 };
+-                let session = Session::new(index, dax, vdev.find_vqs(&vqs_info)?)?;
+-                *SESSION.lock() = Some(session.clone());
++                let session = Session::new(tag, index, dax, vdev.find_vqs(&vqs_info)?)?;
++                SESSIONS.lock().push(session.clone(), GFP_KERNEL)?;
+                 session
+             },
+         })
+@@ -123,11 +143,8 @@ fn init(&self, _vdev: &virtio::Device<Bound>) -> Result {
+     }
+ 
+     fn remove(_vdev: &virtio::Device<Core>, this: core::pin::Pin<&Self>) {
+-        let mut session = SESSION.lock();
+-        if session.as_ref().is_some_and(|s| Arc::ptr_eq(s, &this.session)) {
+-            *session = None;
+-        }
+-        pr_info!("unbound\n");
++        SESSIONS.lock().retain(|s| !Arc::ptr_eq(s, &this.session));
++        pr_info!("{}: unbound\n", core::str::from_utf8(&this.session.tag).unwrap_or("?"));
+     }
+ }
+ 
+@@ -378,8 +395,9 @@ impl fs::FileSystem for SharedFs {
+     const NAME: &'static CStr = c"sharedfs";
+     const DENTRY_OPS: Option<dentry::Ops<Self>> = Some(DENTRY_OPS);
+ 
+-    fn fill_super(sb: &mut sb::SuperBlock<Self, sb::New>) -> Result<KBox<MountData>> {
+-        let session = SESSION.lock().as_ref().cloned().ok_or(ENODEV)?;
++    fn fill_super(sb: &mut sb::SuperBlock<Self, sb::New>, source: Option<&CStr>) -> Result<KBox<MountData>> {
++        let tag = source.ok_or(EINVAL)?;
++        let session = session_by_tag(tag.to_bytes()).ok_or(ENODEV)?;
+         if session.mount.lock().is_some() {
+             // One mount per session for now; a second would need its own notification fan-out.
+             return Err(EBUSY);
+@@ -621,7 +639,7 @@ struct SharedFsModule {
+ impl kernel::InPlaceModule for SharedFsModule {
+     fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
+         // SAFETY: Module init runs once, before anything can touch the lock.
+-        unsafe { SESSION.init() };
++        unsafe { SESSIONS.init() };
+         try_pin_init!(Self {
+             driver <- kernel::driver::Registration::new(c"sharedfs", module),
+             fs <- fs::Registration::new::<SharedFs>(module),

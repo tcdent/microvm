@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sun, 11 Oct 2026 16:57:38 -0700
+Subject: [PATCH 27/38] fs: sharedfs: survive hibernation
+
+On freeze every window mapping is torn down, unmapping the ranges from
+processes first, and the virtqueues are given up. On restore the queues
+are found again and the notification buffers reposted. The mount and its
+inodes live on in the image: the daemon that answers after a resume is a
+new one with the same persisted index, so inode numbers stay valid, and
+it reports what changed in the directory while no daemon was watching.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ fs/sharedfs/queue.rs | 53 +++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/fs/sharedfs/queue.rs b/fs/sharedfs/queue.rs
+index c13eed78d..4dd41941e 100644
+--- a/fs/sharedfs/queue.rs
++++ b/fs/sharedfs/queue.rs
+@@ -119,21 +119,24 @@ unsafe impl Send for Vqs {}
+ unsafe impl Sync for Vqs {}
+ 
+ struct Queue {
+-    vqs: Vqs,
++    /// `None` between freeze and restore, when the device has no queues.
++    vqs: Option<Vqs>,
+     next_unique: u64,
+     /// Buffers posted on the notification queue; a buffer's address is its token.
+     notify_bufs: KVec<KBox<[u8; NOTIFY_BUF]>>,
+ }
+ 
+ impl Queue {
+-    fn vq(&self) -> &Virtqueue {
++    fn vq(&self) -> Result<&Virtqueue> {
++        let vqs = self.vqs.as_ref().ok_or(ENODEV)?;
+         // SAFETY: `find_vqs` returned two valid queues, owned by `vqs`.
+-        unsafe { self.vqs.0[REQUEST_VQ].as_ref() }
++        Ok(unsafe { vqs.0[REQUEST_VQ].as_ref() })
+     }
+ 
+-    fn notify_vq(&self) -> &Virtqueue {
++    fn notify_vq(&self) -> Result<&Virtqueue> {
++        let vqs = self.vqs.as_ref().ok_or(ENODEV)?;
+         // SAFETY: As above.
+-        unsafe { self.vqs.0[NOTIFY_VQ].as_ref() }
++        Ok(unsafe { vqs.0[NOTIFY_VQ].as_ref() })
+     }
+ 
+     /// Hands notification buffer `i` to the device.
+@@ -145,7 +148,7 @@ fn post_notify_buf(&mut self, i: usize) -> Result {
+         let mut sgs = [&raw mut sg];
+         // SAFETY: The buffer lives as long as the queue, nothing reads it until the device
+         // returns it, and the token is its own address. The caller holds the queue mutex.
+-        unsafe { self.notify_vq().add_sgs_raw(&mut sgs, 0, buf.cast(), GFP_KERNEL) }
++        unsafe { self.notify_vq()?.add_sgs_raw(&mut sgs, 0, buf.cast(), GFP_KERNEL) }
+     }
+ 
+     fn notify_buf_index(&self, token: NonNull<u8>) -> Option<usize> {
+@@ -204,7 +207,7 @@ pub(crate) fn new(tag: KVec<u8>, index: Index, dax: Option<Dax>, vqs: Virtqueues
+                 index,
+                 dax,
+                 maps <- kernel::new_mutex!(Maps::new(window_len)),
+-                queue <- kernel::new_mutex!(Queue { vqs: Vqs(vqs), next_unique: 1, notify_bufs }),
++                queue <- kernel::new_mutex!(Queue { vqs: Some(Vqs(vqs)), next_unique: 1, notify_bufs }),
+                 drain <- new_work!("sharedfs::drain"),
+                 mount <- kernel::new_mutex!(None),
+             }),
+@@ -218,7 +221,30 @@ pub(crate) fn start_notifications(&self) -> Result {
+         for i in 0..NOTIFY_BUFS {
+             q.post_notify_buf(i)?;
+         }
+-        q.notify_vq().kick();
++        q.notify_vq()?.kick();
++        Ok(())
++    }
++
++    /// Gives the device's queues up ahead of a suspend or hibernation. Requests fail with
++    /// `ENODEV` until [`Session::restore_queues`]; none are in flight, as every task is frozen
++    /// before devices are.
++    pub(crate) fn freeze_queues(&self) {
++        self.queue.lock().vqs = None;
++    }
++
++    /// Takes freshly found queues after a resume and posts the notification buffers on them. The
++    /// device on the other side is a new daemon with the same index, so request numbering
++    /// simply continues.
++    pub(crate) fn restore_queues(&self, vqs: Virtqueues) -> Result {
++        if vqs.len() != 2 {
++            return Err(EINVAL);
++        }
++        let mut q = self.queue.lock();
++        q.vqs = Some(Vqs(vqs));
++        for i in 0..NOTIFY_BUFS {
++            q.post_notify_buf(i)?;
++        }
++        q.notify_vq()?.kick();
+         Ok(())
+     }
+ 
+@@ -284,14 +310,14 @@ pub(crate) fn request(&self, req: &[u8], resp_len: usize) -> Result<(KVec<u8>, u
+             // caller for the duration of the request, and `token` is pinned on this stack frame
+             // until the device returns it. The mutex serialises vring access.
+             unsafe {
+-                q.vq().add_sgs_raw(
++                q.vq()?.add_sgs_raw(
+                     &mut sgs,
+                     1,
+                     token_ptr.cast_mut().cast(),
+                     GFP_KERNEL,
+                 )?
+             };
+-            q.vq().kick();
++            q.vq()?.kick();
+         }
+ 
+         token.done.wait_for_completion();
+@@ -319,7 +345,8 @@ impl WorkItem for Session {
+     /// host filled in. Runs in process context.
+     fn run(this: Arc<Session>) {
+         let q = this.queue.lock();
+-        while let Some((token, len)) = q.vq().get_buf() {
++        let Ok(vq) = q.vq() else { return };
++        while let Some((token, len)) = vq.get_buf() {
+             let token: NonNull<Token> = token.cast();
+             // SAFETY: The pointer is one we passed to `add_sgs_raw`, and its owner is still
+             // waiting on `done`, so the token is alive.
+@@ -336,12 +363,12 @@ fn run(this: Arc<Session>) {
+             let len;
+             {
+                 let mut q = this.queue.lock();
+-                let Some((token, n)) = q.notify_vq().get_buf() else { break };
++                let Some((token, n)) = q.notify_vq().ok().and_then(|vq| vq.get_buf()) else { break };
+                 let Some(i) = q.notify_buf_index(token) else { continue };
+                 len = (n as usize).min(NOTIFY_BUF);
+                 copy[..len].copy_from_slice(&q.notify_bufs[i][..len]);
+                 if q.post_notify_buf(i).is_ok() {
+-                    q.notify_vq().kick();
++                    let _ = q.notify_vq().map(|vq| vq.kick());
+                 }
+             }
+             this.deliver(&copy[..len]);

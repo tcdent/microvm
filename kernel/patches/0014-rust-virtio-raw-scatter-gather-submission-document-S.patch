@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tcdent <tcdent@gmail.com>
+Date: Sat, 10 Oct 2026 17:47:08 -0700
+Subject: [PATCH 14/38] rust: virtio: raw scatter-gather submission; document
+ ShmRegion
+
+Virtqueue::add_sgs_raw takes caller-built scatterlists so a driver can
+hand the device a page-cache page directly, which the SGTable path
+(vmalloc-backed, DMA-mapped) cannot express. Unsafe for now: the caller
+vouches for the lists and the token. Adds the sg_set_page helper.
+
+Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
+---
+ rust/helpers/scatterlist.c      |  6 ++++++
+ rust/kernel/virtio.rs           |  2 ++
+ rust/kernel/virtio/virtqueue.rs | 36 +++++++++++++++++++++++++++++++++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/rust/helpers/scatterlist.c b/rust/helpers/scatterlist.c
+index f3c41ea5e..95c85e0c1 100644
+--- a/rust/helpers/scatterlist.c
++++ b/rust/helpers/scatterlist.c
+@@ -24,3 +24,9 @@ __rust_helper void rust_helper_dma_unmap_sgtable(struct device *dev,
+ {
+ 	return dma_unmap_sgtable(dev, sgt, dir, attrs);
+ }
++
++__rust_helper void rust_helper_sg_set_page(struct scatterlist *sg, struct page *page,
++					   unsigned int len, unsigned int offset)
++{
++	sg_set_page(sg, page, len, offset);
++}
+diff --git a/rust/kernel/virtio.rs b/rust/kernel/virtio.rs
+index dc8d728bb..e9ea63325 100644
+--- a/rust/kernel/virtio.rs
++++ b/rust/kernel/virtio.rs
+@@ -290,7 +290,9 @@ fn as_ref(&self) -> &crate::device::Device<Ctx> {
+ /// A device-exposed shared memory region: guest-physical `addr` and `len` in bytes.
+ #[derive(Clone, Copy, Debug)]
+ pub struct ShmRegion {
++    /// Guest-physical address of the region.
+     pub addr: u64,
++    /// Length of the region in bytes.
+     pub len: u64,
+ }
+ 
+diff --git a/rust/kernel/virtio/virtqueue.rs b/rust/kernel/virtio/virtqueue.rs
+index 781326c17..90f576b23 100644
+--- a/rust/kernel/virtio/virtqueue.rs
++++ b/rust/kernel/virtio/virtqueue.rs
+@@ -256,6 +256,42 @@ pub fn add_sgs<'token, PIn, POut, Token>(
+         })
+     }
+ 
++    /// Adds raw scatter-gather lists to the virtqueue.
++    ///
++    /// `sgs` holds `out_num` device-readable lists followed by the device-writable ones. The
++    /// device writes the number of bytes it produced and `token` back through
++    /// [`Virtqueue::get_buf`].
++    ///
++    /// # Safety
++    ///
++    /// * Every entry of `sgs` must point to a scatterlist terminated with `sg_mark_end`, whose
++    ///   pages stay valid and unused by the CPU until the buffer is returned by `get_buf`.
++    /// * `token` must stay valid until it is returned by `get_buf`.
++    /// * The caller must serialise this call against other uses of the vring.
++    #[doc(alias = "virtqueue_add_sgs")]
++    pub unsafe fn add_sgs_raw(
++        &self,
++        sgs: &mut [*mut bindings::scatterlist],
++        out_num: u32,
++        token: *mut c_void,
++        gfp: Flags,
++    ) -> Result {
++        let in_num = u32::try_from(sgs.len())?
++            .checked_sub(out_num)
++            .ok_or(EINVAL)?;
++        // SAFETY: `self` is a valid virtqueue and the caller upholds the buffer requirements.
++        to_result(unsafe {
++            bindings::virtqueue_add_sgs(
++                self.as_raw(),
++                sgs.as_mut_ptr(),
++                out_num,
++                in_num,
++                token,
++                gfp.as_raw(),
++            )
++        })
++    }
++
+     /// Create a scatter-gather table readable by the device.
+     pub fn new_readable_sgtable<P>(
+         &self,
