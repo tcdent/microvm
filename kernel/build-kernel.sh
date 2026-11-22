@@ -10,7 +10,11 @@
 #
 set -e
 
-KVER="${1:-6.12.73}"
+KVER="${1:-7.2.9}"
+# Rust-for-Linux toolchain (research/17): bindgen from cargo, libclang 18
+# from the PyPI wheel; Debian 12's libclang 14 is below the tree's minimum.
+export PATH="$HOME/.cargo/bin:$PATH"
+export LIBCLANG_PATH="${LIBCLANG_PATH:-$(dirname "$(find "$HOME/.local/libclang" -name libclang.so 2>/dev/null | head -1)")}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$DIR/src"
 JOBS=$(nproc)
@@ -26,14 +30,34 @@ fi
 
 cd "$WORK/linux-$KVER"
 
-# Start from our config
-cp "$DIR/.config" .config
+# Start from our config. The 7.2.9 tree is a git repo with our branch
+# checked out; leave its .config alone when it already has one.
+[ -f .config ] || cp "$DIR/.config" .config
 
 # Apply our customizations on top of Firecracker's config
 scripts/config --enable CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES
 scripts/config --enable CONFIG_FUSE_FS
 scripts/config --enable CONFIG_VIRTIO_FS
+# pet (2026-10-10): environment disk is read-only ext4 under a tmpfs
+# overlay; EROFS and squashfs are the candidate read-only image formats.
+scripts/config --enable CONFIG_OVERLAY_FS
+scripts/config --enable CONFIG_EROFS_FS
+scripts/config --enable CONFIG_SQUASHFS
+# systemd mounts binfmt_misc and friends through autofs.
+scripts/config --enable CONFIG_AUTOFS_FS
+# Rust in the kernel (research/17). RUST_IS_AVAILABLE is evaluated at make
+# time from PATH/LIBCLANG_PATH above.
+scripts/config --enable CONFIG_RUST
+scripts/config --disable CONFIG_MODVERSIONS
+scripts/config --disable CONFIG_RANDSTRUCT
 scripts/config --enable CONFIG_X86_MPPARSE
+# Nested virtualization: environments run their own test VMs under KVM (AMD only, the
+# host's CPU), with tap networking and vhost for those VMs' network and vsock traffic.
+# Hibernation is how an environment stops and resumes.
+scripts/config --enable CONFIG_VIRTUALIZATION --enable CONFIG_KVM --enable CONFIG_KVM_AMD
+scripts/config --disable CONFIG_KVM_AMD_SEV --disable CONFIG_KVM_INTEL
+scripts/config --enable CONFIG_TUN --enable CONFIG_VHOST_NET --enable CONFIG_VHOST_VSOCK
+scripts/config --enable CONFIG_HIBERNATION --enable CONFIG_PSI
 
 # ── Phase 4: kernel slimming ────────────────────────────────────
 # Disable subsystems we don't need in a microVM.
@@ -51,9 +75,7 @@ for opt in XFS_FS F2FS_FS REISERFS_FS JFS_FS \
            NET_9P 9P_FS \
            HFS_FS HFSPLUS_FS \
            UDF_FS ISO9660_FS \
-           SQUASHFS \
-           OVERLAY_FS \
-           AUTOFS_FS AUTOFS4_FS; do
+           ; do
     scripts/config --disable "CONFIG_$opt"
 done
 
@@ -106,7 +128,7 @@ done
 for opt in WATCHDOG WATCHDOG_CORE \
            THERMAL THERMAL_NETLINK \
            HWMON \
-           SUSPEND HIBERNATION PM_AUTOSLEEP \
+           PM_AUTOSLEEP \
            ACPI_VIDEO ACPI_HOTPLUG_CPU ACPI_HOTPLUG_MEMORY \
            CPU_FREQ_GOV_USERSPACE CPU_FREQ_GOV_ONDEMAND \
            CPU_FREQ_GOV_CONSERVATIVE CPU_FREQ_GOV_SCHEDUTIL; do
@@ -119,7 +141,9 @@ make olddefconfig
 # Verify our flags are set
 echo "==> Verifying config..."
 for opt in CONFIG_VIRTIO_MMIO CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES \
-           CONFIG_FUSE_FS CONFIG_VIRTIO_FS; do
+           CONFIG_FUSE_FS CONFIG_VIRTIO_FS CONFIG_OVERLAY_FS CONFIG_EROFS_FS CONFIG_VIRTIO_BLK CONFIG_RUST \
+           CONFIG_MEMORY_HOTREMOVE CONFIG_ZONE_DEVICE CONFIG_DAX CONFIG_FS_DAX \
+           CONFIG_HIBERNATION CONFIG_PM_SLEEP CONFIG_KVM CONFIG_KVM_AMD CONFIG_TUN CONFIG_VHOST_NET; do
     val=$(grep "^${opt}=" .config || echo "NOT SET")
     echo "    $val"
 done
