@@ -14,24 +14,120 @@ const PD3_ADDR: u64 = 0xe000;  // PD3: 3-4GB (covers LAPIC at 0xFEE00000)
 
 const BOOT_STACK_POINTER: u64 = 0x8ff0;
 
+/// Create vCPU `id`. The bootstrap processor (id 0) is set up to enter the
+/// kernel in long mode. Application processors are left in KVM's
+/// wait-for-SIPI state; the guest kernel starts them through the in-kernel
+/// local APIC and KVM resets their registers on INIT, so only CPUID and
+/// the FPU matter here.
 pub fn create_vcpu(
     kvm: &kvm_ioctls::Kvm,
     vm: &VmFd,
     memory: &GuestMemoryMmap,
+    id: u8,
+    x2apic: bool,
 ) -> Result<VcpuFd, Box<dyn std::error::Error>> {
-    let vcpu = vm.create_vcpu(0)?;
+    let vcpu = vm.create_vcpu(id as u64)?;
 
     // Pass through host CPUID so the kernel sees real CPU features (RDRAND, SSE, etc)
     let mut cpuid = kvm.get_supported_cpuid(256)?;
+    add_kvm_paravirt_leaves(&mut cpuid)?;
+    set_apic_id(&mut cpuid, id);
+    if !x2apic {
+        hide_x2apic(&mut cpuid);
+    }
     vcpu.set_cpuid2(&cpuid)?;
-
-    setup_gdt(memory)?;
-    setup_page_tables(memory)?;
-    setup_sregs(&vcpu)?;
     setup_fpu(&vcpu)?;
-    setup_msrs(&vcpu)?;
+
+    if id == 0 {
+        setup_gdt(memory)?;
+        setup_page_tables(memory)?;
+        setup_sregs(&vcpu)?;
+        setup_msrs(&vcpu)?;
+    }
 
     Ok(vcpu)
+}
+
+/// Whether to offer the guest x2APIC. It is the cheaper interface when every APIC access
+/// exits: an MSR write rather than an MMIO fault. With AVIC the hardware handles xAPIC
+/// accesses, interrupt delivery and EOIs without exits, but before Zen 4 (`x2avic`) only
+/// for xAPIC, and a guest that enables x2APIC switches AVIC off. So x2APIC is hidden exactly
+/// when the host's kvm_amd has AVIC on and the CPU lacks x2AVIC. `VM_X2APIC=0|1` overrides.
+pub fn guest_x2apic() -> bool {
+    if let Ok(v) = std::env::var("VM_X2APIC") {
+        return v != "0";
+    }
+    let avic = std::fs::read_to_string("/sys/module/kvm_amd/parameters/avic")
+        .is_ok_and(|v| matches!(v.trim(), "Y" | "1"));
+    let x2avic = std::fs::read_to_string("/proc/cpuinfo")
+        .is_ok_and(|c| c.lines().find(|l| l.starts_with("flags")).is_some_and(|l| l.split_whitespace().any(|f| f == "x2avic")));
+    !avic || x2avic
+}
+
+/// CPUID.1:ECX[21] advertises x2APIC.
+fn hide_x2apic(cpuid: &mut kvm_bindings::CpuId) {
+    for e in cpuid.as_mut_slice() {
+        if e.function == 1 && e.index == 0 {
+            e.ecx &= !(1 << 21);
+        }
+    }
+}
+
+/// CPUID carries the APIC id in leaf 1 (EBX[31:24]) and leaf 0xB (EDX);
+/// the kernel matches these against the MP table.
+fn set_apic_id(cpuid: &mut kvm_bindings::CpuId, id: u8) {
+    for e in cpuid.as_mut_slice() {
+        match e.function {
+            1 => e.ebx = (e.ebx & 0x00FF_FFFF) | ((id as u32) << 24),
+            0xB => e.edx = id as u32,
+            _ => {}
+        }
+    }
+}
+
+/// Tell the guest it runs under KVM. KVM_GET_SUPPORTED_CPUID does not
+/// include the hypervisor leaves, and without them the guest never finds
+/// kvm-clock, so it has no wall clock from the host and boots with a
+/// bogus date (certificates fail, timestamps lie). Advertise the KVM
+/// signature and the clocksource features; KVM implements the MSRs
+/// behind them regardless.
+fn add_kvm_paravirt_leaves(cpuid: &mut kvm_bindings::CpuId) -> Result<(), Box<dyn std::error::Error>> {
+    const HYPERVISOR_BIT: u32 = 1 << 31; // CPUID.1:ECX
+    const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
+    const KVM_CPUID_FEATURES: u32 = 0x4000_0001;
+    const KVM_FEATURE_CLOCKSOURCE: u32 = 1 << 0;
+    const KVM_FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
+    // Oversubscription helpers: the guest scheduler sees time stolen by
+    // the host, and spinlocks yield instead of spinning on a preempted vCPU.
+    const KVM_FEATURE_STEAL_TIME: u32 = 1 << 5;
+    const KVM_FEATURE_PV_UNHALT: u32 = 1 << 7;
+    const KVM_FEATURE_CLOCKSOURCE_STABLE_BIT: u32 = 1 << 24;
+
+    for e in cpuid.as_mut_slice() {
+        if e.function == 1 && e.index == 0 {
+            e.ecx |= HYPERVISOR_BIT;
+        }
+    }
+    let sig = kvm_bindings::kvm_cpuid_entry2 {
+        function: KVM_CPUID_SIGNATURE,
+        eax: KVM_CPUID_FEATURES,
+        ebx: u32::from_le_bytes(*b"KVMK"),
+        ecx: u32::from_le_bytes(*b"VMKV"),
+        edx: u32::from_le_bytes(*b"M\0\0\0"),
+        ..Default::default()
+    };
+    let feat = kvm_bindings::kvm_cpuid_entry2 {
+        function: KVM_CPUID_FEATURES,
+        eax: KVM_FEATURE_CLOCKSOURCE
+            | KVM_FEATURE_CLOCKSOURCE2
+            | KVM_FEATURE_STEAL_TIME
+            | KVM_FEATURE_PV_UNHALT
+            | KVM_FEATURE_CLOCKSOURCE_STABLE_BIT,
+        ..Default::default()
+    };
+    cpuid.push(sig)?;
+    cpuid.push(feat)?;
+    Ok(())
 }
 
 pub fn setup_regs(vcpu: &VcpuFd, kernel_entry: u64, boot_params_addr: u64) -> Result<(), Box<dyn std::error::Error>> {

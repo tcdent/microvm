@@ -59,14 +59,15 @@ fn checksum<T: Copy>(v: &T) -> u8 {
     bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
 }
 
-pub fn write(memory: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Error>> {
+pub fn write(memory: &GuestMemoryMmap, num_cpus: u8) -> Result<(), Box<dyn std::error::Error>> {
     let mut addr = GuestAddress(MPTABLE_START);
-    let ioapic_id: u8 = 1; // CPU 0 gets APIC ID 0, IO-APIC gets 1
+    let num_cpus = num_cpus.max(1);
+    let ioapic_id: u8 = num_cpus; // CPUs take APIC IDs 0..N-1, the IO-APIC the next one
 
     // Zero the region
     let total_size = mem::size_of::<MpfIntel>()
         + mem::size_of::<MpcTable>()
-        + mem::size_of::<MpcCpu>()
+        + mem::size_of::<MpcCpu>() * num_cpus as usize
         + mem::size_of::<MpcBus>()
         + mem::size_of::<MpcIoapic>()
         + mem::size_of::<MpcIntsrc>() * NUM_IRQS as usize
@@ -94,19 +95,22 @@ pub fn write(memory: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Error>>
 
     let mut table_checksum: u8 = 0;
 
-    // CPU entry
-    let cpu = MpcCpu(mpspec::mpc_cpu {
-        type_: mpspec::MP_PROCESSOR as u8,
-        apicid: 0,
-        apicver: APIC_VERSION,
-        cpuflag: (mpspec::CPU_ENABLED | mpspec::CPU_BOOTPROCESSOR) as u8,
-        cpufeature: 0x600, // stepping
-        featureflag: 0x201, // FPU + APIC
-        ..Default::default()
-    });
-    memory.write_obj(cpu, addr)?;
-    table_checksum = table_checksum.wrapping_add(checksum(&cpu.0));
-    addr = addr.unchecked_add(mem::size_of::<MpcCpu>() as u64);
+    // One processor entry per vCPU; APIC id matches what cpu.rs puts in CPUID.
+    for id in 0..num_cpus {
+        let bsp = if id == 0 { mpspec::CPU_BOOTPROCESSOR } else { 0 };
+        let cpu = MpcCpu(mpspec::mpc_cpu {
+            type_: mpspec::MP_PROCESSOR as u8,
+            apicid: id,
+            apicver: APIC_VERSION,
+            cpuflag: (mpspec::CPU_ENABLED | bsp) as u8,
+            cpufeature: 0x600, // stepping
+            featureflag: 0x201, // FPU + APIC
+            ..Default::default()
+        });
+        memory.write_obj(cpu, addr)?;
+        table_checksum = table_checksum.wrapping_add(checksum(&cpu.0));
+        addr = addr.unchecked_add(mem::size_of::<MpcCpu>() as u64);
+    }
 
     // ISA bus
     let bus = MpcBus(mpspec::mpc_bus {

@@ -114,6 +114,7 @@ pub fn spawn(
             .into_owned(),
         net_ifname,
         mem_mb: spec.mem_mb as usize,
+        vcpus: 1,
         vm_id: name_hash.clone(),
         fs,
         shutdown: Some(Arc::clone(&shutdown_flag)),

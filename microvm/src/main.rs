@@ -96,6 +96,7 @@ fn config_from_env() -> LaunchConfig {
         initrd_path: env_or("VM_INITRD", "dist/initramfs.cpio.gz"),
         net_ifname: std::env::var("VM_NET").ok(),
         mem_mb: env_or("VM_MEMORY", "1024").parse().unwrap_or(1024),
+        vcpus: env_or("VM_CPUS", "1").parse().unwrap_or(1),
         vm_id: env_or("VM_ID", "default"),
         fs,
         shutdown: None,

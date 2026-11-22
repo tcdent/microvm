@@ -97,9 +97,16 @@ fn configure_boot_params(
     params.hdr.ramdisk_image = initrd_addr as u32;
     params.hdr.ramdisk_size = initrd_size as u32;
 
-    // E820 memory map — tell Linux what memory it has
+    // E820 memory map — tell Linux what memory it has. Same split as
+    // memory::ram_layout: low RAM up to the MMIO hole, the rest above 4 GiB.
     add_e820_entry(&mut params, 0, 0x0009_FC00, E820_RAM);
-    add_e820_entry(&mut params, 0x0010_0000, mem_size as u64 - 0x0010_0000, E820_RAM);
+    for (start, len) in crate::memory::ram_layout(mem_size as u64) {
+        if start == 0 {
+            add_e820_entry(&mut params, 0x0010_0000, len - 0x0010_0000, E820_RAM);
+        } else {
+            add_e820_entry(&mut params, start, len, E820_RAM);
+        }
+    }
 
     LinuxBootConfigurator::write_bootparams::<GuestMemoryMmap>(
         &BootParams::new::<boot_params>(&params, GuestAddress(BOOT_PARAMS_ADDR)),

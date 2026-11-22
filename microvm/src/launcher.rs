@@ -15,8 +15,9 @@
 //! (e.g. for cache invalidation on host-side writes), not serialize
 //! anything across a socket.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use vm_memory::GuestMemoryMmap;
@@ -38,7 +39,6 @@ const VIRTIO_NET_BASE: u64 = 0xD000_1000;
 const VIRTIO_NET_IRQ: u32 = 6;
 const VIRTIO_CONSOLE_BASE: u64 = 0xD000_2000;
 const VIRTIO_CONSOLE_IRQ: u32 = 7;
-
 // ── Config ─────────────────────────────────────────────────────────────
 
 /// Everything needed to bring a VM up.
@@ -56,6 +56,8 @@ pub struct LaunchConfig {
     pub net_ifname: Option<String>,
     /// Guest RAM in MB.
     pub mem_mb: usize,
+    /// vCPUs. One thread each; devices are shared behind one lock.
+    pub vcpus: usize,
     /// Identity for this VM instance. Used today only in log lines;
     /// reserved for future multi-VM orchestrator distinctions
     /// (e.g. `thread_name: format!("vm-fuse-{vm_id}")`).
@@ -140,50 +142,52 @@ pub fn launch_vm(cfg: LaunchConfig, fs: Arc<S3Fs>) -> Result<(), Box<dyn std::er
 
 // ── VM instance ────────────────────────────────────────────────────────
 
-/// Thread ID of the vcpu thread, stored after spawn for signal-based
-/// KVM_RUN interruption. The orchestrator sends SIGUSR1 to kick the
-/// vcpu out of a blocking KVM_RUN when the shutdown flag is set.
-///
-/// In-memory representation of a running VM: KVM handles, guest RAM,
-/// vCPU, and the virtio devices wired into MMIO space.
-///
-/// Private to this module — external callers go through `launch_vm`/`run`.
-struct System {
-    vm: Arc<VmFd>,
-    memory: GuestMemoryMmap,
-    vcpu: VcpuFd,
+/// Everything that answers a guest I/O exit. One lock around all of it:
+/// exits are rare relative to guest work, and a single lock keeps the
+/// device code free of per-device synchronization.
+struct Devices {
     serial: Serial,
     console: VirtioConsole,
     virtiofs: VirtioFs,
     virtionet: Option<VirtioNet<MacvtapBackend>>,
-    // epoll instance reserved for a future multi-fd main-thread event
-    // loop. Currently unused: each device spawns its own blocking
-    // worker thread, so the vCPU thread only waits on KVM_RUN. Once
-    // we consolidate device I/O (e.g. ioeventfd/irqfd management,
-    // orchestrator control channel), this becomes the single place
-    // the VMM thread parks. Was already dead in main.rs pre-refactor.
-    // TODO: wire into launch_vm when that consolidation lands.
+}
+
+/// In-memory representation of a running VM: KVM handles, guest RAM,
+/// vCPUs, and the virtio devices wired into MMIO space.
+struct System {
+    vm: Arc<VmFd>,
+    memory: GuestMemoryMmap,
+    vcpus: Vec<VcpuFd>,
+    devices: Arc<Mutex<Devices>>,
     #[allow(dead_code)]
     poll: EventPoll,
     /// Host-side shutdown control. Checked between KVM_RUN iterations.
     shutdown: Option<Arc<AtomicBool>>,
 }
 
+enum Flow {
+    Continue,
+    Stop,
+}
+
 impl System {
-    fn new(
-        cfg: LaunchConfig,
-        fs: Arc<S3Fs>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(cfg: LaunchConfig, fs: Arc<S3Fs>) -> Result<Self, Box<dyn std::error::Error>> {
         let (kvm, vm) = vm::create_vm()?;
         let vm = Arc::new(vm);
 
         let memory = memory::setup_guest_memory(&vm, cfg.mem_mb)?;
-        mptable::write(&memory)?;
-        let vcpu = cpu::create_vcpu(&kvm, &vm, &memory)?;
+        let ncpu = cfg.vcpus.clamp(1, 64);
+        mptable::write(&memory, ncpu as u8)?;
+        let x2apic = cpu::guest_x2apic();
+        log!("guest APIC: {}", if x2apic { "x2APIC" } else { "xAPIC, for AVIC" });
+        let mut vcpus = Vec::with_capacity(ncpu);
+        for id in 0..ncpu {
+            vcpus.push(cpu::create_vcpu(&kvm, &vm, &memory, id as u8, x2apic)?);
+        }
 
         let (kernel_entry, boot_params_addr) =
             kernel::load(&memory, &cfg.kernel_path, &cfg.initrd_path, cfg.mem_mb * 1024 * 1024)?;
-        cpu::setup_regs(&vcpu, kernel_entry, boot_params_addr)?;
+        cpu::setup_regs(&vcpus[0], kernel_entry, boot_params_addr)?;
 
         // Serial (ttyS0): output-only for early boot messages before
         // virtio-console comes up. Output goes to log_file if set,
@@ -193,16 +197,10 @@ impl System {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .unwrap_or_else(|e| {
-                        log!("serial log open failed ({}), falling back to stdout: {}", path.display(), e);
-                        // Can't return Box<Stdout> from this closure easily,
-                        // so create a /dev/null fallback and warn.
-                        std::fs::File::open("/dev/null").unwrap()
-                    });
+                let f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap_or_else(|e| {
+                    log!("serial log open failed ({}), falling back to /dev/null: {}", path.display(), e);
+                    std::fs::File::open("/dev/null").unwrap()
+                });
                 Box::new(f)
             }
             None => Box::new(std::io::stdout()),
@@ -210,16 +208,9 @@ impl System {
         let serial = serial::create(&vm, serial_output);
 
         // Virtio-console (hvc0): interactive post-boot console.
-        // Orchestrator mode: reads from the pipe the orchestrator
-        // holds the write end of. Standalone: reads from stdin.
         let console_input: Box<dyn std::io::Read + Send> =
             cfg.console_input.unwrap_or_else(|| Box::new(std::io::stdin()));
-        let console = VirtioConsole::new(
-            VIRTIO_CONSOLE_IRQ,
-            VIRTIO_CONSOLE_BASE,
-            console_input,
-            Box::new(std::io::stdout()),
-        );
+        let console = VirtioConsole::new(VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_BASE, console_input, Box::new(std::io::stdout()));
         vm.register_irqfd(console.mmio.irqfd_fd(), VIRTIO_CONSOLE_IRQ)?;
 
         // Virtio-fs (rootfs): backed by S3Fs via virtio-fs-transport worker.
@@ -238,156 +229,207 @@ impl System {
             None
         };
 
-        let poll = EventPoll::new();
-
-        Ok(Self { vm, memory, vcpu, serial, console, virtiofs, virtionet, poll, shutdown: cfg.shutdown })
+        let devices = Arc::new(Mutex::new(Devices { serial, console, virtiofs, virtionet }));
+        Ok(Self { vm, memory, vcpus, devices, poll: EventPoll::new(), shutdown: cfg.shutdown })
     }
 
     fn run(&mut self) {
-        log!("=== microvm started ===");
+        log!("=== microvm started ({} vcpus) ===", self.vcpus.len());
         bench_ts("T2"); // vm-started — vCPU about to enter KVM_RUN
-        // stdin goes to virtio-console (hvc0), not serial (ttyS0).
-        // Serial is output-only for boot messages.
-        loop {
-            // Host-side shutdown check.
-            if let Some(ref flag) = self.shutdown {
-                if flag.load(Ordering::Relaxed) {
-                    log!("Host requested shutdown");
-                    break;
-                }
-            }
-            let exit = match self.vcpu.run() {
-                Ok(exit) => exit,
-                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
-                    continue; // interrupted by signal (shutdown kick)
-                }
-                Err(e) => panic!("KVM_RUN failed: {e}"),
-            };
-            match exit {
-                VcpuExit::IoOut(port, data) => match port {
-                    0x3F8..=0x3FF => {
-                        let offset = port - 0x3F8;
-                        for &byte in data {
-                            self.serial.write(offset as u8, byte);
-                        }
-                    }
-                    0x64 if data.first() == Some(&0xFE) => {
-                        log!("Guest requested shutdown (i8042 reset)");
-                        break;
-                    }
-                    _ => {}
-                },
-                VcpuExit::IoIn(port, data) => match port {
-                    0x3F8..=0x3FF => {
-                        let offset = port - 0x3F8;
-                        data[0] = self.serial.read(offset as u8);
-                    }
-                    _ => data.fill(0),
-                },
-                VcpuExit::MmioRead(addr, data) => {
-                    let val = match addr {
-                        VIRTIO_FS_BASE..=0xD000_0FFF => {
-                            let offset = addr - VIRTIO_FS_BASE;
-                            self.virtiofs.mmio.read(offset, |off| self.virtiofs.config_read(off))
-                        }
-                        VIRTIO_NET_BASE..=0xD000_1FFF => {
-                            if let Some(ref net) = self.virtionet {
-                                let offset = addr - VIRTIO_NET_BASE;
-                                net.mmio.read(offset, |off| net.config_read(off))
-                            } else {
-                                0
-                            }
-                        }
-                        VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
-                            let offset = addr - VIRTIO_CONSOLE_BASE;
-                            self.console.mmio.read(offset, |off| self.console.config_read(off))
-                        }
-                        _ => {
-                            data.fill(0);
-                            continue;
-                        }
-                    };
-                    let bytes = val.to_le_bytes();
-                    let len = data.len().min(4);
-                    data[..len].copy_from_slice(&bytes[..len]);
-                }
-                VcpuExit::MmioWrite(addr, data) => {
-                    let val = u32::from_le_bytes(data[..4.min(data.len())].try_into().unwrap_or([0; 4]));
-                    match addr {
-                        VIRTIO_FS_BASE..=0xD000_0FFF => {
-                            let offset = addr - VIRTIO_FS_BASE;
-                            self.virtiofs.mmio.write(offset, val, |_, _| {});
-                            if offset == 0x044 && val == 1 {
-                                let qs = self.virtiofs.mmio.queue_sel();
-                                self.virtiofs.activate_queue(qs as usize);
-                                // Start worker when the request queue (1) is activated.
-                                if qs == 1 {
-                                    // Wrap into Arc because virtio-fs-transport's
-                                    // FsSession<F> requires Arc<GuestMemoryMmap>
-                                    // — the worker lives in a separate crate and
-                                    // can't assume anything about guest-memory
-                                    // ownership on the VMM side. Net/console
-                                    // workers are VM-local (microvm crate) and
-                                    // pass GuestMemoryMmap directly via its cheap
-                                    // internal Arc-based Clone.
-                                    self.virtiofs.start_worker(&self.vm, Arc::new(self.memory.clone()));
-                                }
-                            }
-                            // QueueNotify (0x050) goes to the worker via ioeventfd — no vCPU exit.
-                        }
-                        VIRTIO_NET_BASE..=0xD000_1FFF => {
-                            if let Some(ref mut net) = self.virtionet {
-                                let offset = addr - VIRTIO_NET_BASE;
-                                let notify = net.mmio.write(offset, val, |_, _| {});
-                                if offset == 0x044 && val == 1 {
-                                    let qs = net.mmio.queue_sel();
-                                    net.activate_queue(qs as usize);
-                                }
-                                if offset == 0x070 && (val & 0x04) != 0 {
-                                    net.start_rx_worker(self.memory.clone());
-                                }
-                                if notify {
-                                    net.process_tx(&self.memory);
-                                    net.mmio.inject_irq();
-                                }
-                            }
-                        }
-                        VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
-                            let offset = addr - VIRTIO_CONSOLE_BASE;
-                            let notify = self.console.mmio.write(offset, val, |_, _| {});
-                            if offset == 0x044 && val == 1 {
-                                let qs = self.console.mmio.queue_sel();
-                                self.console.activate_queue(qs as usize);
-                            }
-                            // Start RX worker on DRIVER_OK.
-                            if offset == 0x070 && (val & 0x04) != 0 {
-                                self.console.start_rx_worker(self.memory.clone());
-                            }
-                            if notify {
-                                self.console.process_tx(&self.memory);
-                                self.console.mmio.inject_irq();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                VcpuExit::Hlt => {}
-                VcpuExit::Shutdown => {
-                    log!("Guest shutdown");
-                    break;
-                }
-                VcpuExit::InternalError => {
-                    log!("KVM internal error");
-                    break;
-                }
-                exit => {
-                    log!("Unhandled exit: {:?}", exit);
-                    break;
-                }
-            }
-            // RX is handled by the worker thread via irqfd.
-            // TX completions are signalled inline above.
+        install_kick_handler();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads: Arc<Mutex<Vec<libc::pthread_t>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        let mut vcpus = std::mem::take(&mut self.vcpus);
+        let mut bsp = vcpus.remove(0);
+        for (i, mut vcpu) in vcpus.into_iter().enumerate() {
+            let (vm, memory, devices, stop, shutdown, threads) = (
+                self.vm.clone(),
+                self.memory.clone(),
+                self.devices.clone(),
+                stop.clone(),
+                self.shutdown.clone(),
+                threads.clone(),
+            );
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("vcpu{}", i + 1))
+                    .spawn(move || {
+                        threads.lock().unwrap().push(unsafe { libc::pthread_self() });
+                        vcpu_loop(&mut vcpu, &vm, &memory, &devices, &stop, shutdown.as_deref());
+                    })
+                    .expect("spawn vcpu thread"),
+            );
+        }
+        vcpu_loop(&mut bsp, &self.vm, &self.memory, &self.devices, &stop, self.shutdown.as_deref());
+
+        // The BSP's loop ended: stop the rest. A signal makes KVM_RUN return
+        // EINTR, and the loop notices the flag.
+        stop.store(true, Ordering::SeqCst);
+        for t in threads.lock().unwrap().iter() {
+            unsafe { libc::pthread_kill(*t, libc::SIGUSR1) };
+        }
+        for h in handles {
+            h.join().ok();
         }
     }
 }
 
+extern "C" fn kick_handler(_: libc::c_int) {}
+
+/// SIGUSR1 interrupts KVM_RUN without killing the process.
+fn install_kick_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = kick_handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Run one vCPU until the guest stops or the host asks us to.
+fn vcpu_loop(
+    vcpu: &mut VcpuFd,
+    vm: &VmFd,
+    memory: &GuestMemoryMmap,
+    devices: &Mutex<Devices>,
+    stop: &AtomicBool,
+    shutdown: Option<&AtomicBool>,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(flag) = shutdown {
+            if flag.load(Ordering::Relaxed) {
+                log!("Host requested shutdown");
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
+        let exit = match vcpu.run() {
+            Ok(exit) => exit,
+            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => continue,
+            Err(e) => panic!("KVM_RUN failed: {e}"),
+        };
+        let flow = handle_exit(&mut devices.lock().unwrap(), vm, memory, exit);
+        if let Flow::Stop = flow {
+            stop.store(true, Ordering::SeqCst);
+            break;
+        }
+    }
+}
+
+fn handle_exit(d: &mut Devices, vm: &VmFd, memory: &GuestMemoryMmap, exit: VcpuExit<'_>) -> Flow {
+    match exit {
+        VcpuExit::IoOut(port, data) => match port {
+            0x3F8..=0x3FF => {
+                let offset = port - 0x3F8;
+                for &byte in data {
+                    d.serial.write(offset as u8, byte);
+                }
+            }
+            0x64 if data.first() == Some(&0xFE) => {
+                log!("Guest requested shutdown (i8042 reset)");
+                return Flow::Stop;
+            }
+            _ => {}
+        },
+        VcpuExit::IoIn(port, data) => match port {
+            0x3F8..=0x3FF => {
+                let offset = port - 0x3F8;
+                data[0] = d.serial.read(offset as u8);
+            }
+            _ => data.fill(0),
+        },
+        VcpuExit::MmioRead(addr, data) => {
+            let val: Option<u32> = match addr {
+                VIRTIO_FS_BASE..=0xD000_0FFF => {
+                    Some(d.virtiofs.mmio.read(addr - VIRTIO_FS_BASE, |off| d.virtiofs.config_read(off)))
+                }
+                VIRTIO_NET_BASE..=0xD000_1FFF => Some(match d.virtionet {
+                    Some(ref net) => net.mmio.read(addr - VIRTIO_NET_BASE, |off| net.config_read(off)),
+                    None => 0,
+                }),
+                VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
+                    Some(d.console.mmio.read(addr - VIRTIO_CONSOLE_BASE, |off| d.console.config_read(off)))
+                }
+                _ => None,
+            };
+            match val {
+                Some(v) => {
+                    let bytes = v.to_le_bytes();
+                    let len = data.len().min(4);
+                    data[..len].copy_from_slice(&bytes[..len]);
+                }
+                None => data.fill(0),
+            }
+        }
+        VcpuExit::MmioWrite(addr, data) => {
+            let val = u32::from_le_bytes(data[..4.min(data.len())].try_into().unwrap_or([0; 4]));
+            match addr {
+                VIRTIO_FS_BASE..=0xD000_0FFF => {
+                    let offset = addr - VIRTIO_FS_BASE;
+                    d.virtiofs.mmio.write(offset, val, |_, _| {});
+                    if offset == 0x044 && val == 1 {
+                        let qs = d.virtiofs.mmio.queue_sel();
+                        d.virtiofs.activate_queue(qs as usize);
+                        // Start worker when the request queue (1) is activated.
+                        if qs == 1 {
+                            d.virtiofs.start_worker(vm, Arc::new(memory.clone()));
+                        }
+                    }
+                }
+                VIRTIO_NET_BASE..=0xD000_1FFF => {
+                    if let Some(ref mut net) = d.virtionet {
+                        let offset = addr - VIRTIO_NET_BASE;
+                        let notify = net.mmio.write(offset, val, |_, _| {});
+                        if offset == 0x044 && val == 1 {
+                            let qs = net.mmio.queue_sel();
+                            net.activate_queue(qs as usize);
+                        }
+                        if offset == 0x070 && (val & 0x04) != 0 {
+                            net.start_rx_worker(memory.clone());
+                        }
+                        if notify {
+                            net.process_tx(memory);
+                            net.mmio.inject_irq();
+                        }
+                    }
+                }
+                VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
+                    let offset = addr - VIRTIO_CONSOLE_BASE;
+                    let notify = d.console.mmio.write(offset, val, |_, _| {});
+                    if offset == 0x044 && val == 1 {
+                        let qs = d.console.mmio.queue_sel();
+                        d.console.activate_queue(qs as usize);
+                    }
+                    if offset == 0x070 && (val & 0x04) != 0 {
+                        d.console.start_rx_worker(memory.clone());
+                    }
+                    if notify {
+                        d.console.process_tx(memory);
+                        d.console.mmio.inject_irq();
+                    }
+                }
+                _ => {}
+            }
+        }
+        VcpuExit::Hlt => {}
+        VcpuExit::Shutdown => {
+            log!("Guest shutdown");
+            return Flow::Stop;
+        }
+        VcpuExit::InternalError => {
+            log!("KVM internal error");
+            return Flow::Stop;
+        }
+        exit => {
+            log!("Unhandled exit: {:?}", exit);
+            return Flow::Stop;
+        }
+    }
+    Flow::Continue
+}
