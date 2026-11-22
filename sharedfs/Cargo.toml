@@ -1,0 +1,18 @@
+[package]
+name = "sharedfs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR BSD-3-Clause"
+description = "Host side of sharedfs: single-writer project directory with a guest-readable shared metadata index"
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.30", features = ["fs", "inotify", "mman", "poll", "time", "user"] }
+# Same versions as the VMM so Queue, GuestMemoryMmap and EventFd are
+# one type across the crate boundary.
+virtio-queue = "0.17"
+vm-memory = { version = "0.17", features = ["backend-mmap"] }
+vmm-sys-util = "0.15.0"
+
+[dev-dependencies]
+tempfile = "3"
