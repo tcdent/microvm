@@ -11,7 +11,7 @@
 //! source (IPC, JSON, CLI flags) and terminal handling, and reuse
 //! `launcher::run` unchanged.
 
-use microvm::launcher::{DiskSpec, LaunchConfig};
+use microvm::launcher::{DiskSpec, LaunchConfig, SharedfsExport};
 use s3_rootfs::config::FsConfig;
 
 fn main() {
@@ -102,6 +102,8 @@ fn config_from_env() -> LaunchConfig {
         shutdown: None,
         log_file: None,
         console_input: None,
+        sharedfs: parse_sharedfs(&env_or("VM_SHAREDFS", "")),
+        state_dir: std::env::var("VM_STATE").ok().map(std::path::PathBuf::from),
         // vda: the environment image, read-only. vdb: the data disk. vdc: swap, which also
         // holds the hibernation image.
         disks: [("VM_DISK", true), ("VM_DATA", false), ("VM_SWAP", false)]
@@ -119,6 +121,40 @@ fn config_from_env() -> LaunchConfig {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// `VM_SHAREDFS`: whitespace-separated exports, each `TAG=PATH[:OPTION]...`. An option is a
+/// window size with a `M` or `G` suffix (default 8G), or `ro` for an export the host keeps
+/// writing and any number of VMs may share. A malformed entry is fatal.
+fn parse_sharedfs(spec: &str) -> Vec<SharedfsExport> {
+    spec.split_whitespace()
+        .map(|item| {
+            let (tag, rest) = item.split_once('=').unwrap_or_else(|| panic!("VM_SHAREDFS: `{item}` is not TAG=PATH"));
+            let mut parts = rest.split(':');
+            let path = parts.next().unwrap_or_default();
+            let (mut window, mut read_only) = (None, false);
+            for opt in parts {
+                match opt {
+                    "ro" => read_only = true,
+                    w if w.chars().next().is_some_and(|c| c.is_ascii_digit()) => window = Some(w),
+                    _ => panic!("VM_SHAREDFS: `{item}` has an unknown option `{opt}`"),
+                }
+            }
+            let window_len = match window {
+                None => sharedfs::device::WINDOW_LEN,
+                Some(w) => {
+                    let (n, shift) = match w.as_bytes().last() {
+                        Some(b'G') | Some(b'g') => (&w[..w.len() - 1], 30),
+                        Some(b'M') | Some(b'm') => (&w[..w.len() - 1], 20),
+                        _ => panic!("VM_SHAREDFS: `{item}` window needs an M or G suffix"),
+                    };
+                    n.parse::<usize>().unwrap_or_else(|_| panic!("VM_SHAREDFS: `{item}` bad window size")) << shift
+                }
+            };
+            assert!(!tag.is_empty() && tag.len() < sharedfs::device::TAG_LEN, "VM_SHAREDFS: `{item}` tag must be 1..35 bytes");
+            SharedfsExport { tag: tag.to_owned(), root: path.into(), window_len, read_only }
+        })
+        .collect()
 }
 
 // ── Terminal handling ──────────────────────────────────────────────────

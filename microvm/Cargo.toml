@@ -24,4 +24,5 @@ virtio-queue = "0.17"
 xdp-net = { path = "../../rust-vmm/xdp-net" }
 s3-rootfs = { path = "../s3-rootfs" }
 virtio-fs-transport = { path = "../virtio-fs-transport" }
+sharedfs = { path = "../sharedfs" }
 vmm-sys-util = "0.15.0"

@@ -20,13 +20,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{GuestMemory, GuestMemoryMmap};
 use xdp_net::{MacvtapBackend, NetBackend};
 
 use s3_rootfs::S3Fs;
 
 use crate::event_loop::EventPoll;
 use crate::serial::Serial;
+use crate::sharedfs_dev::SharedfsDev;
 use crate::virtio_blk::VirtioBlk;
 use crate::virtio_console::VirtioConsole;
 use crate::virtio_fs::{FsDevice, VirtioFs};
@@ -44,6 +45,24 @@ const VIRTIO_CONSOLE_IRQ: u32 = 7;
 const BLK_BASE: u64 = 0xD000_4000;
 const BLK_IRQ0: u32 = 11;
 const MAX_DISKS: usize = 4;
+// sharedfs exports: one device (one page, one IRQ) each from here, IRQs 15, 16, ...
+// Each gets its own read-only index slot and data window slot, at fixed strides from
+// the bases the sharedfs crate suggests.
+const SHAREDFS_BASE: u64 = 0xD000_8000;
+const SHAREDFS_IRQ0: u32 = 15;
+const MAX_SHAREDFS: usize = 4;
+
+/// One host directory exported to the guest through sharedfs.
+pub struct SharedfsExport {
+    /// What the guest names as the mount source.
+    pub tag: String,
+    pub root: std::path::PathBuf,
+    /// Data window size in bytes. The guest keeps 64 bytes of page metadata per 4 KiB of window.
+    pub window_len: usize,
+    /// The host stays the writer: shared with other VMs, and the guest's writes are refused.
+    pub read_only: bool,
+}
+
 /// A virtio-blk backing file. The first disk is `/dev/vda`.
 pub struct DiskSpec {
     pub path: std::path::PathBuf,
@@ -88,6 +107,12 @@ pub struct LaunchConfig {
     /// orchestrator to inject commands (e.g. `poweroff` for graceful
     /// shutdown). None = stdin (standalone interactive mode).
     pub console_input: Option<Box<dyn std::io::Read + Send>>,
+    /// Host directories to expose through sharedfs, one device each, in order.
+    pub sharedfs: Vec<SharedfsExport>,
+    /// Where this VM keeps state across runs. Each sharedfs export persists its index there,
+    /// so a guest resuming from hibernation finds its inode numbers still valid. `None` keeps
+    /// the indexes anonymous.
+    pub state_dir: Option<std::path::PathBuf>,
     /// Block devices, in order. With any disk present the guest boots
     /// from the initrd without a virtiofs root.
     pub disks: Vec<DiskSpec>,
@@ -173,6 +198,7 @@ struct Devices {
     console: VirtioConsole,
     virtiofs: Option<Box<dyn FsDevice + Send>>,
     virtionet: Option<VirtioNet<MacvtapBackend>>,
+    sharedfs: Vec<SharedfsDev>,
     disks: Vec<VirtioBlk>,
 }
 
@@ -209,6 +235,56 @@ impl System {
             vcpus.push(cpu::create_vcpu(&kvm, &vm, &memory, id as u8, x2apic)?);
         }
 
+        // sharedfs: one device per export. Scan the host directory, then hand the index
+        // pages to the guest as a read-only memory slot so the hardware enforces
+        // single-writer, and the data window as a writable one.
+        let mut sharedfs = Vec::new();
+        for (i, export) in cfg.sharedfs.iter().take(MAX_SHAREDFS).enumerate() {
+            let irq = SHAREDFS_IRQ0 + i as u32;
+            let mmio_base = SHAREDFS_BASE + i as u64 * 0x1000;
+            let shm_base = sharedfs::device::SHM_BASE + (i * sharedfs::device::INDEX_LEN) as u64;
+            let window_base = sharedfs::device::WINDOW_BASE + (i * sharedfs::device::WINDOW_LEN) as u64;
+            if export.window_len > sharedfs::device::WINDOW_LEN {
+                return Err(format!("sharedfs {}: window larger than the {} GiB stride", export.tag, sharedfs::device::WINDOW_LEN >> 30).into());
+            }
+            // The data window: reserved host address space the daemon maps file ranges into.
+            // Writable, since guest writes land in the host page cache directly.
+            let window = sharedfs::Window::reserve(export.window_len)?;
+            let window_region = kvm_bindings::kvm_userspace_memory_region {
+                slot: (memory.num_regions() + 2 * i) as u32,
+                flags: 0,
+                guest_phys_addr: window_base,
+                memory_size: window.len() as u64,
+                userspace_addr: window.as_ptr() as u64,
+            };
+            unsafe { vm.set_user_memory_region(window_region)? };
+            let index_file = cfg.state_dir.as_ref().map(|d| d.join(format!("sharedfs-{}.index", export.tag)));
+            let server = sharedfs::Server::open(&export.root, sharedfs::device::INDEX_LEN, Some(window), index_file.as_deref(), export.read_only)?;
+            let region = kvm_bindings::kvm_userspace_memory_region {
+                slot: (memory.num_regions() + 2 * i + 1) as u32,
+                flags: kvm_bindings::KVM_MEM_READONLY,
+                guest_phys_addr: shm_base,
+                memory_size: server.index().len() as u64,
+                userspace_addr: server.index().as_ptr() as u64,
+            };
+            unsafe { vm.set_user_memory_region(region)? };
+            log!(
+                "sharedfs {}: {} -> {} entries live, index {} MiB at 0x{:x}, window {} MiB at 0x{:x}, mmio 0x{:x} irq {}",
+                export.tag,
+                export.root.display(),
+                server.index().live_count(),
+                server.index().len() >> 20,
+                shm_base,
+                export.window_len >> 20,
+                window_base,
+                mmio_base,
+                irq
+            );
+            let dev = SharedfsDev::new(server, &export.tag, irq, mmio_base, shm_base, window_base);
+            vm.register_irqfd(dev.mmio.irqfd_fd(), irq)?;
+            sharedfs.push(dev);
+        }
+
         let mut disks = Vec::new();
         for (i, d) in cfg.disks.iter().take(MAX_DISKS).enumerate() {
             let file = std::fs::OpenOptions::new().read(true).write(!d.read_only).open(&d.path)?;
@@ -221,6 +297,9 @@ impl System {
 
         // Device lines the base command line does not know about, then the root.
         let mut extra = String::new();
+        for i in 0..sharedfs.len() {
+            extra.push_str(&format!(" virtio_mmio.device=4K@0x{:x}:{}", SHAREDFS_BASE + i as u64 * 0x1000, SHAREDFS_IRQ0 + i as u32));
+        }
         for i in 0..disks.len() {
             extra.push_str(&format!(" virtio_mmio.device=4K@0x{:x}:{}", BLK_BASE + i as u64 * 0x1000, BLK_IRQ0 + i as u32));
         }
@@ -294,7 +373,7 @@ impl System {
             None
         };
 
-        let devices = Arc::new(Mutex::new(Devices { serial, console, virtiofs, virtionet, disks }));
+        let devices = Arc::new(Mutex::new(Devices { serial, console, virtiofs, virtionet, sharedfs, disks }));
         Ok(Self { vm, memory, vcpus, devices, poll: EventPoll::new(), shutdown: cfg.shutdown })
     }
 
@@ -422,6 +501,10 @@ fn handle_exit(d: &mut Devices, vm: &VmFd, memory: &GuestMemoryMmap, exit: VcpuE
                 VIRTIO_CONSOLE_BASE..=0xD000_2FFF => {
                     Some(d.console.mmio.read(addr - VIRTIO_CONSOLE_BASE, |off| d.console.config_read(off)))
                 }
+                SHAREDFS_BASE..=0xD000_BFFF => {
+                    let i = ((addr - SHAREDFS_BASE) >> 12) as usize;
+                    Some(d.sharedfs.get(i).map_or(0, |s| s.mmio.read(addr & 0xFFF, |off| s.config_read(off))))
+                }
                 BLK_BASE..=0xD000_7FFF => {
                     let i = ((addr - BLK_BASE) >> 12) as usize;
                     Some(d.disks.get(i).map_or(0, |b| b.mmio.read(addr & 0xFFF, |off| b.config_read(off))))
@@ -513,7 +596,30 @@ fn handle_exit(d: &mut Devices, vm: &VmFd, memory: &GuestMemoryMmap, exit: VcpuE
                         }
                     }
                 }
+                SHAREDFS_BASE..=0xD000_BFFF => {
+                    let i = ((addr - SHAREDFS_BASE) >> 12) as usize;
+                    if let Some(s) = d.sharedfs.get_mut(i) {
+                        let offset = addr & 0xFFF;
+                        s.mmio.write(offset, val, |_, _| {});
+                        if offset == 0x070 && val == 0 {
+                            s.reset();
+                        }
+                        if offset == 0x044 && val == 1 {
+                            let qs = s.mmio.queue_sel();
+                            s.activate_queue(qs as usize);
+                            s.start_worker(vm, Arc::new(memory.clone()));
+                        }
+                    }
+                }
                 _ => {}
+            }
+        }
+        VcpuExit::MemoryFault { gpa, size, flags } => {
+            if let Some(s) = d.sharedfs.iter().find(|s| s.window_fault(gpa)) {
+                log!("sharedfs {}: window page 0x{gpa:x} had no backing (host truncate?), zero-filled", s.tag());
+            } else {
+                log!("unhandled memory fault gpa=0x{gpa:x} size=0x{size:x} flags=0x{flags:x}");
+                return Flow::Stop;
             }
         }
         VcpuExit::Hlt => {}

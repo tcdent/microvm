@@ -47,6 +47,12 @@ pub struct VirtioMmioDevice {
     // Queue configuration (indexed by queue_sel)
     queue_sel: u32,
     pub queues: Vec<QueueConfig>,
+
+    /// Shared memory regions (virtio-mmio v2, registers 0x0ac-0x0bc),
+    /// as `(guest_phys_base, len)`. Selected by SHMSel; an out-of-range
+    /// selector reads back a length of all-ones per the spec.
+    pub shm: Vec<(u64, u64)>,
+    shm_sel: u32,
 }
 
 #[derive(Clone)]
@@ -90,7 +96,13 @@ impl VirtioMmioDevice {
             config_generation: Arc::new(AtomicU32::new(0)),
             queue_sel: 0,
             queues,
+            shm: Vec::new(),
+            shm_sel: 0,
         }
+    }
+
+    fn selected_shm(&self) -> (u64, u64) {
+        self.shm.get(self.shm_sel as usize).copied().unwrap_or((0, u64::MAX))
     }
 
     fn selected_queue(&self) -> Option<&QueueConfig> {
@@ -117,6 +129,10 @@ impl VirtioMmioDevice {
             0x044 => self.selected_queue().map_or(0, |q| q.ready as u32),
             0x060 => self.interrupt_status.load(Ordering::Relaxed),
             0x070 => self.status,
+            0x0B0 => self.selected_shm().1 as u32,
+            0x0B4 => (self.selected_shm().1 >> 32) as u32,
+            0x0B8 => self.selected_shm().0 as u32,
+            0x0BC => (self.selected_shm().0 >> 32) as u32,
             0x0FC => self.config_generation.load(Ordering::Acquire),
             // Config space starts at 0x100
             off @ 0x100.. => config_read(off - 0x100),
@@ -165,6 +181,7 @@ impl VirtioMmioDevice {
                     }
                 }
             }
+            0x0AC => self.shm_sel = val,
             // Queue address registers (low/high halves)
             0x080 => {
                 if let Some(q) = self.selected_queue_mut() {

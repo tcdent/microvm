@@ -39,6 +39,7 @@ pub(crate) mod mptable;
 pub(crate) mod serial;
 pub(crate) mod virtio_console;
 pub(crate) mod virtio_fs;
+pub(crate) mod sharedfs_dev;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_mmio;
 pub(crate) mod virtio_net;

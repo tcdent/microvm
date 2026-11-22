@@ -120,6 +120,8 @@ pub fn spawn(
         shutdown: Some(Arc::clone(&shutdown_flag)),
         log_file: Some(log_dir.join("serial.log")),
         console_input: Some(Box::new(console_read)),
+        sharedfs: Vec::new(),
+        state_dir: None,
         disks: Vec::new(),
         cmdline_extra: String::new(),
         net_mac: None,
