@@ -11,7 +11,7 @@
 //! source (IPC, JSON, CLI flags) and terminal handling, and reuse
 //! `launcher::run` unchanged.
 
-use microvm::launcher::LaunchConfig;
+use microvm::launcher::{DiskSpec, LaunchConfig};
 use s3_rootfs::config::FsConfig;
 
 fn main() {
@@ -102,6 +102,18 @@ fn config_from_env() -> LaunchConfig {
         shutdown: None,
         log_file: None,
         console_input: None,
+        // vda: the environment image, read-only. vdb: the data disk. vdc: swap, which also
+        // holds the hibernation image.
+        disks: [("VM_DISK", true), ("VM_DATA", false), ("VM_SWAP", false)]
+            .iter()
+            .filter_map(|(var, ro)| std::env::var(var).ok().map(|p| DiskSpec { path: p.into(), read_only: *ro }))
+            .collect(),
+        cmdline_extra: env_or("VM_CMDLINE", ""),
+        virtiofs_root: std::env::var("VM_VIRTIOFS").ok().map(std::path::PathBuf::from),
+        net_mac: std::env::var("VM_MAC").ok().and_then(|m| {
+            let b: Vec<u8> = m.split(':').filter_map(|h| u8::from_str_radix(h, 16).ok()).collect();
+            b.try_into().ok()
+        }),
     }
 }
 

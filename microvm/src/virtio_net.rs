@@ -9,6 +9,7 @@
 
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
@@ -48,7 +49,9 @@ const MAX_IOVECS: usize = 16;
 pub struct VirtioNet<B: NetBackend + Send + 'static> {
     pub mmio: VirtioMmioDevice,
     tx_queue: Queue,
-    rx_queue: Option<Queue>,
+    /// Shared with the RX worker, which locks it per packet, so a device reset can replace
+    /// the ring under the worker.
+    rx_queue: Arc<Mutex<Queue>>,
     backend: Option<B>,
     /// Dup'd fd for TX on the vCPU thread. The worker thread owns the
     /// backend (and its fd) for RX. Full duplex, no interference.
@@ -77,7 +80,7 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
         Self {
             mmio,
             tx_queue: Queue::new(QUEUE_SIZE).unwrap(),
-            rx_queue: Some(Queue::new(QUEUE_SIZE).unwrap()),
+            rx_queue: Arc::new(Mutex::new(Queue::new(QUEUE_SIZE).unwrap())),
             backend: Some(backend),
             tx_fd,
             mac,
@@ -126,22 +129,26 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
         }
 
         match queue_idx {
-            RX_QUEUE => {
-                if let Some(ref mut q) = self.rx_queue {
-                    configure(q, &qc);
-                }
-            }
+            RX_QUEUE => configure(&mut self.rx_queue.lock().unwrap(), &qc),
             TX_QUEUE => configure(&mut self.tx_queue, &qc),
             _ => {}
         }
     }
 
-    /// Start the RX worker thread. Call after the guest writes DRIVER_OK.
+    /// The driver reset the device: forget both rings' positions. The RX worker keeps running
+    /// and uses the rings the driver configures next.
+    pub fn reset(&mut self) {
+        self.tx_queue.reset();
+        self.rx_queue.lock().unwrap().reset();
+    }
+
+    /// Start the RX worker thread. Call after the guest writes DRIVER_OK. Started once; it
+    /// survives device resets because it shares the queue with the device.
     pub fn start_rx_worker(&mut self, memory: GuestMemoryMmap) {
-        let rx_queue = match self.rx_queue.take() {
-            Some(q) => q,
-            None => return,
-        };
+        if self._rx_worker.is_some() {
+            return;
+        }
+        let rx_queue = self.rx_queue.clone();
         let backend = match self.backend.take() {
             Some(b) => b,
             None => return,
@@ -154,15 +161,16 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
 
         self._rx_worker = Some(thread::Builder::new().name("vm-net-rx".into()).spawn(move || {
             let _backend = backend;
-            let mut rx_queue = rx_queue;
 
             // Wait for the guest to post RX buffers. This happens after
             // DRIVER_OK when the interface comes up (virtnet_open).
             loop {
-                if rx_queue.pop_descriptor_chain(&memory).is_some() {
-                    rx_queue.go_to_previous_position();
+                let mut q = rx_queue.lock().unwrap();
+                if q.pop_descriptor_chain(&memory).is_some() {
+                    q.go_to_previous_position();
                     break;
                 }
+                drop(q);
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
@@ -185,6 +193,7 @@ impl<B: NetBackend + Send + 'static> VirtioNet<B> {
 
                 let mut delivered = 0u32;
                 loop {
+                    let mut rx_queue = rx_queue.lock().unwrap();
                     let dc = match rx_queue.pop_descriptor_chain(&memory) {
                         Some(dc) => dc,
                         None => break,

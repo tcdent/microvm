@@ -19,10 +19,15 @@ pub fn load(
     kernel_path: &str,
     initrd_path: &str,
     mem_size: usize,
+    extra_cmdline: &str,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let kernel_result = load_kernel(memory, kernel_path)?;
-    let (initrd_addr, initrd_size) = load_initrd(memory, kernel_result.kernel_end, initrd_path)?;
-    let cmdline = load_cmdline(memory)?;
+    let (initrd_addr, initrd_size) = if initrd_path.is_empty() {
+        (0, 0)
+    } else {
+        load_initrd(memory, kernel_result.kernel_end, initrd_path)?
+    };
+    let cmdline = load_cmdline(memory, extra_cmdline)?;
     configure_boot_params(memory, &kernel_result, &cmdline, initrd_addr, initrd_size, mem_size)?;
 
     let entry = kernel_result.kernel_load.raw_value();
@@ -59,14 +64,15 @@ fn load_initrd(
     Ok((initrd_addr, initrd_data.len() as u64))
 }
 
-fn load_cmdline(memory: &GuestMemoryMmap) -> Result<Cmdline, Box<dyn std::error::Error>> {
-    let mut cmdline = Cmdline::new(512)?;
+/// Base command line plus the launcher's device and root arguments.
+fn load_cmdline(memory: &GuestMemoryMmap, extra: &str) -> Result<Cmdline, Box<dyn std::error::Error>> {
+    let mut cmdline = Cmdline::new(1024)?;
     cmdline.insert_str("console=ttyS0 earlyprintk=ttyS0 random.trust_cpu=on pci=off")?;
     // Register virtio-mmio devices: size@base:irq
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0000000:5")?; // virtio-fs
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0001000:6")?; // virtio-net
     cmdline.insert_str(" virtio_mmio.device=4K@0xd0002000:7")?; // virtio-console
-    cmdline.insert_str(" rootfstype=virtiofs root=rootfs rw systemd.unit=multi-user.target systemd.show_status=no")?;
+    cmdline.insert_str(extra)?;
 
     linux_loader::loader::load_cmdline(memory, GuestAddress(CMDLINE_ADDR), &cmdline)?;
 

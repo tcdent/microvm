@@ -40,6 +40,9 @@ pub struct VirtioMmioDevice {
     /// irqfd. `Arc<AtomicU32>` replaces the older pattern of
     /// casting `&AtomicU32` to `usize` to cross thread boundaries.
     pub interrupt_status: Arc<AtomicU32>,
+    /// ConfigGeneration (0x0fc): bumped whenever the device changes its configuration space,
+    /// so the driver knows to read it again.
+    config_generation: Arc<AtomicU32>,
 
     // Queue configuration (indexed by queue_sel)
     queue_sel: u32,
@@ -84,6 +87,7 @@ impl VirtioMmioDevice {
             driver_features: 0,
             driver_features_sel: 0,
             interrupt_status: Arc::new(AtomicU32::new(0)),
+            config_generation: Arc::new(AtomicU32::new(0)),
             queue_sel: 0,
             queues,
         }
@@ -113,6 +117,7 @@ impl VirtioMmioDevice {
             0x044 => self.selected_queue().map_or(0, |q| q.ready as u32),
             0x060 => self.interrupt_status.load(Ordering::Relaxed),
             0x070 => self.status,
+            0x0FC => self.config_generation.load(Ordering::Acquire),
             // Config space starts at 0x100
             off @ 0x100.. => config_read(off - 0x100),
             _ => 0,
@@ -147,7 +152,19 @@ impl VirtioMmioDevice {
                 // InterruptACK
                 self.interrupt_status.fetch_and(!val, Ordering::Relaxed);
             }
-            0x070 => self.status = val,
+            0x070 => {
+                self.status = val;
+                // A device reset: the driver will configure every queue again before using
+                // it. Devices reset their own queue state when they see this write.
+                if val == 0 {
+                    for q in &mut self.queues {
+                        q.ready = false;
+                        q.desc_addr = 0;
+                        q.avail_addr = 0;
+                        q.used_addr = 0;
+                    }
+                }
+            }
             // Queue address registers (low/high halves)
             0x080 => {
                 if let Some(q) = self.selected_queue_mut() {
@@ -197,6 +214,15 @@ impl VirtioMmioDevice {
         self.irqfd.write(1).ok();
     }
 
+    /// A handle that announces configuration changes from any thread.
+    pub fn config_notifier(&self) -> ConfigNotifier {
+        ConfigNotifier {
+            interrupt_status: self.interrupt_status.clone(),
+            config_generation: self.config_generation.clone(),
+            irqfd: self.irqfd.try_clone().expect("failed to clone irqfd"),
+        }
+    }
+
     /// Raw fd for the irqfd — register with KVM via register_irqfd().
     pub fn irqfd_fd(&self) -> &EventFd {
         &self.irqfd
@@ -204,5 +230,21 @@ impl VirtioMmioDevice {
 
     pub fn is_driver_ready(&self) -> bool {
         self.status & STATUS_DRIVER_OK != 0
+    }
+}
+
+/// Tells the driver its device's configuration space changed (the config-change interrupt,
+/// InterruptStatus bit 1), from whichever thread noticed.
+pub struct ConfigNotifier {
+    interrupt_status: Arc<AtomicU32>,
+    config_generation: Arc<AtomicU32>,
+    irqfd: EventFd,
+}
+
+impl ConfigNotifier {
+    pub fn notify(&self) {
+        self.config_generation.fetch_add(1, Ordering::Release);
+        self.interrupt_status.fetch_or(0x02, Ordering::Release);
+        self.irqfd.write(1).ok();
     }
 }

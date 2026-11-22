@@ -16,6 +16,7 @@
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use virtio_queue::{Queue, QueueT};
@@ -38,7 +39,9 @@ pub struct VirtioConsole {
     pub mmio: VirtioMmioDevice,
     pub mmio_base: u64,
     tx_queue: Queue,
-    rx_queue: Option<Queue>,
+    /// Shared with the RX worker, which locks it per buffer, so a device reset can replace
+    /// the ring under the worker.
+    rx_queue: Arc<Mutex<Queue>>,
     /// Input source for the guest — stdin, socket, pipe, etc.
     input: Option<Box<dyn Read + Send>>,
     /// Output sink for guest writes — stdout, socket, pipe, etc.
@@ -71,7 +74,7 @@ impl VirtioConsole {
             mmio,
             mmio_base,
             tx_queue: Queue::new(QUEUE_SIZE).unwrap(),
-            rx_queue: Some(Queue::new(QUEUE_SIZE).unwrap()),
+            rx_queue: Arc::new(Mutex::new(Queue::new(QUEUE_SIZE).unwrap())),
             input: Some(input),
             output,
             _rx_worker: None,
@@ -131,22 +134,27 @@ impl VirtioConsole {
         }
 
         match queue_idx {
-            RX_QUEUE => {
-                if let Some(ref mut q) = self.rx_queue {
-                    configure(q, &qc);
-                }
-            }
+            RX_QUEUE => configure(&mut self.rx_queue.lock().unwrap(), &qc),
             TX_QUEUE => configure(&mut self.tx_queue, &qc),
             _ => {}
         }
     }
 
-    /// Start the RX worker — reads from input source, delivers to guest.
+    /// The driver reset the device (hibernation does this twice): forget both rings' positions.
+    /// The RX worker keeps running and picks up the rings the driver configures next.
+    pub fn reset(&mut self) {
+        crate::log!("console: reset by the driver");
+        self.tx_queue.reset();
+        self.rx_queue.lock().unwrap().reset();
+    }
+
+    /// Start the RX worker — reads from input source, delivers to guest. Started once; it
+    /// survives device resets because it shares the queue with the device.
     pub fn start_rx_worker(&mut self, memory: GuestMemoryMmap) {
-        let rx_queue = match self.rx_queue.take() {
-            Some(q) => q,
-            None => return,
-        };
+        if self._rx_worker.is_some() {
+            return;
+        }
+        let rx_queue = self.rx_queue.clone();
         let mut input = match self.input.take() {
             Some(r) => r,
             None => return,
@@ -159,12 +167,11 @@ impl VirtioConsole {
         let interrupt_status = self.mmio.interrupt_status.clone();
 
         self._rx_worker = Some(thread::spawn(move || {
-            let mut rx_queue = rx_queue;
             let mut buf = [0u8; 4096];
 
             // Wait for guest to post buffers before draining
             loop {
-                if rx_queue.pop_descriptor_chain(&memory).is_some() {
+                if rx_queue.lock().unwrap().pop_descriptor_chain(&memory).is_some() {
                     // Put it back — go_to_previous_position not available,
                     // but the guest will re-post on next interrupt cycle.
                     // Break to start the main loop.
@@ -176,17 +183,30 @@ impl VirtioConsole {
             loop {
                 // Block on input read — zero CPU when idle
                 let n = match input.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        crate::log!("console rx: input closed");
+                        break;
+                    }
                     Ok(n) => n,
-                    Err(_) => break,
+                    Err(e) => {
+                        crate::log!("console rx: input error {e}");
+                        break;
+                    }
                 };
 
                 let mut written = 0;
+                let mut waited = 0u32;
                 while written < n {
+                    let mut rx_queue = rx_queue.lock().unwrap();
                     let dc = match rx_queue.pop_descriptor_chain(&memory) {
                         Some(dc) => dc,
                         None => {
                             // No guest buffers — wait briefly and retry
+                            waited += 1;
+                            if waited % 5000 == 0 {
+                                crate::log!("console rx: no guest buffer for {} s", waited / 1000);
+                            }
+                            drop(rx_queue);
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             continue;
                         }
@@ -230,7 +250,9 @@ impl VirtioConsole {
                 }
             }
 
-            self.tx_queue.add_used(memory, head_index, 0).ok();
+            if let Err(e) = self.tx_queue.add_used(memory, head_index, 0) {
+                crate::log!("console: tx add_used({head_index}) failed: {e:?}");
+            }
         }
 
         self.output.flush().ok();

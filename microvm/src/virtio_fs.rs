@@ -17,7 +17,7 @@ use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::eventfd::EventFd;
 
-use s3_rootfs::S3Fs;
+use fuse_backend_rs::api::filesystem::FileSystem;
 use virtio_fs_transport::{FsSession, serve};
 
 use crate::virtio_mmio::VirtioMmioDevice;
@@ -35,7 +35,17 @@ const REQUEST_QUEUE: usize = 1;
 /// thread via `FsSession`. After handoff, the filesystem is shared
 /// between the worker (which services FUSE requests) and any future
 /// orchestrator reference (which can invalidate the cache, etc.).
-pub struct VirtioFs {
+/// What the launcher needs from a virtio-fs device, independent of the
+/// filesystem behind it.
+pub trait FsDevice {
+    fn mmio(&self) -> &VirtioMmioDevice;
+    fn mmio_mut(&mut self) -> &mut VirtioMmioDevice;
+    fn config_read(&self, offset: u64) -> u32;
+    fn activate_queue(&mut self, queue_idx: usize);
+    fn start_worker(&mut self, vm: &VmFd, memory: Arc<GuestMemoryMmap>);
+}
+
+pub struct VirtioFs<F: FileSystem + Send + Sync + 'static> {
     pub mmio: VirtioMmioDevice,
     queue: Option<Queue>,
     tag: String,
@@ -44,12 +54,12 @@ pub struct VirtioFs {
     /// Filesystem. Held in `Option` because `start_worker` consumes
     /// this slot — once the worker owns its Arc, the device struct
     /// no longer needs a reference.
-    fs: Option<Arc<S3Fs>>,
+    fs: Option<Arc<F>>,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
-impl VirtioFs {
-    pub fn new(fs: Arc<S3Fs>, tag: &str, irq: u32, mmio_base: u64) -> Self {
+impl<F: FileSystem + Send + Sync + 'static> VirtioFs<F> {
+    pub fn new(fs: Arc<F>, tag: &str, irq: u32, mmio_base: u64) -> Self {
         let mmio = VirtioMmioDevice::new(
             VIRTIO_DEV_FS,
             VENDOR_ID,
@@ -155,5 +165,23 @@ impl VirtioFs {
         };
 
         self._worker = Some(serve(session));
+    }
+}
+
+impl<F: FileSystem + Send + Sync + 'static> FsDevice for VirtioFs<F> {
+    fn mmio(&self) -> &VirtioMmioDevice {
+        &self.mmio
+    }
+    fn mmio_mut(&mut self) -> &mut VirtioMmioDevice {
+        &mut self.mmio
+    }
+    fn config_read(&self, offset: u64) -> u32 {
+        VirtioFs::config_read(self, offset)
+    }
+    fn activate_queue(&mut self, queue_idx: usize) {
+        VirtioFs::activate_queue(self, queue_idx)
+    }
+    fn start_worker(&mut self, vm: &VmFd, memory: Arc<GuestMemoryMmap>) {
+        VirtioFs::start_worker(self, vm, memory)
     }
 }

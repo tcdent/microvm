@@ -120,6 +120,10 @@ pub fn spawn(
         shutdown: Some(Arc::clone(&shutdown_flag)),
         log_file: Some(log_dir.join("serial.log")),
         console_input: Some(Box::new(console_read)),
+        disks: Vec::new(),
+        cmdline_extra: String::new(),
+        net_mac: None,
+        virtiofs_root: None,
     };
 
     // 8. Insert into registry as Starting.
