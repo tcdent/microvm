@@ -1,51 +1,16 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: tcdent <tcdent@gmail.com>
-Date: Sat, 10 Oct 2026 17:47:07 -0700
-Subject: [PATCH 11/38] rust: sync: add Locked, proof that an embedded lock is
- held
+`Locked`, proof that an embedded lock is held
 
-Some kernel objects carry their own lock, for example an inode's rw
-semaphore or a folio's lock bit. Locked<T, Marker> wraps a reference to
-such an object as evidence that the lock is held, so an API can require
-the lock at the type level. The VFS hands callbacks objects it has
-already locked and will unlock itself; those wrap the guard in
-ManuallyDrop.
+A type that stands for "the lock inside this object is held", from Wedson
+Almeida Filho's RFC v2 "Rust abstractions for VFS" (May 2024). The file system
+abstractions use it to say that an operation runs with the inode's lock taken
+by the VFS, so the implementation can reach the state that lock protects
+without taking it again.
 
-Lifted from Wedson Almeida Filho's "Rust abstractions for VFS" RFC v2
-(May 2024), where it lived in kernel::types.
+For upstream: it is a patch of its own in the RFC and stays one here.
 
-Claude-Session: https://claude.ai/code/session_01SKmspe5nVbuvzdvYZa9UhW
----
- rust/kernel/sync.rs        |  2 +
- rust/kernel/sync/locked.rs | 77 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 79 insertions(+)
- create mode 100644 rust/kernel/sync/locked.rs
-
-diff --git a/rust/kernel/sync.rs b/rust/kernel/sync.rs
-index 993dbf2ca..098d11a5e 100644
---- a/rust/kernel/sync.rs
-+++ b/rust/kernel/sync.rs
-@@ -16,6 +16,7 @@
- pub mod completion;
- mod condvar;
- pub mod lock;
-+pub mod locked;
- mod locked_by;
- pub mod poll;
- pub mod rcu;
-@@ -28,6 +29,7 @@
- pub use lock::global::{global_lock, GlobalGuard, GlobalLock, GlobalLockBackend, GlobalLockedBy};
- pub use lock::mutex::{new_mutex, Mutex, MutexGuard};
- pub use lock::spinlock::{new_spinlock, SpinLock, SpinLockGuard};
-+pub use locked::{Lockable, Locked};
- pub use locked_by::LockedBy;
- pub use refcount::Refcount;
- pub use set_once::SetOnce;
-diff --git a/rust/kernel/sync/locked.rs b/rust/kernel/sync/locked.rs
-new file mode 100644
-index 000000000..54bcd847f
---- /dev/null
-+++ b/rust/kernel/sync/locked.rs
+diff -ruN a/rust/kernel/sync/locked.rs b/rust/kernel/sync/locked.rs
+--- a/rust/kernel/sync/locked.rs	1969-12-31 16:00:00.000000000 -0800
++++ b/rust/kernel/sync/locked.rs	2026-11-23 14:31:43.283583209 -0800
 @@ -0,0 +1,77 @@
 +// SPDX-License-Identifier: GPL-2.0
 +
@@ -124,3 +89,22 @@ index 000000000..54bcd847f
 +        unsafe { self.0.unlock() };
 +    }
 +}
+diff -ruN a/rust/kernel/sync.rs b/rust/kernel/sync.rs
+--- a/rust/kernel/sync.rs	2026-11-23 14:31:43.155581235 -0800
++++ b/rust/kernel/sync.rs	2026-11-23 14:31:43.167581419 -0800
+@@ -16,6 +16,7 @@
+ pub mod completion;
+ mod condvar;
+ pub mod lock;
++pub mod locked;
+ mod locked_by;
+ pub mod poll;
+ pub mod rcu;
+@@ -28,6 +29,7 @@
+ pub use lock::global::{global_lock, GlobalGuard, GlobalLock, GlobalLockBackend, GlobalLockedBy};
+ pub use lock::mutex::{new_mutex, Mutex, MutexGuard};
+ pub use lock::spinlock::{new_spinlock, SpinLock, SpinLockGuard};
++pub use locked::{Lockable, Locked};
+ pub use locked_by::LockedBy;
+ pub use refcount::Refcount;
+ pub use set_once::SetOnce;

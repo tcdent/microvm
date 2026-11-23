@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+config SHAREDFS
+	bool "sharedfs: filesystem with host-resident metadata (Rust)"
+	depends on RUST && VIRTIO
+	help
+	  A filesystem for virtual machines whose metadata is read directly from
+	  a shared memory index maintained by the host, and whose mutations and
+	  file data travel over a virtqueue. One writer per export.

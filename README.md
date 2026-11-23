@@ -23,7 +23,7 @@ sharedfs, on top of them.
 |---|---|
 | `microvm/` | The VMM: vCPUs, MP table, virtio-mmio transport, and the console, net, blk, virtio-fs and sharedfs devices. A library (`launcher::run`) and a standalone binary configured from `VM_*` environment variables. |
 | `sharedfs/` | Host daemon for the shared project filesystem. A library with no VMM in it; the tests speak its protocol directly. |
-| `kernel/` | The guest kernel: build script, config, and `patches/`, the Rust guest driver for sharedfs as a series on Linux 7.2.9. |
+| `kernel/` | The guest kernel: build script, config, `patches/`, our changes to Linux 7.2.9 (the Rust virtio and file system bindings), and `linux/fs/sharedfs/`, the guest driver for sharedfs. |
 | `s3-rootfs/` | An S3-backed FUSE filesystem for VM root filesystems, with a content-addressed golden image shared across VMs. |
 | `virtio-fs-transport/` | The virtqueue worker that serves a FUSE filesystem over virtio-fs. |
 | `orchestrator/` | `microd`, the daemon that runs many VMs as threads in one process. |
@@ -83,10 +83,10 @@ The guest kernel:
 kernel/build-kernel.sh
 ```
 
-It expects the 7.2.9 source at `kernel/src/linux-7.2.9` (untracked)
-with the `kernel/patches` series applied, and a Rust-for-Linux
-toolchain; `research/17` lists the versions. The script does not apply
-the series itself.
+It fetches Linux 7.2.9 as released, applies the patches under
+`kernel/patches/linux-7.2.9/`, copies in the driver from
+`kernel/linux/`, and builds the result in `kernel/vendor/` (untracked). `kernel/patches/README.md` describes the convention. It
+needs a Rust-for-Linux toolchain; `research/17` lists the versions.
 
 ## Running
 

@@ -1,0 +1,29 @@
+sharedfs in the fs build
+
+Names `fs/sharedfs` in `fs/Kconfig` and `fs/Makefile`, so the file system is
+configured and built with the rest. The file system itself is not a change to
+the kernel but our own code, kept whole under `linux/fs/sharedfs/` in this
+repository and copied into the tree by `apply.sh`.
+
+diff -ruN a/fs/Kconfig b/fs/Kconfig
+--- a/fs/Kconfig	2026-11-23 15:02:48.628709174 -0800
++++ b/fs/Kconfig	2026-11-23 15:02:48.632709236 -0800
+@@ -129,6 +129,7 @@
+ 
+ source "fs/autofs/Kconfig"
+ source "fs/fuse/Kconfig"
++source "fs/sharedfs/Kconfig"
+ source "fs/overlayfs/Kconfig"
+ 
+ menu "Caches"
+diff -ruN a/fs/Makefile b/fs/Makefile
+--- a/fs/Makefile	2026-11-23 15:02:48.632709236 -0800
++++ b/fs/Makefile	2026-11-23 15:02:48.636709298 -0800
+@@ -102,6 +102,7 @@
+ obj-$(CONFIG_AUTOFS_FS)		+= autofs/
+ obj-$(CONFIG_ADFS_FS)		+= adfs/
+ obj-$(CONFIG_FUSE_FS)		+= fuse/
++obj-$(CONFIG_SHAREDFS)		+= sharedfs/
+ obj-$(CONFIG_OVERLAY_FS)	+= overlayfs/
+ obj-$(CONFIG_ORANGEFS_FS)       += orangefs/
+ obj-$(CONFIG_UDF_FS)		+= udf/

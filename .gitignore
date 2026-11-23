@@ -5,6 +5,10 @@ microvm/target/
 # Kernel source (downloaded, not ours)
 kernel/src/
 
+# The kernel as released with kernel/patches applied, and the release tarball: made, never committed
+kernel/vendor/
+kernel/patches/pristine/
+
 # Large binary artifacts (downloaded)
 dist/vmlinux
 dist/vmlinuz

@@ -1,12 +1,18 @@
 #!/bin/sh
 # Build a custom kernel for our microVM.
 #
-# Starts from Firecracker's microVM config and adds virtiofs support.
-# Produces a vmlinux ELF that we load directly (no bzImage decompression).
+# The source is `vendor/linux-<version>`: the release with the patches under
+# `patches/linux-<version>/` applied and our own files from `linux/` copied in,
+# made by `patches/apply.sh` (see patches/README.md). Starts from our config and produces a vmlinux ELF that
+# we load directly (no bzImage decompression).
 #
 # Usage: ./build-kernel.sh [kernel-version]
+#        KSRC=path/to/tree ./build-kernel.sh    build another tree as it stands,
+#                                               e.g. a checkout a patch is being
+#                                               written in; its .config is kept
 #
-# Requires: build-essential, flex, bison, libelf-dev, libssl-dev
+# Requires: build-essential, flex, bison, libelf-dev, libssl-dev, patch, and
+# the Rust-for-Linux toolchain (research/17)
 #
 set -e
 
@@ -16,23 +22,17 @@ KVER="${1:-7.2.9}"
 export PATH="$HOME/.cargo/bin:$PATH"
 export LIBCLANG_PATH="${LIBCLANG_PATH:-$(dirname "$(find "$HOME/.local/libclang" -name libclang.so 2>/dev/null | head -1)")}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
-WORK="$DIR/src"
 JOBS=$(nproc)
 
-# Download kernel source if not present
-if [ ! -d "$WORK/linux-$KVER" ]; then
-    MAJOR=$(echo "$KVER" | cut -d. -f1)
-    echo "==> Downloading kernel $KVER..."
-    mkdir -p "$WORK"
-    curl -L "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KVER}.tar.xz" \
-        | tar xJ -C "$WORK"
+if [ -n "${KSRC:-}" ]; then
+    cd "$KSRC"
+    [ -f .config ] || cp "$DIR/.config" .config
+else
+    # The release as published with our patches applied; quick where no patch has changed.
+    "$DIR/patches/apply.sh"
+    cd "$DIR/vendor/linux-$KVER"
+    cp "$DIR/.config" .config
 fi
-
-cd "$WORK/linux-$KVER"
-
-# Start from our config. The 7.2.9 tree is a git repo with our branch
-# checked out; leave its .config alone when it already has one.
-[ -f .config ] || cp "$DIR/.config" .config
 
 # Apply our customizations on top of Firecracker's config
 scripts/config --enable CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES
